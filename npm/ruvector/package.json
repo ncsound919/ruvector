@@ -1,6 +1,6 @@
 {
   "name": "ruvector",
-  "version": "0.1.2",
+  "version": "0.1.21",
   "description": "All-in-one vector database: HNSW search, Cypher queries, GNN layers, compression. Pinecone + Neo4j + PyTorch in one package.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
