@@ -79,7 +79,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: npm/packages/graph-node
-        run: npm install
+        run: npm install --ignore-scripts --omit=optional --force
 
       - name: Build native module
         working-directory: npm/packages/graph-node
