@@ -8,6 +8,7 @@ members = [
     "crates/exo-federation",
     "crates/exo-node",
     "crates/exo-backend-classical",
+    "crates/exo-exotic",
 ]
 resolver = "2"
 
