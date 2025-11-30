@@ -30,3 +30,6 @@ default = ["console_error_panic_hook"]
 opt-level = "s"
 lto = true
 codegen-units = 1
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
