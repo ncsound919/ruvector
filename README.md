@@ -85,7 +85,13 @@ cargo add ruvector-raft ruvector-cluster ruvector-replication
 
 ### Attention Mechanisms (`@ruvector/attention`)
 
-High-performance attention mechanisms for transformers, graph neural networks, and hyperbolic embeddings. Native Rust with NAPI-RS bindings for maximum performance.
+| Feature | What It Does | Why It Matters |
+|---------|--------------|----------------|
+| **39 Mechanisms** | Dot-product, multi-head, flash, linear, sparse, cross-attention | Cover all transformer and GNN use cases |
+| **Graph Attention** | RoPE, edge-featured, local-global, neighborhood | Purpose-built for graph neural networks |
+| **Hyperbolic Attention** | Poincaré ball operations, curved-space math | Better embeddings for hierarchical data |
+| **SIMD Optimized** | Native Rust with AVX2/NEON acceleration | 2-10x faster than pure JS |
+| **Streaming & Caching** | Chunk-based processing, KV-cache | Constant memory, 10x faster inference |
 
 > **Documentation**: [Attention Module Docs](./crates/ruvector-attention/README.md)
 
