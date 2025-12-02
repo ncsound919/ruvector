@@ -93,51 +93,51 @@ High-performance attention mechanisms for transformers, graph neural networks, a
 
 | Mechanism | Complexity | Memory | Best For |
 |-----------|------------|--------|----------|
-| **DotProductAttention** | O(n²) | O(n²) | Standard transformer attention, general purpose |
-| **MultiHeadAttention** | O(n²·h) | O(n²·h) | Transformers, parallel attention heads, BERT/GPT |
-| **FlashAttention** | O(n²) | O(n) | Long sequences, memory-constrained environments |
-| **LinearAttention** | O(n·d) | O(n·d) | Very long sequences (>8K tokens), streaming |
-| **HyperbolicAttention** | O(n²) | O(n²) | Hierarchical data, taxonomies, tree structures |
-| **MoEAttention** | O(n·k) | O(n·k) | Mixture of Experts, sparse routing, large models |
+| **DotProductAttention** | O(n²) | O(n²) | Basic attention for small-medium sequences |
+| **MultiHeadAttention** | O(n²·h) | O(n²·h) | BERT, GPT-style transformers |
+| **FlashAttention** | O(n²) | O(n) | Long sequences with limited GPU memory |
+| **LinearAttention** | O(n·d) | O(n·d) | 8K+ token sequences, real-time streaming |
+| **HyperbolicAttention** | O(n²) | O(n²) | Tree-like data: taxonomies, org charts |
+| **MoEAttention** | O(n·k) | O(n·k) | Large models with sparse expert routing |
 
 #### Graph Attention Mechanisms
 
 | Mechanism | Complexity | Best For |
 |-----------|------------|----------|
-| **GraphRoPeAttention** | O(n²) | Graph transformers with rotary position embeddings |
-| **EdgeFeaturedAttention** | O(n²·e) | Molecular graphs, knowledge graphs with edge attributes |
-| **DualSpaceAttention** | O(n²) | Combined Euclidean + hyperbolic embeddings |
-| **LocalGlobalAttention** | O(n·k + n) | Large-scale graphs (>100K nodes), scalable GNNs |
+| **GraphRoPeAttention** | O(n²) | Position-aware graph transformers |
+| **EdgeFeaturedAttention** | O(n²·e) | Molecules, knowledge graphs with edge data |
+| **DualSpaceAttention** | O(n²) | Hybrid flat + hierarchical embeddings |
+| **LocalGlobalAttention** | O(n·k + n) | 100K+ node graphs, scalable GNNs |
 
 #### Specialized Mechanisms
 
 | Mechanism | Type | Best For |
 |-----------|------|----------|
-| **SparseAttention** | Efficiency | Very long documents, memory-limited inference |
-| **CrossAttention** | Multi-modal | Vision-language models, encoder-decoder |
-| **NeighborhoodAttention** | Graph | Local graph neighborhoods, message passing |
-| **HierarchicalAttention** | Structure | Document hierarchies, multi-level attention |
+| **SparseAttention** | Efficiency | Long docs, low-memory inference |
+| **CrossAttention** | Multi-modal | Image-text, encoder-decoder models |
+| **NeighborhoodAttention** | Graph | Local message passing in GNNs |
+| **HierarchicalAttention** | Structure | Multi-level docs (section → paragraph) |
 
 #### Hyperbolic Math Functions
 
-For working with hyperbolic embeddings (Poincaré ball model):
+Operations for Poincaré ball embeddings (curved space for hierarchies):
 
 | Function | Description | Use Case |
 |----------|-------------|----------|
-| `expMap(v, c)` | Tangent space → Poincaré ball | Embedding initialization |
-| `logMap(p, c)` | Poincaré ball → Tangent space | Gradient computation |
-| `mobiusAddition(x, y, c)` | Hyperbolic vector addition | Feature aggregation |
-| `poincareDistance(x, y, c)` | Hyperbolic distance metric | Similarity computation |
-| `projectToPoincareBall(p, c)` | Project to valid ball region | Numerical stability |
+| `expMap(v, c)` | Map to hyperbolic space | Initialize embeddings |
+| `logMap(p, c)` | Map to flat space | Compute gradients |
+| `mobiusAddition(x, y, c)` | Add vectors in curved space | Aggregate features |
+| `poincareDistance(x, y, c)` | Measure hyperbolic distance | Compute similarity |
+| `projectToPoincareBall(p, c)` | Ensure valid coordinates | Prevent numerical errors |
 
 #### Async & Batch Operations
 
 | Operation | Description | Performance |
 |-----------|-------------|-------------|
-| `asyncBatchCompute()` | Parallel batch processing | 3-5x speedup |
-| `streamingAttention()` | Chunk-based streaming | Constant memory |
-| `HardNegativeMiner` | Contrastive learning | Semi-hard/hard mining |
-| `AttentionCache` | KV-cache for inference | 10x faster generation |
+| `asyncBatchCompute()` | Process batches in parallel | 3-5x faster |
+| `streamingAttention()` | Process in chunks | Fixed memory usage |
+| `HardNegativeMiner` | Find hard training examples | Better contrastive learning |
+| `AttentionCache` | Cache key-value pairs | 10x faster inference |
 
 ```bash
 # Install attention module
