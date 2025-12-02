@@ -52,6 +52,8 @@ npx ruvector
 
 ### Core Capabilities
 
+Essential vector database features for storing, searching, and querying embeddings.
+
 | Feature | What It Does | Why It Matters |
 |---------|--------------|----------------|
 | **Vector Search** | HNSW index, <0.5ms latency, SIMD acceleration | Fast enough for real-time apps |
@@ -62,6 +64,8 @@ npx ruvector
 | **Collections** | Namespace isolation, multi-tenancy | Organize vectors by project/user |
 
 ### Distributed Systems
+
+Scale horizontally with production-grade clustering and replication.
 
 | Feature | What It Does | Why It Matters |
 |---------|--------------|----------------|
@@ -76,6 +80,8 @@ cargo add ruvector-raft ruvector-cluster ruvector-replication
 ```
 
 ### AI & ML
+
+Built-in machine learning capabilities for compression, routing, and trainable search.
 
 | Feature | What It Does | Why It Matters |
 |---------|--------------|----------------|
@@ -184,6 +190,8 @@ const dist = poincareDistance(new Float32Array([0.1, 0.2]), new Float32Array([0.
 ```
 
 ### Deployment
+
+Run anywhere—server, browser, or embedded in your application.
 
 | Feature | What It Does | Why It Matters |
 |---------|--------------|----------------|
