@@ -9,6 +9,35 @@
 
 **The most advanced AI vector database CLI for PostgreSQL.** A drop-in pgvector replacement with 53+ SQL functions, 39 attention mechanisms, GNN layers, hyperbolic embeddings, and self-learning capabilities.
 
+## Quick Start (One Command Install)
+
+```bash
+# Install everything (PostgreSQL + RuVector extension) in one command
+npx @ruvector/postgres-cli install
+
+# Or install natively without Docker
+npx @ruvector/postgres-cli install --method native
+```
+
+That's it! The installer will:
+1. Detect your system (Linux/macOS)
+2. Install PostgreSQL if not present
+3. Install Rust if not present (for native installs)
+4. Build and install the RuVector extension
+5. Create a ready-to-use database
+
+## Supported Environments
+
+| Platform | Architecture | Docker | Native | Package Manager |
+|----------|-------------|--------|--------|-----------------|
+| **Ubuntu/Debian** | x64, arm64 | ✅ | ✅ | apt |
+| **RHEL/CentOS/Fedora** | x64, arm64 | ✅ | ✅ | dnf/yum |
+| **Arch Linux** | x64 | ✅ | ✅ | pacman |
+| **macOS** | Intel, Apple Silicon | ✅ | ✅ | Homebrew |
+| **Windows** | x64 | ✅ (WSL2) | ❌ | - |
+
+**PostgreSQL Versions**: 14, 15, 16, 17 (native), Docker supports all
+
 ## Why RuVector?
 
 | Feature | pgvector | RuVector |
@@ -22,52 +51,263 @@
 | Self-Learning | - | ReasoningBank |
 | Agent Routing | - | Tiny Dancer |
 
-## Installation
+## Installation Options
+
+### Option 1: Docker (Fastest - Recommended)
 
 ```bash
-# Global installation
+# Auto-detect and install via Docker
+npx @ruvector/postgres-cli install
+
+# Or explicitly use Docker
+npx @ruvector/postgres-cli install --method docker
+
+# Customize port and credentials
+npx @ruvector/postgres-cli install \
+  --port 5433 \
+  --user myuser \
+  --password mypass \
+  --database mydb
+```
+
+### Option 2: Native Installation (No Docker Required)
+
+```bash
+# Full native installation - installs everything
+npx @ruvector/postgres-cli install --method native
+
+# Specify PostgreSQL version
+npx @ruvector/postgres-cli install --method native --pg-version 17
+
+# Use existing PostgreSQL (skip PostgreSQL install)
+npx @ruvector/postgres-cli install --method native --skip-postgres
+
+# Use existing Rust (skip Rust install)
+npx @ruvector/postgres-cli install --method native --skip-rust
+```
+
+### Option 3: Global CLI
+
+```bash
+# Install globally
 npm install -g @ruvector/postgres-cli
 
-# Or use npx directly
+# Then use anywhere
+ruvector-pg install
+ruvector-pg info
+ruvector-pg vector create embeddings --dim 384
+```
+
+## Install Command Options
+
+```bash
+npx @ruvector/postgres-cli install [options]
+
+Options:
+  -m, --method <type>     Installation method: docker, native, auto (default: "auto")
+  -p, --port <number>     PostgreSQL port (default: "5432")
+  -u, --user <name>       Database user (default: "ruvector")
+  --password <pass>       Database password (default: "ruvector")
+  -d, --database <name>   Database name (default: "ruvector")
+  --data-dir <path>       Persistent data directory (Docker only)
+  --name <name>           Container name (default: "ruvector-postgres")
+  --version <version>     RuVector version (default: "0.2.5")
+  --pg-version <version>  PostgreSQL version for native (14, 15, 16, 17) (default: "16")
+  --skip-postgres         Skip PostgreSQL installation (use existing)
+  --skip-rust             Skip Rust installation (use existing)
+```
+
+## Server Management
+
+```bash
+# Check installation status
+npx @ruvector/postgres-cli status
+
+# Start/Stop the server
+npx @ruvector/postgres-cli start
+npx @ruvector/postgres-cli stop
+
+# View logs
+npx @ruvector/postgres-cli logs
+npx @ruvector/postgres-cli logs --follow
+
+# Connect with psql
+npx @ruvector/postgres-cli psql
+npx @ruvector/postgres-cli psql "SELECT ruvector_version();"
+
+# Uninstall
+npx @ruvector/postgres-cli uninstall
+```
+
+## Tutorial 1: Semantic Search in 5 Minutes
+
+### Step 1: Install & Connect
+
+```bash
+# Install RuVector PostgreSQL
+npx @ruvector/postgres-cli install
+
+# Verify installation
 npx @ruvector/postgres-cli info
 ```
 
-## Quick Start
-
-### 1. Connect to PostgreSQL
+### Step 2: Create Vector Table
 
 ```bash
-# Set connection string
-export DATABASE_URL="postgresql://user:pass@localhost:5432/mydb"
-
-# Or use -c flag
-ruvector-pg -c "postgresql://user:pass@localhost:5432/mydb" info
+# Create table with 384-dimensional vectors and HNSW index
+npx @ruvector/postgres-cli vector create documents --dim 384 --index hnsw
 ```
 
-### 2. Install Extension
+### Step 3: Insert Vectors
 
 ```bash
-# Install ruvector extension
-ruvector-pg install
+# Insert from JSON file
+echo '[
+  {"vector": [0.1, 0.2, 0.3], "metadata": {"title": "AI Overview"}},
+  {"vector": [0.4, 0.5, 0.6], "metadata": {"title": "ML Basics"}}
+]' > docs.json
 
-# Verify installation
-ruvector-pg info
+npx @ruvector/postgres-cli vector insert documents --file docs.json
 ```
 
-### 3. Create & Search Vectors
+### Step 4: Search
 
 ```bash
-# Create a vector table with HNSW index
-ruvector-pg vector create embeddings --dim 384 --index hnsw
+# Find similar documents
+npx @ruvector/postgres-cli vector search documents \
+  --query "[0.15, 0.25, 0.35]" \
+  --top-k 5 \
+  --metric cosine
+```
 
-# Insert vectors from file
-ruvector-pg vector insert embeddings --file vectors.json
+## Tutorial 2: Hybrid Search with BM25
 
-# Search similar vectors
-ruvector-pg vector search embeddings --query "[0.1, 0.2, 0.3, ...]" --top-k 10
+Combine semantic vectors with keyword search:
 
-# Compute distance between vectors
-ruvector-pg vector distance --a "[0.1, 0.2]" --b "[0.3, 0.4]" --metric cosine
+```bash
+# Create sparse vector for text matching
+npx @ruvector/postgres-cli sparse create \
+  --indices "[0, 5, 10]" \
+  --values "[0.5, 0.3, 0.2]" \
+  --dim 10000
+
+# Compute BM25 score
+npx @ruvector/postgres-cli sparse bm25 \
+  --query '{"indices": [1,5,10], "values": [0.8,0.5,0.3]}' \
+  --doc '{"indices": [1,5], "values": [2,1]}' \
+  --doc-len 150 \
+  --avg-doc-len 200
+```
+
+## Tutorial 3: Knowledge Graph with Hyperbolic Embeddings
+
+Perfect for hierarchical data like taxonomies:
+
+```bash
+# Create a graph
+npx @ruvector/postgres-cli graph create taxonomy
+
+# Add nodes
+npx @ruvector/postgres-cli graph create-node taxonomy \
+  --labels "Category" \
+  --properties '{"name": "Science"}'
+
+npx @ruvector/postgres-cli graph create-node taxonomy \
+  --labels "Category" \
+  --properties '{"name": "Physics"}'
+
+# Add edge
+npx @ruvector/postgres-cli graph create-edge taxonomy \
+  --from 1 --to 2 --type "SUBCATEGORY"
+
+# Compute hyperbolic distance (better for hierarchies)
+npx @ruvector/postgres-cli hyperbolic poincare-distance \
+  --a "[0.1, 0.2]" \
+  --b "[0.3, 0.4]" \
+  --curvature -1.0
+```
+
+## Tutorial 4: Self-Learning Search
+
+Enable the system to learn from user feedback:
+
+```bash
+# Enable learning for a table
+npx @ruvector/postgres-cli learning enable documents \
+  --max-trajectories 1000 \
+  --num-clusters 10
+
+# Record search trajectory
+npx @ruvector/postgres-cli learning record \
+  --input "[0.1, 0.2, ...]" \
+  --output "[0.3, 0.4, ...]" \
+  --success true
+
+# Get optimized search parameters
+npx @ruvector/postgres-cli learning get-params documents \
+  --query "[0.15, 0.25, ...]"
+
+# View learning statistics
+npx @ruvector/postgres-cli learning stats documents
+```
+
+## Commands Reference
+
+### Vector Operations
+```bash
+ruvector-pg vector create <table> --dim <n> --index <hnsw|ivfflat>
+ruvector-pg vector insert <table> --file data.json
+ruvector-pg vector search <table> --query "[...]" --top-k 10 --metric cosine
+ruvector-pg vector distance --a "[...]" --b "[...]" --metric <cosine|l2|ip>
+ruvector-pg vector normalize --vector "[0.5, 0.3, 0.2]"
+```
+
+### Attention Mechanisms (39 types)
+```bash
+ruvector-pg attention compute --query "[...]" --keys "[[...]]" --values "[[...]]" --type scaled_dot
+ruvector-pg attention list-types
+```
+
+### Graph Neural Networks
+```bash
+ruvector-pg gnn create <name> --type gcn --input-dim 384 --output-dim 128
+ruvector-pg gnn forward <layer> --features features.json --edges edges.json
+```
+
+### Hyperbolic Geometry
+```bash
+ruvector-pg hyperbolic poincare-distance --a "[...]" --b "[...]"
+ruvector-pg hyperbolic lorentz-distance --a "[...]" --b "[...]"
+ruvector-pg hyperbolic mobius-add --a "[...]" --b "[...]"
+ruvector-pg hyperbolic exp-map --base "[...]" --tangent "[...]"
+ruvector-pg hyperbolic poincare-to-lorentz --vector "[...]"
+```
+
+### Sparse Vectors & BM25
+```bash
+ruvector-pg sparse create --indices "[...]" --values "[...]" --dim 10000
+ruvector-pg sparse bm25 --query "..." --doc "..." --doc-len 150 --avg-doc-len 200
+ruvector-pg sparse distance --a "..." --b "..." --metric cosine
+```
+
+### Agent Routing (Tiny Dancer)
+```bash
+ruvector-pg routing register --name "agent1" --type llm --capabilities "..." --cost 0.01 --latency 100 --quality 0.9
+ruvector-pg routing route --embedding "[...]" --optimize-for balanced
+ruvector-pg routing list
+```
+
+### Quantization
+```bash
+ruvector-pg quantization binary --vector "[...]"
+ruvector-pg quantization scalar --vector "[...]"
+ruvector-pg quantization compare "[0.1, 0.2, ...]"
+```
+
+### Benchmarking
+```bash
+ruvector-pg bench run --type all --size 10000 --dim 384
+ruvector-pg bench report --format table
 ```
 
 ## Architecture
@@ -76,7 +316,12 @@ ruvector-pg vector distance --a "[0.1, 0.2]" --b "[0.3, 0.4]" --metric cosine
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    @ruvector/postgres-cli                          │
 ├─────────────────────────────────────────────────────────────────────┤
+│  Installation Layer                                                 │
+│    ├── Docker      - Pull/build image, run container              │
+│    └── Native      - Install PG + Rust + pgrx + extension         │
+├─────────────────────────────────────────────────────────────────────┤
 │  CLI Layer (Commander.js)                                          │
+│    ├── install/status/start/stop/logs - Server management         │
 │    ├── vector    - CRUD & search operations                        │
 │    ├── attention - 39 attention mechanism types                    │
 │    ├── gnn       - Graph Neural Network layers                     │
@@ -85,155 +330,16 @@ ruvector-pg vector distance --a "[0.1, 0.2]" --b "[0.3, 0.4]" --metric cosine
 │    ├── sparse    - BM25/SPLADE scoring                             │
 │    ├── routing   - Tiny Dancer agent routing                       │
 │    ├── learning  - ReasoningBank self-learning                     │
-│    ├── bench     - Performance benchmarking                        │
-│    └── quant     - Quantization (scalar/product/binary)            │
+│    └── bench     - Performance benchmarking                        │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Client Layer (pg with connection pooling)                         │
 │    ├── Connection pooling (max 10, idle timeout 30s)               │
 │    ├── Automatic retry (3 attempts, exponential backoff)           │
-│    ├── Batch operations (1000 vectors/batch)                       │
-│    ├── SQL injection protection                                    │
-│    └── Input validation                                            │
+│    └── SQL injection protection                                    │
 ├─────────────────────────────────────────────────────────────────────┤
-│  PostgreSQL Extension (ruvector-postgres crate)                    │
-│    └── 53 SQL functions exposed via pgrx                           │
+│  PostgreSQL Extension (ruvector-postgres 0.2.5)                    │
+│    └── 53+ SQL functions exposed via pgrx                          │
 └─────────────────────────────────────────────────────────────────────┘
-```
-
-## Commands Reference
-
-### Vector Operations
-
-```bash
-# Create table with HNSW or IVFFlat index
-ruvector-pg vector create <table> --dim <n> --index <hnsw|ivfflat>
-
-# Insert from JSON file
-ruvector-pg vector insert <table> --file data.json
-
-# Semantic search
-ruvector-pg vector search <table> --query "[...]" --top-k 10 --metric cosine
-
-# Distance calculation
-ruvector-pg vector distance --a "[...]" --b "[...]" --metric <cosine|l2|ip>
-
-# Vector normalization
-ruvector-pg vector normalize --vector "[0.5, 0.3, 0.2]"
-```
-
-### Hyperbolic Geometry
-
-Perfect for hierarchical data like taxonomies and knowledge graphs:
-
-```bash
-# Poincare ball distance
-ruvector-pg hyperbolic poincare-distance --a "[0.1, 0.2]" --b "[0.3, 0.4]" --curvature -1.0
-
-# Lorentz hyperboloid distance
-ruvector-pg hyperbolic lorentz-distance --a "[1.1, 0.1, 0.2]" --b "[1.2, 0.3, 0.4]"
-
-# Mobius addition (hyperbolic translation)
-ruvector-pg hyperbolic mobius-add --a "[0.1, 0.2]" --b "[0.05, 0.1]"
-
-# Exponential map (tangent to manifold)
-ruvector-pg hyperbolic exp-map --base "[0.0, 0.0]" --tangent "[0.1, 0.2]"
-
-# Convert between models
-ruvector-pg hyperbolic poincare-to-lorentz --vector "[0.3, 0.4]"
-ruvector-pg hyperbolic lorentz-to-poincare --vector "[1.5, 0.3, 0.4]"
-```
-
-### Attention Mechanisms
-
-```bash
-# Compute attention (39 types available)
-ruvector-pg attention compute \
-  --query "[0.1, 0.2, ...]" \
-  --keys "[[...], [...]]" \
-  --values "[[...], [...]]" \
-  --type scaled_dot
-
-# List all 39 attention types
-ruvector-pg attention list-types
-```
-
-### Graph Neural Networks
-
-```bash
-# GCN layer
-ruvector-pg gnn gcn --features "[[...]]" --adj "[[...]]" --weights "[[...]]"
-
-# GraphSAGE layer
-ruvector-pg gnn graphsage --features "[[...]]" --neighbors "[[...]]"
-
-# GAT (Graph Attention) layer
-ruvector-pg gnn gat --features "[[...]]" --adj "[[...]]"
-```
-
-### Graph & Cypher
-
-```bash
-# Execute Cypher query
-ruvector-pg graph query "MATCH (n:Person)-[:KNOWS]->(m) RETURN n, m"
-
-# Create nodes and edges
-ruvector-pg graph create-node --labels "Person,Developer" --properties '{"name": "Alice"}'
-ruvector-pg graph create-edge --from node1 --to node2 --type KNOWS
-
-# Graph traversal
-ruvector-pg graph traverse --start node123 --depth 3 --type bfs
-```
-
-### Sparse Vectors & BM25
-
-```bash
-# Create sparse vector
-ruvector-pg sparse create --indices "[0, 5, 10]" --values "[0.5, 0.3, 0.2]" --dim 100
-
-# BM25 scoring
-ruvector-pg sparse bm25 --query-terms "[1, 5, 10]" --doc-freqs "[100, 50, 10]"
-
-# Sparse dot product
-ruvector-pg sparse dot --a "0:0.5,5:0.3" --b "0:0.2,5:0.8"
-```
-
-### Agent Routing (Tiny Dancer)
-
-```bash
-# Route query to best agent
-ruvector-pg routing route --query "[0.1, 0.2, ...]" --agents agents.json
-
-# Register new agent
-ruvector-pg routing register --name "summarizer" --capabilities "[0.8, 0.2, ...]"
-
-# Multi-agent routing
-ruvector-pg routing multi-route --query "[...]" --top-k 3
-```
-
-### Self-Learning (ReasoningBank)
-
-```bash
-# Record learning trajectory
-ruvector-pg learning record --input "[...]" --output "[...]" --success true
-
-# Get adaptive search parameters
-ruvector-pg learning adaptive-search --context "[0.1, 0.2, ...]"
-
-# Train from trajectories
-ruvector-pg learning train --file trajectories.json --epochs 10
-```
-
-### Benchmarking
-
-```bash
-# Run full benchmark suite
-ruvector-pg bench run --type all --size 10000 --dim 384
-
-# Benchmark specific operation
-ruvector-pg bench run --type search --size 100000 --dim 768
-
-# Generate report
-ruvector-pg bench report --format table
 ```
 
 ## Benchmarks
@@ -251,66 +357,6 @@ Performance measured on AMD EPYC 7763 (64 cores), 256GB RAM:
 
 *Dimensions: 384 for vector ops, 128 for GNN*
 
-## Docker Quick Start
-
-```bash
-# Pull and run the RuVector PostgreSQL image
-docker run -d --name ruvector-pg \
-  -e POSTGRES_PASSWORD=secret \
-  -p 5432:5432 \
-  ruvector/postgres:latest
-
-# Connect with CLI
-ruvector-pg -c "postgresql://postgres:secret@localhost:5432/postgres" install
-```
-
-## Usage Tutorial: Building a Semantic Search Engine
-
-### Step 1: Setup
-
-```bash
-# Create database
-createdb semantic_search
-ruvector-pg -c "postgresql://localhost/semantic_search" install
-```
-
-### Step 2: Create Embeddings Table
-
-```bash
-ruvector-pg vector create documents --dim 384 --index hnsw
-```
-
-### Step 3: Insert Documents (from JSON)
-
-```json
-// documents.json
-[
-  {"vector": [0.1, 0.2, ...], "metadata": {"title": "AI Overview", "category": "tech"}},
-  {"vector": [0.3, 0.1, ...], "metadata": {"title": "ML Basics", "category": "tech"}}
-]
-```
-
-```bash
-ruvector-pg vector insert documents --file documents.json
-```
-
-### Step 4: Semantic Search
-
-```bash
-# Find similar documents
-ruvector-pg vector search documents \
-  --query "[0.15, 0.18, ...]" \
-  --top-k 5 \
-  --metric cosine
-```
-
-### Step 5: Add Hybrid Search with BM25
-
-```bash
-# Create sparse representation for text search
-ruvector-pg sparse create --indices "[10, 25, 42]" --values "[2.5, 1.8, 3.2]" --dim 10000
-```
-
 ## Environment Variables
 
 | Variable | Description | Default |
@@ -320,31 +366,44 @@ ruvector-pg sparse create --indices "[10, 25, 42]" --values "[2.5, 1.8, 3.2]" --
 | `RUVECTOR_TIMEOUT` | Query timeout (ms) | `30000` |
 | `RUVECTOR_RETRIES` | Max retry attempts | `3` |
 
-## Global Options
+## Troubleshooting
+
+### Docker Issues
 
 ```bash
--c, --connection <string>  PostgreSQL connection string
--v, --verbose              Enable verbose output
--h, --help                 Display help
---version                  Display version
+# Check if Docker is running
+docker info
+
+# View container logs
+npx @ruvector/postgres-cli logs
+
+# Restart container
+npx @ruvector/postgres-cli stop && npx @ruvector/postgres-cli start
 ```
 
-## Features Summary
+### Native Installation Issues
 
-- **Vector Search**: HNSW and IVFFlat indexes with cosine, L2, inner product, and hyperbolic metrics
-- **39 Attention Mechanisms**: Scaled dot-product, multi-head, flash, sparse, linear, causal, and more
-- **Graph Neural Networks**: GCN, GraphSAGE, GAT, GIN layers with message passing
-- **Graph Operations**: Full Cypher query support, BFS/DFS traversal, PageRank
-- **Self-Learning**: ReasoningBank-based trajectory learning and adaptive search
-- **Hyperbolic Embeddings**: Poincare ball and Lorentz hyperboloid models for hierarchies
-- **Sparse Vectors**: BM25, TF-IDF, and SPLADE for hybrid search
-- **Agent Routing**: Tiny Dancer routing with FastGRNN acceleration
-- **Quantization**: Scalar, product, and binary quantization for memory efficiency
-- **Performance**: Connection pooling, batch operations, automatic retries
+```bash
+# Check PostgreSQL is running
+sudo systemctl status postgresql
+
+# Check pgrx installation
+cargo pgrx --version
+
+# Reinstall extension
+npx @ruvector/postgres-cli install --method native --skip-postgres --skip-rust
+```
+
+### Permission Issues
+
+```bash
+# Native install may require sudo for PostgreSQL operations
+# The installer will prompt for sudo password when needed
+```
 
 ## Related Packages
 
-- [`ruvector-postgres`](https://crates.io/crates/ruvector-postgres) - Rust PostgreSQL extension
+- [`ruvector-postgres`](https://crates.io/crates/ruvector-postgres) - Rust PostgreSQL extension (v0.2.5)
 - [`ruvector-core`](https://crates.io/crates/ruvector-core) - Core vector operations library
 
 ## Contributing
