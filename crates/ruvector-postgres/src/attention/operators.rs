@@ -17,7 +17,7 @@ use super::{Attention, AttentionType, ScaledDotAttention, MultiHeadAttention, Fl
 /// );
 /// ```
 #[pg_extern(immutable, parallel_safe)]
-fn ruvector_attention_score(
+pub fn ruvector_attention_score(
     query: Vec<f32>,
     key: Vec<f32>,
     attention_type: default!(&str, "'scaled_dot'"),
@@ -58,7 +58,7 @@ fn ruvector_attention_score(
 /// -- Returns: {0.09, 0.24, 0.67}
 /// ```
 #[pg_extern(immutable, parallel_safe)]
-fn ruvector_softmax(scores: Vec<f32>) -> Vec<f32> {
+pub fn ruvector_softmax(scores: Vec<f32>) -> Vec<f32> {
     if scores.is_empty() {
         return Vec::new();
     }
@@ -78,7 +78,7 @@ fn ruvector_softmax(scores: Vec<f32>) -> Vec<f32> {
 /// );
 /// ```
 #[pg_extern(immutable, parallel_safe)]
-fn ruvector_multi_head_attention(
+pub fn ruvector_multi_head_attention(
     query: Vec<f32>,
     keys_json: JsonB,
     values_json: JsonB,
@@ -159,7 +159,7 @@ fn ruvector_multi_head_attention(
 /// );
 /// ```
 #[pg_extern(immutable, parallel_safe)]
-fn ruvector_flash_attention(
+pub fn ruvector_flash_attention(
     query: Vec<f32>,
     keys_json: JsonB,
     values_json: JsonB,
@@ -213,7 +213,7 @@ fn ruvector_flash_attention(
 /// SELECT * FROM ruvector_attention_types();
 /// ```
 #[pg_extern]
-fn ruvector_attention_types() -> TableIterator<
+pub fn ruvector_attention_types() -> TableIterator<
     'static,
     (
         name!(name, String),
@@ -252,7 +252,7 @@ fn ruvector_attention_types() -> TableIterator<
 /// -- Returns array of attention scores
 /// ```
 #[pg_extern(immutable, parallel_safe)]
-fn ruvector_attention_scores(
+pub fn ruvector_attention_scores(
     query: Vec<f32>,
     keys_json: JsonB,
     attention_type: default!(&str, "'scaled_dot'"),

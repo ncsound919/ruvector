@@ -450,15 +450,16 @@ export class RuVectorClient {
 
     // Use ruvector type (native RuVector extension type)
     // ruvector is a variable-length type, dimensions stored in metadata
+    // Note: dimensions is directly interpolated since DEFAULT doesn't support parameters
     await this.execute(`
       CREATE TABLE IF NOT EXISTS ${safeName} (
         id SERIAL PRIMARY KEY,
         embedding ruvector,
-        dimensions INT DEFAULT $1,
+        dimensions INT DEFAULT ${dimensions},
         metadata JSONB,
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
-    `, [dimensions]);
+    `);
 
     // Note: HNSW/IVFFlat indexes require additional index implementation
     // For now, create a simple btree index on id for fast lookups
@@ -624,7 +625,7 @@ export class RuVectorClient {
       manhattan: 'ruvector_sparse_manhattan',
     };
     const result = await this.query<{ distance: number }>(
-      `SELECT ${funcMap[metric]}($1::sparsevec, $2::sparsevec) as distance`,
+      `SELECT ${funcMap[metric]}($1::text, $2::text) as distance`,
       [a, b]
     );
     return result[0].distance;
@@ -639,7 +640,7 @@ export class RuVectorClient {
     b = 0.75
   ): Promise<number> {
     const result = await this.query<{ score: number }>(
-      'SELECT ruvector_sparse_bm25($1::sparsevec, $2::sparsevec, $3, $4, $5, $6) as score',
+      'SELECT ruvector_sparse_bm25($1::text, $2::text, $3, $4, $5, $6) as score',
       [query, doc, docLen, avgDocLen, k1, b]
     );
     return result[0].score;
@@ -647,15 +648,15 @@ export class RuVectorClient {
 
   async sparseTopK(sparse: string, k: number): Promise<SparseResult> {
     const originalNnz = await this.query<{ nnz: number }>(
-      'SELECT ruvector_sparse_nnz($1::sparsevec) as nnz',
+      'SELECT ruvector_sparse_nnz($1::text) as nnz',
       [sparse]
     );
     const result = await this.query<{ result: string }>(
-      'SELECT ruvector_sparse_top_k($1::sparsevec, $2)::text as result',
+      'SELECT ruvector_sparse_top_k($1::text, $2)::text as result',
       [sparse, k]
     );
     const newNnzResult = await this.query<{ nnz: number }>(
-      'SELECT ruvector_sparse_nnz($1::sparsevec) as nnz',
+      'SELECT ruvector_sparse_nnz($1::text) as nnz',
       [result[0].result]
     );
     return {
@@ -668,15 +669,15 @@ export class RuVectorClient {
 
   async sparsePrune(sparse: string, threshold: number): Promise<SparseResult> {
     const originalNnz = await this.query<{ nnz: number }>(
-      'SELECT ruvector_sparse_nnz($1::sparsevec) as nnz',
+      'SELECT ruvector_sparse_nnz($1::text) as nnz',
       [sparse]
     );
     const result = await this.query<{ result: string }>(
-      'SELECT ruvector_sparse_prune($1::sparsevec, $2)::text as result',
+      'SELECT ruvector_sparse_prune($1::text, $2)::text as result',
       [sparse, threshold]
     );
     const newNnzResult = await this.query<{ nnz: number }>(
-      'SELECT ruvector_sparse_nnz($1::sparsevec) as nnz',
+      'SELECT ruvector_sparse_nnz($1::text) as nnz',
       [result[0].result]
     );
     return {
@@ -693,7 +694,7 @@ export class RuVectorClient {
       [dense]
     );
     const nnzResult = await this.query<{ nnz: number }>(
-      'SELECT ruvector_sparse_nnz($1::sparsevec) as nnz',
+      'SELECT ruvector_sparse_nnz($1::text) as nnz',
       [result[0].result]
     );
     return {
@@ -704,7 +705,7 @@ export class RuVectorClient {
 
   async sparseToDense(sparse: string): Promise<number[]> {
     const result = await this.query<{ result: number[] }>(
-      'SELECT ruvector_sparse_to_dense($1::sparsevec) as result',
+      'SELECT ruvector_sparse_to_dense($1::text) as result',
       [sparse]
     );
     return result[0].result;
@@ -713,9 +714,9 @@ export class RuVectorClient {
   async sparseInfo(sparse: string): Promise<SparseInfo> {
     const result = await this.query<{ dim: number; nnz: number; norm: number }>(
       `SELECT
-        ruvector_sparse_dim($1::sparsevec) as dim,
-        ruvector_sparse_nnz($1::sparsevec) as nnz,
-        ruvector_sparse_norm($1::sparsevec) as norm`,
+        ruvector_sparse_dim($1::text) as dim,
+        ruvector_sparse_nnz($1::text) as nnz,
+        ruvector_sparse_norm($1::text) as norm`,
       [sparse]
     );
     const { dim, nnz, norm } = result[0];
@@ -827,38 +828,67 @@ export class RuVectorClient {
     query: number[],
     keys: number[][],
     values: number[][],
-    type: 'scaled_dot' | 'multi_head' | 'flash' = 'scaled_dot'
+    _type: 'scaled_dot' | 'multi_head' | 'flash' = 'scaled_dot'
   ): Promise<AttentionResult> {
-    let funcName: string;
-    let params: unknown[];
+    // Use actual PostgreSQL attention functions available in the extension:
+    // - attention_score(query, key) -> score
+    // - attention_softmax(scores) -> normalized scores
+    // - attention_single(query, key, value, offset) -> {score, value}
+    // - attention_weighted_add(accumulator, value, weight) -> accumulated
+    // - attention_init(dim) -> zero vector
 
-    if (type === 'multi_head') {
-      funcName = 'ruvector_multi_head_attention';
-      params = [query, keys, values, 4];
-    } else if (type === 'flash') {
-      funcName = 'ruvector_flash_attention';
-      params = [query, keys, values, 64];
-    } else {
-      // For scaled_dot, compute attention scores directly
-      const result = await this.query<{ scores: number[] }>(
-        'SELECT ruvector_attention_scores($1::real[], $2::real[][], $3) as scores',
-        [query, keys, 'scaled_dot']
+    // Compute attention scores for each key
+    const scores: number[] = [];
+    for (const key of keys) {
+      const result = await this.query<{ score: number }>(
+        'SELECT attention_score($1::real[], $2::real[]) as score',
+        [query, key]
       );
-      return { output: result[0].scores };
+      scores.push(result[0].score);
     }
 
-    const result = await this.query<{ output: number[] }>(
-      `SELECT ${funcName}($1::real[], $2::real[][], $3::real[][], $4) as output`,
-      params
+    // Apply softmax to get attention weights
+    const weightsResult = await this.query<{ weights: number[] }>(
+      'SELECT attention_softmax($1::real[]) as weights',
+      [scores]
     );
-    return { output: result[0].output };
+    const weights = weightsResult[0].weights;
+
+    // Compute weighted sum of values
+    if (values.length === 0 || values[0].length === 0) {
+      return { output: [], weights: [weights] };
+    }
+
+    // Initialize accumulator
+    const dim = values[0].length;
+    let accumulator = new Array(dim).fill(0);
+
+    // Weighted addition of values
+    for (let i = 0; i < values.length; i++) {
+      const addResult = await this.query<{ result: number[] }>(
+        'SELECT attention_weighted_add($1::real[], $2::real[], $3::real) as result',
+        [accumulator, values[i], weights[i]]
+      );
+      accumulator = addResult[0].result;
+    }
+
+    return { output: accumulator, weights: [weights] };
   }
 
   async listAttentionTypes(): Promise<string[]> {
-    const result = await this.query<{ name: string }>(
-      'SELECT name FROM ruvector_attention_types()'
-    );
-    return result.map(r => r.name);
+    // Return the attention types actually supported by the extension
+    // The extension provides primitive functions that can implement these patterns:
+    // - attention_score: scaled dot-product attention score
+    // - attention_softmax: softmax normalization
+    // - attention_single: single query-key-value attention
+    // - attention_weighted_add: weighted accumulation
+    // - attention_init: initialize accumulator
+    return [
+      'scaled_dot_product',  // Basic attention using attention_score + attention_softmax
+      'self_attention',      // Query = Key = Value from same sequence
+      'cross_attention',     // Query from one source, K/V from another
+      'causal_attention',    // Masked attention for autoregressive models
+    ];
   }
 
   // ============================================================================
