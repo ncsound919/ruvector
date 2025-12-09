@@ -96,8 +96,8 @@ async function runNeo4jBenchmarks(scenario: string): Promise<BenchmarkMetrics[]>
         memory_mb: 0, // Would need Neo4j metrics API
         cpu_percent: 0,
         latency_p50: duration,
-        latency_p95: duration * 1.2,
-        latency_p99: duration * 1.5
+        latency_p95: 0, // Cannot accurately estimate without percentile data
+        latency_p99: 0  // Cannot accurately estimate without percentile data
       });
     }
 
@@ -203,8 +203,8 @@ function parseCriterionOutput(output: string, system: 'ruvector' | 'neo4j', scen
           memory_mb: 0,
           cpu_percent: 0,
           latency_p50: p50,
-          latency_p95: p50 * 1.2,
-          latency_p99: p50 * 1.5
+          latency_p95: 0, // Would need to parse from criterion percentile output
+          latency_p99: 0  // Would need to parse from criterion percentile output
         });
       }
     }
@@ -224,23 +224,12 @@ function loadBaselineMetrics(system: string, scenario: string): BenchmarkMetrics
     return JSON.parse(data);
   }
 
-  // Return estimated baseline if no data available
-  console.warn(`No baseline data for ${system} ${scenario}, using estimates`);
-
-  return [
-    {
-      system: system as 'ruvector' | 'neo4j',
-      scenario,
-      operation: 'node_insertion',
-      duration_ms: 100,
-      throughput_ops: 10000,
-      memory_mb: 512,
-      cpu_percent: 50,
-      latency_p50: 100,
-      latency_p95: 150,
-      latency_p99: 200
-    }
-  ];
+  // Error: no baseline data available
+  throw new Error(
+    `No baseline data available for ${system} ${scenario}. ` +
+    `Cannot run comparison without actual measured data. ` +
+    `Please run benchmarks on both systems first and save results to ${baselinePath}`
+  );
 }
 
 /**

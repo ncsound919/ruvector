@@ -43,6 +43,9 @@ once_cell = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
+# HTTP client for API embeddings
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
@@ -70,6 +73,10 @@ harness = false
 name = "comprehensive_bench"
 harness = false
 
+[[bench]]
+name = "real_benchmark"
+harness = false
+
 [features]
 default = ["simd", "storage", "hnsw"]
 simd = []
@@ -77,6 +84,7 @@ storage = ["redb", "memmap2"]  # File-based storage (not available in WASM)
 hnsw = ["hnsw_rs"]  # HNSW indexing (not available in WASM due to mmap dependency)
 memory-only = []  # Pure in-memory storage for WASM
 uuid-support = []  # Deprecated: uuid is now always included
+real-embeddings = []  # Feature flag for embedding provider API (use ApiEmbedding for production)
 
 [lib]
 crate-type = ["rlib"]

@@ -2,13 +2,28 @@
 //!
 //! High-performance Rust-native vector database with HNSW indexing and SIMD-optimized operations.
 //!
-//! ## Features
+//! ## Working Features (Tested & Benchmarked)
 //!
-//! - **HNSW Indexing**: O(log n) search with 95%+ recall
-//! - **SIMD Optimizations**: 4-16x faster distance calculations
-//! - **Quantization**: 4-32x memory compression
-//! - **Zero-copy Memory**: Memory-mapped vectors for instant loading
-//! - **AgenticDB Compatible**: Drop-in replacement with 10-100x speedup
+//! - **HNSW Indexing**: Approximate nearest neighbor search with O(log n) complexity
+//! - **SIMD Distance**: SimSIMD-powered distance calculations (~16M ops/sec for 512-dim)
+//! - **Quantization**: Scalar (4x) and binary (32x) compression with distance support
+//! - **Persistence**: REDB-based storage with config persistence
+//! - **Search**: ~2.5K queries/sec on 10K vectors (benchmarked)
+//!
+//! ## ⚠️ Experimental/Incomplete Features - READ BEFORE USE
+//!
+//! - **AgenticDB**: ⚠️⚠️⚠️ **CRITICAL WARNING** ⚠️⚠️⚠️
+//!   - Uses PLACEHOLDER hash-based embeddings, NOT real semantic embeddings
+//!   - "dog" and "cat" will NOT be similar (different characters)
+//!   - "dog" and "god" WILL be similar (same characters) - **This is wrong!**
+//!   - **MUST integrate real embedding model for production** (ONNX, Candle, or API)
+//!   - See [`agenticdb`] module docs and `/examples/onnx-embeddings` for integration
+//! - **Advanced Features**: Conformal prediction, hybrid search - functional but less tested
+//!
+//! ## What This Is NOT
+//!
+//! - This is NOT a complete RAG solution - you need external embedding models
+//! - Examples use mock embeddings for demonstration only
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -20,6 +35,7 @@ pub mod advanced_features;
 pub mod agenticdb;
 
 pub mod distance;
+pub mod embeddings;
 pub mod error;
 pub mod index;
 pub mod quantization;
@@ -55,6 +71,23 @@ pub use advanced_features::{
 
 #[cfg(feature = "storage")]
 pub use agenticdb::AgenticDB;
+
+pub use embeddings::{EmbeddingProvider, HashEmbedding, ApiEmbedding, BoxedEmbeddingProvider};
+
+#[cfg(feature = "real-embeddings")]
+pub use embeddings::CandleEmbedding;
+
+// Compile-time warning about AgenticDB limitations
+#[cfg(feature = "storage")]
+const _: () = {
+    // This will appear in cargo build output as a note
+    #[deprecated(
+        since = "0.1.0",
+        note = "AgenticDB uses placeholder hash-based embeddings. For semantic search, integrate a real embedding model (ONNX, Candle, or API). See /examples/onnx-embeddings for production setup."
+    )]
+    const AGENTICDB_EMBEDDING_WARNING: () = ();
+    let _ = AGENTICDB_EMBEDDING_WARNING;
+};
 
 pub use error::{Result, RuvectorError};
 pub use types::{DistanceMetric, SearchQuery, SearchResult, VectorEntry, VectorId};

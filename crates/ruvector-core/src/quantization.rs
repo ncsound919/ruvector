@@ -49,6 +49,13 @@ impl QuantizedVector for ScalarQuantized {
     fn distance(&self, other: &Self) -> f32 {
         // Fast int8 distance calculation
         // Use i32 to avoid overflow: max diff is 255, and 255*255=65025 fits in i32
+
+        // Scale handling: We use the average of both scales for balanced comparison.
+        // Using max(scale) would bias toward the vector with larger range,
+        // while average provides a more symmetric distance metric.
+        // This ensures distance(a, b) ≈ distance(b, a) in the reconstructed space.
+        let avg_scale = (self.scale + other.scale) / 2.0;
+
         self.data
             .iter()
             .zip(&other.data)
@@ -58,7 +65,7 @@ impl QuantizedVector for ScalarQuantized {
             })
             .sum::<f32>()
             .sqrt()
-            * self.scale.max(other.scale)
+            * avg_scale
     }
 
     fn reconstruct(&self) -> Vec<f32> {
@@ -306,5 +313,118 @@ mod tests {
 
         let dist = q1.distance(&q2);
         assert_eq!(dist, 2.0); // 2 bits differ
+    }
+
+    #[test]
+    fn test_scalar_quantization_roundtrip() {
+        // Test that quantize -> reconstruct produces values close to original
+        let test_vectors = vec![
+            vec![1.0, 2.0, 3.0, 4.0, 5.0],
+            vec![-10.0, -5.0, 0.0, 5.0, 10.0],
+            vec![0.1, 0.2, 0.3, 0.4, 0.5],
+            vec![100.0, 200.0, 300.0, 400.0, 500.0],
+        ];
+
+        for vector in test_vectors {
+            let quantized = ScalarQuantized::quantize(&vector);
+            let reconstructed = quantized.reconstruct();
+
+            assert_eq!(vector.len(), reconstructed.len());
+
+            for (orig, recon) in vector.iter().zip(reconstructed.iter()) {
+                // With 8-bit quantization, max error is roughly (max-min)/255
+                let max = vector.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let min = vector.iter().copied().fold(f32::INFINITY, f32::min);
+                let max_error = (max - min) / 255.0 * 2.0; // Allow 2x for rounding
+
+                assert!(
+                    (orig - recon).abs() < max_error,
+                    "Roundtrip error too large: orig={}, recon={}, error={}",
+                    orig,
+                    recon,
+                    (orig - recon).abs()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_scalar_distance_symmetry() {
+        // Test that distance(a, b) == distance(b, a)
+        let v1 = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let v2 = vec![2.0, 3.0, 4.0, 5.0, 6.0];
+
+        let q1 = ScalarQuantized::quantize(&v1);
+        let q2 = ScalarQuantized::quantize(&v2);
+
+        let dist_ab = q1.distance(&q2);
+        let dist_ba = q2.distance(&q1);
+
+        // Distance should be symmetric (within floating point precision)
+        assert!(
+            (dist_ab - dist_ba).abs() < 0.01,
+            "Distance is not symmetric: d(a,b)={}, d(b,a)={}",
+            dist_ab,
+            dist_ba
+        );
+    }
+
+    #[test]
+    fn test_scalar_distance_different_scales() {
+        // Test distance calculation with vectors that have different scales
+        let v1 = vec![1.0, 2.0, 3.0, 4.0, 5.0]; // range: 4.0
+        let v2 = vec![10.0, 20.0, 30.0, 40.0, 50.0]; // range: 40.0
+
+        let q1 = ScalarQuantized::quantize(&v1);
+        let q2 = ScalarQuantized::quantize(&v2);
+
+        let dist_ab = q1.distance(&q2);
+        let dist_ba = q2.distance(&q1);
+
+        // With average scaling, symmetry should be maintained
+        assert!(
+            (dist_ab - dist_ba).abs() < 0.01,
+            "Distance with different scales not symmetric: d(a,b)={}, d(b,a)={}",
+            dist_ab,
+            dist_ba
+        );
+    }
+
+    #[test]
+    fn test_scalar_quantization_edge_cases() {
+        // Test with all same values
+        let same_values = vec![5.0, 5.0, 5.0, 5.0];
+        let quantized = ScalarQuantized::quantize(&same_values);
+        let reconstructed = quantized.reconstruct();
+
+        for (orig, recon) in same_values.iter().zip(reconstructed.iter()) {
+            assert!((orig - recon).abs() < 0.01);
+        }
+
+        // Test with extreme ranges
+        let extreme = vec![f32::MIN / 1e10, 0.0, f32::MAX / 1e10];
+        let quantized = ScalarQuantized::quantize(&extreme);
+        let reconstructed = quantized.reconstruct();
+
+        assert_eq!(extreme.len(), reconstructed.len());
+    }
+
+    #[test]
+    fn test_binary_distance_symmetry() {
+        // Test that binary distance is symmetric
+        let v1 = vec![1.0, -1.0, 1.0, -1.0];
+        let v2 = vec![1.0, 1.0, -1.0, -1.0];
+
+        let q1 = BinaryQuantized::quantize(&v1);
+        let q2 = BinaryQuantized::quantize(&v2);
+
+        let dist_ab = q1.distance(&q2);
+        let dist_ba = q2.distance(&q1);
+
+        assert_eq!(
+            dist_ab, dist_ba,
+            "Binary distance not symmetric: d(a,b)={}, d(b,a)={}",
+            dist_ab, dist_ba
+        );
     }
 }

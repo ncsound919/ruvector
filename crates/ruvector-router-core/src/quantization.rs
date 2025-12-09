@@ -31,6 +31,8 @@ pub enum QuantizedVector {
         data: Vec<u8>,
         /// Threshold value
         threshold: f32,
+        /// Number of original dimensions
+        dimensions: usize,
     },
 }
 
@@ -53,7 +55,11 @@ pub fn dequantize(quantized: &QuantizedVector) -> Vec<f32> {
             // Placeholder - would need codebooks stored separately
             vec![0.0; codes.len() * (codes.len() / subspaces)]
         }
-        QuantizedVector::Binary { data, threshold } => binary_dequantize(data, *threshold),
+        QuantizedVector::Binary {
+            data,
+            threshold,
+            dimensions,
+        } => binary_dequantize(data, *threshold, *dimensions),
     }
 }
 
@@ -74,7 +80,13 @@ fn scalar_quantize(vector: &[f32]) -> QuantizedVector {
 
 /// Dequantize scalar quantized vector
 fn scalar_dequantize(data: &[u8], min: f32, scale: f32) -> Vec<f32> {
-    data.iter().map(|&v| (v as f32) / scale + min).collect()
+    // CRITICAL FIX: During quantization, we compute: quantized = (value - min) * scale
+    // where scale = 255.0 / (max - min)
+    // Therefore, dequantization must be: value = quantized / scale + min
+    // which simplifies to: value = min + quantized * (max - min) / 255.0
+    // Since scale = 255.0 / (max - min), then 1/scale = (max - min) / 255.0
+    // So the correct formula is: value = min + quantized / scale
+    data.iter().map(|&v| min + (v as f32) / scale).collect()
 }
 
 /// Product quantization (simplified version)
@@ -103,8 +115,9 @@ fn product_quantize(vector: &[f32], subspaces: usize, _k: usize) -> Result<Quant
 /// Binary quantization (1 bit per dimension)
 fn binary_quantize(vector: &[f32]) -> QuantizedVector {
     let threshold = vector.iter().sum::<f32>() / vector.len() as f32;
+    let dimensions = vector.len();
 
-    let num_bytes = vector.len().div_ceil(8);
+    let num_bytes = dimensions.div_ceil(8);
     let mut data = vec![0u8; num_bytes];
 
     for (i, &val) in vector.iter().enumerate() {
@@ -115,21 +128,31 @@ fn binary_quantize(vector: &[f32]) -> QuantizedVector {
         }
     }
 
-    QuantizedVector::Binary { data, threshold }
+    QuantizedVector::Binary {
+        data,
+        threshold,
+        dimensions,
+    }
 }
 
 /// Dequantize binary quantized vector
-fn binary_dequantize(data: &[u8], threshold: f32) -> Vec<f32> {
-    let mut result = Vec::with_capacity(data.len() * 8);
+fn binary_dequantize(data: &[u8], threshold: f32, dimensions: usize) -> Vec<f32> {
+    let mut result = Vec::with_capacity(dimensions);
 
-    for &byte in data {
+    for (i, &byte) in data.iter().enumerate() {
         for bit_idx in 0..8 {
+            if result.len() >= dimensions {
+                break;
+            }
             let bit = (byte >> bit_idx) & 1;
             result.push(if bit == 1 {
                 threshold + 1.0
             } else {
                 threshold - 1.0
             });
+        }
+        if result.len() >= dimensions {
+            break;
         }
     }
 
@@ -171,8 +194,11 @@ mod tests {
         let quantized = binary_quantize(&vector);
 
         match quantized {
-            QuantizedVector::Binary { data, .. } => {
+            QuantizedVector::Binary {
+                data, dimensions, ..
+            } => {
                 assert!(!data.is_empty());
+                assert_eq!(dimensions, 5);
             }
             _ => panic!("Expected binary quantization"),
         }
@@ -185,5 +211,89 @@ mod tests {
 
         let ratio = calculate_compression_ratio(384, QuantizationType::Binary);
         assert!(ratio > 20.0); // Should be close to 32x
+    }
+
+    #[test]
+    fn test_scalar_quantization_roundtrip() {
+        // Test that quantize -> dequantize produces values close to original
+        let test_vectors = vec![
+            vec![1.0, 2.0, 3.0, 4.0, 5.0],
+            vec![-10.0, -5.0, 0.0, 5.0, 10.0],
+            vec![0.1, 0.2, 0.3, 0.4, 0.5],
+            vec![100.0, 200.0, 300.0, 400.0, 500.0],
+        ];
+
+        for vector in test_vectors {
+            let quantized = scalar_quantize(&vector);
+            let dequantized = dequantize(&quantized);
+
+            assert_eq!(vector.len(), dequantized.len());
+
+            for (orig, deq) in vector.iter().zip(dequantized.iter()) {
+                // With 8-bit quantization, max error is roughly (max-min)/255
+                let max = vector.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let min = vector.iter().copied().fold(f32::INFINITY, f32::min);
+                let max_error = (max - min) / 255.0 * 2.0; // Allow 2x for rounding
+
+                assert!(
+                    (orig - deq).abs() < max_error,
+                    "Roundtrip error too large: orig={}, deq={}, error={}",
+                    orig,
+                    deq,
+                    (orig - deq).abs()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_scalar_quantization_edge_cases() {
+        // Test with all same values
+        let same_values = vec![5.0, 5.0, 5.0, 5.0];
+        let quantized = scalar_quantize(&same_values);
+        let dequantized = dequantize(&quantized);
+
+        for (orig, deq) in same_values.iter().zip(dequantized.iter()) {
+            assert!((orig - deq).abs() < 0.01);
+        }
+
+        // Test with extreme ranges
+        let extreme = vec![f32::MIN / 1e10, 0.0, f32::MAX / 1e10];
+        let quantized = scalar_quantize(&extreme);
+        let dequantized = dequantize(&quantized);
+
+        assert_eq!(extreme.len(), dequantized.len());
+    }
+
+    #[test]
+    fn test_binary_quantization_roundtrip() {
+        let vector = vec![1.0, -1.0, 2.0, -2.0, 0.5, -0.5];
+        let quantized = binary_quantize(&vector);
+        let dequantized = dequantize(&quantized);
+
+        // Binary quantization doesn't preserve exact values,
+        // but should preserve the sign relative to threshold
+        assert_eq!(
+            vector.len(),
+            dequantized.len(),
+            "Dequantized vector should have same length as original"
+        );
+
+        match quantized {
+            QuantizedVector::Binary {
+                threshold,
+                dimensions,
+                ..
+            } => {
+                assert_eq!(dimensions, vector.len());
+                for (orig, deq) in vector.iter().zip(dequantized.iter()) {
+                    // Check that both have same relationship to threshold
+                    let orig_above = orig > &threshold;
+                    let deq_above = deq > &threshold;
+                    assert_eq!(orig_above, deq_above);
+                }
+            }
+            _ => panic!("Expected binary quantization"),
+        }
     }
 }

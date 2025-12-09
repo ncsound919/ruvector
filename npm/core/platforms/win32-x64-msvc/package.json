@@ -1,11 +1,15 @@
 {
   "name": "ruvector-core-win32-x64-msvc",
-  "version": "0.1.17",
+  "version": "0.1.25",
   "description": "Windows x64 MSVC native binding for ruvector-core - High-performance vector database with HNSW indexing built in Rust",
   "main": "index.js",
   "type": "commonjs",
-  "os": ["win32"],
-  "cpu": ["x64"],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
   "author": "ruv.io Team <info@ruv.io> (https://ruv.io)",
   "homepage": "https://ruv.io",
   "engines": {

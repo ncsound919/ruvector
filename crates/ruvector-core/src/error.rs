@@ -29,9 +29,21 @@ pub enum RuvectorError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    /// Invalid dimension
+    #[error("Invalid dimension: {0}")]
+    InvalidDimension(String),
+
     /// Storage error
     #[error("Storage error: {0}")]
     StorageError(String),
+
+    /// Model loading error
+    #[error("Model loading error: {0}")]
+    ModelLoadError(String),
+
+    /// Model inference error
+    #[error("Model inference error: {0}")]
+    ModelInferenceError(String),
 
     /// Index error
     #[error("Index error: {0}")]

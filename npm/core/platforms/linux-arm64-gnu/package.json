@@ -1,11 +1,15 @@
 {
   "name": "ruvector-core-linux-arm64-gnu",
-  "version": "0.1.17",
+  "version": "0.1.25",
   "description": "Linux ARM64 GNU native binding for ruvector-core - High-performance vector database with HNSW indexing built in Rust",
   "main": "index.js",
   "type": "commonjs",
-  "os": ["linux"],
-  "cpu": ["arm64"],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
   "author": "ruv.io Team <info@ruv.io> (https://ruv.io)",
   "homepage": "https://ruv.io",
   "engines": {

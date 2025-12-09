@@ -1,10 +1,36 @@
 # AgenticDB API Documentation
 
+## ⚠️ CRITICAL LIMITATION: Placeholder Embeddings
+
+**THIS MODULE USES HASH-BASED PLACEHOLDER EMBEDDINGS - NOT REAL SEMANTIC EMBEDDINGS**
+
+### What This Means
+
+The current implementation uses a simple hash function to generate embeddings, which does **NOT** understand semantic meaning:
+
+- ❌ "dog" and "cat" will NOT be similar (different characters)
+- ❌ "happy" and "joyful" will NOT be similar (different characters)
+- ❌ "car" and "automobile" will NOT be similar (different characters)
+- ✅ "dog" and "god" WILL be similar (same characters) - **This is wrong for semantic search!**
+
+### For Production Use
+
+**You MUST integrate a real embedding model:**
+
+1. **ONNX Runtime** (Recommended): See `/examples/onnx-embeddings`
+2. **Candle** (Pure Rust): Native inference with Hugging Face models
+3. **API-based**: OpenAI, Cohere, Anthropic embeddings
+4. **Python Bindings**: sentence-transformers via PyO3
+
+See the module-level documentation in `agenticdb.rs` for integration examples.
+
+---
+
 ## Phase 3 Implementation Complete ✅
 
 ### Overview
 
-Ruvector now includes full AgenticDB API compatibility with 10-100x performance improvements over the original implementation. The implementation provides five specialized tables for agentic AI systems:
+Ruvector includes full AgenticDB API compatibility with 10-100x performance improvements over the original implementation. The implementation provides five specialized tables for agentic AI systems:
 
 1. **vectors_table** - Core embeddings with metadata
 2. **reflexion_episodes** - Self-critique memory for learning from mistakes
@@ -75,7 +101,9 @@ pub fn retrieve_similar_episodes(
 ) -> Result<Vec<ReflexionEpisode>>
 ```
 
-**Description**: Retrieves the k most similar past episodes based on semantic similarity.
+**Description**: Retrieves the k most similar past episodes.
+
+**⚠️ WARNING**: With placeholder embeddings, similarity is based on character overlap, NOT semantic meaning. Integrate a real embedding model for production use.
 
 **Parameters**:
 - `query`: Natural language query describing the current situation
@@ -150,6 +178,8 @@ pub fn search_skills(
 ```
 
 **Description**: Finds relevant skills based on description similarity.
+
+**⚠️ WARNING**: With placeholder embeddings, similarity is based on character overlap, NOT semantic meaning. Integrate a real embedding model for production use.
 
 **Example**:
 ```rust
@@ -581,10 +611,18 @@ cargo run --example agenticdb_demo
 
 ---
 
-## Future Enhancements
+## Critical Next Steps
+
+### Required for Production
+- [ ] **CRITICAL**: Replace placeholder embeddings with real semantic models
+  - [ ] ONNX Runtime integration (recommended)
+  - [ ] Candle-based inference
+  - [ ] API client for OpenAI/Cohere/Anthropic
+  - [ ] Python bindings for sentence-transformers
+- [ ] Add feature flag to require real embeddings at compile time
+- [ ] Runtime warning when placeholder embeddings are used
 
 ### Planned Features
-- [ ] Real embedding models (sentence-transformers)
 - [ ] Actual RL training algorithms (not just experience storage)
 - [ ] Distributed training support
 - [ ] Advanced query operators

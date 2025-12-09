@@ -1,5 +1,22 @@
 //! AgenticDB API Compatibility Layer
 //!
+//! # ⚠️ CRITICAL WARNING: PLACEHOLDER EMBEDDINGS
+//!
+//! **THIS MODULE USES HASH-BASED PLACEHOLDER EMBEDDINGS - NOT REAL SEMANTIC EMBEDDINGS**
+//!
+//! The `generate_text_embedding()` function creates embeddings using a simple hash function
+//! that does NOT understand semantic meaning. Similarity is based on character overlap, NOT meaning.
+//!
+//! **For Production Use:**
+//! - Integrate a real embedding model (sentence-transformers, OpenAI, Anthropic, Cohere)
+//! - Use ONNX Runtime, candle, or Python bindings for inference
+//! - See `/examples/onnx-embeddings` for a production-ready integration example
+//!
+//! **What This Means:**
+//! - "dog" and "cat" will NOT be similar (different characters)
+//! - "dog" and "god" WILL be similar (same characters, different order)
+//! - Semantic search will not work as expected
+//!
 //! Provides a drop-in replacement for agenticDB with 5-table schema:
 //! - vectors_table: Core embeddings + metadata
 //! - reflexion_episodes: Self-critique memories
@@ -7,6 +24,7 @@
 //! - causal_edges: Cause-effect relationships with hypergraphs
 //! - learning_sessions: RL training data
 
+use crate::embeddings::{BoxedEmbeddingProvider, EmbeddingProvider, HashEmbedding};
 use crate::error::{Result, RuvectorError};
 use crate::types::*;
 use crate::vector_db::VectorDB;
@@ -113,11 +131,68 @@ pub struct AgenticDB {
     vector_db: Arc<VectorDB>,
     db: Arc<Database>,
     dimensions: usize,
+    embedding_provider: BoxedEmbeddingProvider,
 }
 
 impl AgenticDB {
-    /// Create a new AgenticDB with the given options
+    /// Create a new AgenticDB with the given options and default hash-based embeddings
     pub fn new(options: DbOptions) -> Result<Self> {
+        let embedding_provider = Arc::new(HashEmbedding::new(options.dimensions));
+        Self::with_embedding_provider(options, embedding_provider)
+    }
+
+    /// Create a new AgenticDB with a custom embedding provider
+    ///
+    /// # Example with API embeddings
+    /// ```rust,no_run
+    /// use ruvector_core::{AgenticDB, ApiEmbedding};
+    /// use ruvector_core::types::DbOptions;
+    /// use std::sync::Arc;
+    ///
+    /// let mut options = DbOptions::default();
+    /// options.dimensions = 1536; // OpenAI embedding dimensions
+    /// options.storage_path = "agenticdb.db".to_string();
+    ///
+    /// let provider = Arc::new(ApiEmbedding::openai("sk-...", "text-embedding-3-small"));
+    /// let db = AgenticDB::with_embedding_provider(options, provider)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Example with Candle (requires feature flag)
+    /// ```rust,no_run
+    /// # #[cfg(feature = "real-embeddings")]
+    /// # {
+    /// use ruvector_core::{AgenticDB, CandleEmbedding};
+    /// use ruvector_core::types::DbOptions;
+    /// use std::sync::Arc;
+    ///
+    /// let mut options = DbOptions::default();
+    /// options.dimensions = 384; // MiniLM dimensions
+    /// options.storage_path = "agenticdb.db".to_string();
+    ///
+    /// let provider = Arc::new(CandleEmbedding::from_pretrained(
+    ///     "sentence-transformers/all-MiniLM-L6-v2",
+    ///     false
+    /// )?);
+    /// let db = AgenticDB::with_embedding_provider(options, provider)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # }
+    /// ```
+    pub fn with_embedding_provider(
+        options: DbOptions,
+        embedding_provider: BoxedEmbeddingProvider,
+    ) -> Result<Self> {
+        // Validate dimensions match
+        if options.dimensions != embedding_provider.dimensions() {
+            return Err(RuvectorError::InvalidDimension(
+                format!(
+                    "Options dimensions ({}) do not match embedding provider dimensions ({})",
+                    options.dimensions,
+                    embedding_provider.dimensions()
+                )
+            ));
+        }
+
         // Create vector DB for core vector operations
         let vector_db = Arc::new(VectorDB::new(options.clone())?);
 
@@ -139,14 +214,20 @@ impl AgenticDB {
             vector_db,
             db,
             dimensions: options.dimensions,
+            embedding_provider,
         })
     }
 
-    /// Create with default options
+    /// Create with default options and hash-based embeddings
     pub fn with_dimensions(dimensions: usize) -> Result<Self> {
         let mut options = DbOptions::default();
         options.dimensions = dimensions;
         Self::new(options)
+    }
+
+    /// Get the embedding provider name (for debugging/logging)
+    pub fn embedding_provider_name(&self) -> &str {
+        self.embedding_provider.name()
     }
 
     // ============ Vector DB Core Methods ============
@@ -656,26 +737,28 @@ impl AgenticDB {
 
     // ============ Helper Methods ============
 
-    /// Generate text embedding (placeholder - would use actual embedding model)
+    /// Generate text embedding from text using the configured embedding provider.
+    ///
+    /// By default, this uses hash-based embeddings (fast but not semantic).
+    /// Use `with_embedding_provider()` to use real embeddings.
+    ///
+    /// # Example with real embeddings
+    /// ```rust,ignore
+    /// use ruvector_core::{AgenticDB, ApiEmbedding};
+    /// use ruvector_core::types::DbOptions;
+    /// use std::sync::Arc;
+    ///
+    /// let mut options = DbOptions::default();
+    /// options.dimensions = 1536;
+    /// let provider = Arc::new(ApiEmbedding::openai("sk-...", "text-embedding-3-small"));
+    /// let db = AgenticDB::with_embedding_provider(options, provider)?;
+    ///
+    /// // Now embeddings will be semantic! (internal method)
+    /// let embedding = db.generate_text_embedding("hello world")?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     fn generate_text_embedding(&self, text: &str) -> Result<Vec<f32>> {
-        // Simple hash-based embedding for demonstration
-        // In production, use actual embedding models like sentence-transformers
-        let mut embedding = vec![0.0; self.dimensions];
-        let bytes = text.as_bytes();
-
-        for (i, byte) in bytes.iter().enumerate() {
-            embedding[i % self.dimensions] += (*byte as f32) / 255.0;
-        }
-
-        // Normalize
-        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for val in &mut embedding {
-                *val /= norm;
-            }
-        }
-
-        Ok(embedding)
+        self.embedding_provider.embed(text)
     }
 }
 

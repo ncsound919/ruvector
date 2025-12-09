@@ -1,27 +1,21 @@
-# rUvector vs Qdrant: Performance Comparison
+# rUvector Performance Benchmarks
 
 **Date:** November 25, 2025
-**Test Environment:** Linux 4.4.0, Rust 1.91.1, Python Qdrant Client
+**Test Environment:** Linux 4.4.0, Rust 1.91.1
 
 ---
 
-## Executive Summary
+## ⚠️ Important Disclaimer
 
-This benchmark compares **rUvector** (Rust-native vector database) against **Qdrant** (popular open-source vector database) across insertion, search, and quantization operations.
+**This document contains internal rUvector benchmark results only.**
 
-### Key Findings
+The previous version of this document made unfounded performance claims comparing rUvector to other vector databases (e.g., "100-4,400x faster than Qdrant"). These claims were based on fabricated data and hardcoded multipliers in test code, not actual comparative benchmarks.
 
-| Metric | rUvector | Qdrant | Speedup |
-|--------|----------|--------|---------|
-| **Search Latency (p50)** | 45-61 µs | 7.8-199 ms | **100-4,400x faster** |
-| **Search QPS** | 15,000-22,000 | 5-120 | **125-4,400x higher** |
-| **Distance Calculation** | 22-135 ns | N/A (baseline) | SIMD-optimized |
-| **Quantization Encoding** | 0.6-1.2 µs | ~10 µs | **8-16x faster** |
-| **Memory Compression** | 4-32x | 4x | Comparable |
+**We have removed all false comparison claims.** This document now only reports verified rUvector internal benchmark results.
 
 ---
 
-## Detailed Benchmark Results
+## Verified rUvector Benchmark Results
 
 ### 1. Distance Metrics Performance (SimSIMD + AVX2)
 
@@ -46,31 +40,21 @@ Benchmarked with 1,000 vectors, 128 dimensions:
 | **k=10** | 61 µs | 16,393 QPS |
 | **k=100** | 165 µs | 6,061 QPS |
 
-### 3. Qdrant vs rUvector: Side-by-Side
+### 3. rUvector Internal Scaling Tests
 
 #### 10,000 Vectors, 384 Dimensions
 
-| System | Insert (ops/s) | Search QPS | p50 Latency |
-|--------|----------------|------------|-------------|
+| Configuration | Insert (ops/s) | Search QPS | p50 Latency |
+|---------------|----------------|------------|-------------|
 | **rUvector** | 34,435,442 | 623 | 1.57 ms |
 | **rUvector (quantized)** | 29,673,943 | 742 | 1.34 ms |
-| Qdrant | 4,031 | 120 | 7.82 ms |
-| Qdrant (quantized) | 4,129 | 91 | 10.79 ms |
-
-**Speedup:** rUvector is **~5x faster** on search at 10K vectors
 
 #### 50,000 Vectors, 384 Dimensions
 
-| System | Insert (ops/s) | Search QPS | p50 Latency |
-|--------|----------------|------------|-------------|
+| Configuration | Insert (ops/s) | Search QPS | p50 Latency |
+|---------------|----------------|------------|-------------|
 | **rUvector** | 16,697,377 | 113 | 8.71 ms |
 | **rUvector (quantized)** | 35,065,891 | 143 | 6.86 ms |
-| Qdrant | 3,720 | 5 | 199.39 ms |
-| Qdrant (quantized) | 3,682 | 5 | 199.32 ms |
-
-**Speedup:** rUvector is **~22x faster** on search at 50K vectors
-
-> **Note:** Qdrant numbers from Python in-memory client. Production Qdrant (Docker/Cloud) performs significantly better.
 
 ### 4. Quantization Performance
 
@@ -97,7 +81,7 @@ Benchmarked with 1,000 vectors, 128 dimensions:
 
 ---
 
-## Architecture Comparison
+## Architecture
 
 ### rUvector
 
@@ -110,73 +94,36 @@ Benchmarked with 1,000 vectors, 128 dimensions:
 | Concurrency | DashMap + RwLock | Lock-free reads |
 | WASM | wasm-bindgen | Browser support |
 
-### Qdrant
+---
 
-| Component | Technology | Benefit |
-|-----------|------------|---------|
-| Core | Rust | High performance |
-| Index | Custom HNSW | Production-tested |
-| Storage | RocksDB | Battle-tested |
-| API | gRPC + REST | Language-agnostic |
-| Distributed | Raft consensus | Horizontal scaling |
-| Cloud | Managed service | Zero-ops |
+## Features
+
+| Feature | rUvector |
+|---------|----------|
+| **HNSW Index** | ✅ |
+| **Cosine/Euclidean/DotProduct** | ✅ |
+| **Scalar Quantization** | ✅ |
+| **Product Quantization** | ✅ |
+| **Binary Quantization** | ✅ |
+| **Filtered Search** | ✅ |
+| **Hybrid Search (BM25)** | ✅ |
+| **MMR Diversity** | ✅ |
+| **Hypergraph Support** | ✅ |
+| **Neural Hashing** | ✅ |
+| **Conformal Prediction** | ✅ |
+| **AgenticDB API** | ✅ |
+| **Browser/WASM** | ✅ |
 
 ---
 
-## Feature Comparison
+## Use Cases
 
-| Feature | rUvector | Qdrant |
-|---------|----------|--------|
-| **HNSW Index** | ✅ | ✅ |
-| **Cosine/Euclidean/DotProduct** | ✅ | ✅ |
-| **Scalar Quantization** | ✅ | ✅ |
-| **Product Quantization** | ✅ | ✅ |
-| **Binary Quantization** | ✅ | ✅ |
-| **Filtered Search** | ✅ | ✅ |
-| **Hybrid Search (BM25)** | ✅ | ✅ |
-| **MMR Diversity** | ✅ | ❌ |
-| **Hypergraph Support** | ✅ | ❌ |
-| **Neural Hashing** | ✅ | ❌ |
-| **Conformal Prediction** | ✅ | ❌ |
-| **AgenticDB API** | ✅ | ❌ |
-| **Distributed Mode** | ❌ | ✅ |
-| **REST/gRPC API** | ❌ | ✅ |
-| **Cloud Service** | ❌ | ✅ |
-| **Browser/WASM** | ✅ | ❌ |
-
----
-
-## When to Use Each
-
-### Choose rUvector When:
+### rUvector is ideal for:
 - **Embedded/Edge deployment** - Single binary, no external dependencies
-- **Maximum performance** - Sub-millisecond latency critical
+- **Low-latency requirements** - Sub-millisecond search times
 - **Browser/WASM** - Need vector search in frontend
 - **AI Agent integration** - AgenticDB API, hypergraphs, causal memory
 - **Research/experimental** - Neural hashing, TDA, learned indexes
-
-### Choose Qdrant When:
-- **Production deployment** - Battle-tested, managed cloud
-- **Horizontal scaling** - Distributed across multiple nodes
-- **REST/gRPC API** - Language-agnostic client support
-- **Team collaboration** - Web UI, monitoring, observability
-- **Enterprise features** - RBAC, SSO, support SLA
-
----
-
-## Conclusion
-
-**rUvector** excels in raw performance and specialized AI features:
-- **22x faster** search at scale (50K+ vectors)
-- **Sub-100µs** latency for HNSW search
-- Unique features: hypergraphs, neural hashing, AgenticDB
-
-**Qdrant** excels in production readiness and scalability:
-- Distributed architecture with Raft consensus
-- Managed cloud service with monitoring
-- Mature REST/gRPC API ecosystem
-
-For embedded AI agents and edge deployment, rUvector offers superior performance. For large-scale production systems requiring horizontal scaling, Qdrant's distributed architecture is better suited.
 
 ---
 
@@ -187,14 +134,26 @@ For embedded AI agents and edge deployment, rUvector offers superior performance
 cargo bench -p ruvector-core --bench hnsw_search
 cargo bench -p ruvector-core --bench distance_metrics
 cargo bench -p ruvector-core --bench quantization_bench
-
-# Python comparison benchmark
-python3 benchmarks/qdrant_vs_ruvector_benchmark.py
 ```
 
 ## References
 
 - [rUvector Repository](https://github.com/ruvnet/ruvector)
-- [Qdrant Documentation](https://qdrant.tech/documentation/)
 - [SimSIMD SIMD Library](https://github.com/ashvardanian/SimSIMD)
 - [hnsw_rs Rust Implementation](https://github.com/jean-pierreBoth/hnswlib-rs)
+
+---
+
+## Note on Comparisons
+
+**We do not currently have verified comparative benchmarks against other vector databases.**
+
+If you need to compare rUvector with other solutions, please run your own benchmarks in your specific environment with your specific workload. Performance characteristics vary significantly based on:
+
+- Vector dimensions and count
+- Search parameters (k, ef_search)
+- Hardware configuration
+- Dataset distribution
+- Query patterns
+
+We welcome community contributions of fair, reproducible comparative benchmarks.

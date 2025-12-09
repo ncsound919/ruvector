@@ -1,9 +1,9 @@
 [package]
 name = "ruvector-postgres"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 license = "MIT"
-description = "High-performance PostgreSQL vector database extension - pgvector drop-in replacement with 53+ SQL functions, SIMD acceleration, hyperbolic embeddings, GNN layers, and self-learning capabilities"
+description = "High-performance PostgreSQL vector database extension - pgvector drop-in replacement with 53+ SQL functions, SIMD acceleration, local embedding generation, hyperbolic embeddings, GNN layers, and self-learning capabilities"
 repository = "https://github.com/ruvnet/ruvector"
 homepage = "https://github.com/ruvnet/ruvector"
 documentation = "https://docs.rs/ruvector-postgres"
@@ -17,12 +17,11 @@ exclude = ["docker/", "tests/", "benches/", "examples/"]
 crate-type = ["cdylib", "lib"]
 
 [features]
-default = ["pg16"]
+default = ["pg17"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
-# Note: pg18 requires pgrx 0.15.0+ (planned for future release)
 pg_test = []
 
 # SIMD features for compile-time selection
@@ -56,11 +55,12 @@ hyperbolic = []     # Hyperbolic embeddings (Poincaré, Lorentz)
 sparse = []         # Sparse vectors (BM25, SPLADE)
 graph = []          # Graph operations & Cypher
 routing = []        # Tiny Dancer AI routing
+embeddings = ["dep:fastembed"]  # Local embedding generation
 
 # Feature bundles
 ai-complete = ["learning", "attention", "gnn", "routing"]
 graph-complete = ["hyperbolic", "sparse", "graph"]
-all-features = ["ai-complete", "graph-complete"]
+all-features = ["ai-complete", "graph-complete", "embeddings"]
 
 [dependencies]
 # PostgreSQL extension framework
@@ -114,6 +114,9 @@ tracing = "0.1"
 # Lazy static initialization
 lazy_static = "1.4"
 once_cell = "1.19"
+
+# Local embedding generation (optional)
+fastembed = { version = "5", optional = true }
 
 # Optional: Use ruvector-core for shared implementations
 # Uncomment to link with existing ruvector-core crate

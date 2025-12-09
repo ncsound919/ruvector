@@ -23,6 +23,10 @@ pub mod learning;
 pub mod graph;
 pub mod hyperbolic;
 
+// Optional: Local embedding generation (requires 'embeddings' feature)
+#[cfg(feature = "embeddings")]
+pub mod embeddings;
+
 // Re-exports for convenience
 pub use types::RuVector;
 pub use distance::{DistanceMetric, euclidean_distance, cosine_distance, inner_product_distance};

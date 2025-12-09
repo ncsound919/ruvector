@@ -172,33 +172,17 @@ export class ResultsAnalyzer {
 
   // Create latency histogram
   private createLatencyHistogram(latency: LatencyMetrics): HistogramBucket[] {
-    const buckets: HistogramBucket[] = [
-      { min: 0, max: 10, count: 0, percentage: 0 },
-      { min: 10, max: 25, count: 0, percentage: 0 },
-      { min: 25, max: 50, count: 0, percentage: 0 },
-      { min: 50, max: 100, count: 0, percentage: 0 },
-      { min: 100, max: 200, count: 0, percentage: 0 },
-      { min: 200, max: 500, count: 0, percentage: 0 },
-      { min: 500, max: Infinity, count: 0, percentage: 0 },
-    ];
+    // NOTE: This function cannot create accurate histograms without raw latency samples.
+    // We only have percentile data (p50, p95, p99), which is insufficient for distribution.
+    // Returning empty histogram to avoid fabricating data.
 
-    // Estimate distribution based on percentiles
-    // This is a rough approximation - ideally we'd have raw data
-    const total = 1000000; // Assume 1M samples
+    console.warn(
+      'Cannot generate latency histogram without raw sample data. ' +
+      'Only percentile metrics (p50, p95, p99) are available. ' +
+      'To get accurate histograms, modify metrics collection to store raw latency samples.'
+    );
 
-    buckets[0].count = Math.floor(total * 0.5); // 50% under 10ms
-    buckets[1].count = Math.floor(total * 0.25); // 25% 10-25ms
-    buckets[2].count = Math.floor(total * 0.15); // 15% 25-50ms
-    buckets[3].count = Math.floor(total * 0.08); // 8% 50-100ms
-    buckets[4].count = Math.floor(total * 0.015); // 1.5% 100-200ms
-    buckets[5].count = Math.floor(total * 0.004); // 0.4% 200-500ms
-    buckets[6].count = Math.floor(total * 0.001); // 0.1% 500ms+
-
-    buckets.forEach(bucket => {
-      bucket.percentage = (bucket.count / total) * 100;
-    });
-
-    return buckets;
+    return []; // Return empty array instead of fabricated data
   }
 
   // Detect anomalies
