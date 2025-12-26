@@ -563,7 +563,7 @@ GRANT ALL ON ALL SEQUENCES IN SCHEMA {schema} TO ruvector_users;
                     // Use parameterized query placeholder - caller must bind tenant_id
                     filter: "tenant_id = $1".to_string(),
                     tenant_param: Some(tenant_id.to_string()),
-                }
+                };
             }
         };
 
