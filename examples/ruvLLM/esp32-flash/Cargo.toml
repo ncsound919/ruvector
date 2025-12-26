@@ -1,0 +1,33 @@
+[package]
+name = "ruvllm-esp32-flash"
+version = "0.1.0"
+edition = "2021"
+authors = ["RuVector Team"]
+description = "Complete RuvLLM for ESP32 - Ready to Flash"
+license = "MIT"
+
+[dependencies]
+# ESP-IDF Framework
+esp-idf-svc = { version = "0.49", default-features = false }
+esp-idf-hal = { version = "0.44", default-features = false }
+esp-idf-sys = { version = "0.35", default-features = false, features = ["binstart"] }
+
+# no_std compatible
+heapless = { version = "0.8", features = ["serde"] }
+libm = "0.2"
+
+# Logging
+log = "0.4"
+esp-idf-logger = "0.1"
+
+[build-dependencies]
+embuild = "0.32"
+
+[profile.release]
+opt-level = "s"       # Optimize for size
+lto = true
+debug = false
+
+[profile.dev]
+opt-level = 1
+debug = true
