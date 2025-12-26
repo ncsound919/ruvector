@@ -405,19 +405,21 @@ mod tests {
         let empty_dst: Vec<i32> = vec![];
 
         let result = ruvector_gcn_forward(empty_embeddings, empty_src, empty_dst, None, 4);
+        let parsed = parse_result(&result);
 
-        assert_eq!(result.len(), 0);
+        assert_eq!(parsed.len(), 0);
     }
 
     #[pg_test]
     fn test_weighted_gcn() {
-        let embeddings = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let embeddings = to_json(vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
         let src = vec![0];
         let dst = vec![1];
         let weights = Some(vec![2.0]);
 
         let result = ruvector_gcn_forward(embeddings, src, dst, weights, 2);
+        let parsed = parse_result(&result);
 
-        assert_eq!(result.len(), 2);
+        assert_eq!(parsed.len(), 2);
     }
 }
