@@ -2,7 +2,7 @@ name: PostgreSQL Extension CI
 
 on:
   push:
-    branches: [main, develop, "claude/**"]
+    branches: [main, develop, "claude/**", "fix/**"]
     paths:
       - 'crates/ruvector-postgres/**'
       - '.github/workflows/postgres-extension-ci.yml'
