@@ -113,7 +113,16 @@ Manage session lifecycle:
 |------|---------|---------|
 | `session-start` | Session begins | Context loading, initialization |
 | `session-restore` | Manual restore | Restore previous session state |
-| `session-end` | Session ends | Persist state, export metrics |
+| `session-end` / `Stop` | Session ends | Persist state, export metrics |
+
+### Compact Hooks
+
+Execute during context compaction:
+
+| Hook | Matcher | Purpose |
+|------|---------|---------|
+| `PreCompact` | `manual` | Display learned patterns during manual compact |
+| `PreCompact` | `auto` | Show learning stats during auto-compact |
 
 ## Configuration
 
@@ -121,6 +130,15 @@ Hooks are configured in `.claude/settings.json`:
 
 ```json
 {
+  "env": {
+    "RUVECTOR_INTELLIGENCE_ENABLED": "true",
+    "INTELLIGENCE_MODE": "treatment",
+    "RUVECTOR_MEMORY_BACKEND": "rvlite"
+  },
+  "permissions": {
+    "allow": ["Bash(cargo:*)", "Bash(git:*)", "Bash(.claude/hooks:*)"],
+    "deny": ["Bash(rm -rf /)", "Bash(cargo publish:*)"]
+  },
   "hooks": {
     "PreToolUse": [
       {
@@ -130,9 +148,24 @@ Hooks are configured in `.claude/settings.json`:
           "timeout": 3000,
           "command": "npx ruvector hooks pre-command \"$CMD\""
         }]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [{
+          "type": "command",
+          "timeout": 3000,
+          "command": "npx ruvector hooks pre-edit \"$FILE\""
+        }]
       }
     ],
     "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{
+          "type": "command",
+          "command": "npx ruvector hooks post-command \"$CMD\" \"$SUCCESS\""
+        }]
+      },
       {
         "matcher": "Write|Edit|MultiEdit",
         "hooks": [{
@@ -141,17 +174,59 @@ Hooks are configured in `.claude/settings.json`:
         }]
       }
     ],
+    "PreCompact": [
+      {
+        "matcher": "manual",
+        "hooks": [{
+          "type": "command",
+          "command": "npx ruvector hooks compact-context --mode manual"
+        }]
+      },
+      {
+        "matcher": "auto",
+        "hooks": [{
+          "type": "command",
+          "command": "npx ruvector hooks compact-context --mode auto"
+        }]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [{
           "type": "command",
+          "timeout": 5000,
           "command": "npx ruvector hooks session-start"
         }]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "npx ruvector hooks session-end --persist-state"
+        }]
+      }
     ]
+  },
+  "includeCoAuthoredBy": true,
+  "enabledMcpjsonServers": ["claude-flow", "ruv-swarm"],
+  "statusLine": {
+    "type": "command",
+    "command": ".claude/statusline-command.sh"
   }
 }
 ```
+
+### Configuration Sections
+
+| Section | Description |
+|---------|-------------|
+| `env` | Environment variables for hooks |
+| `permissions` | Allow/deny rules for commands |
+| `hooks` | Hook definitions by event type |
+| `includeCoAuthoredBy` | Add co-author attribution |
+| `enabledMcpjsonServers` | MCP servers to enable |
+| `statusLine` | Custom status line command |
 
 ## Intelligence Layer
 

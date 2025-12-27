@@ -669,6 +669,8 @@ npx ruvector hooks validate-config --fix
 
 ## Environment Variables
 
+### RuVector Variables
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RUVECTOR_HOME` | `~/.ruvector` | Global patterns directory |
@@ -676,7 +678,20 @@ npx ruvector hooks validate-config --fix
 | `RUVECTOR_CLI_PATH` | auto-detected | Path to CLI binary |
 | `RUVECTOR_INTELLIGENCE_ENABLED` | `true` | Enable/disable intelligence |
 | `RUVECTOR_LEARNING_RATE` | `0.1` | Q-learning alpha parameter |
-| `INTELLIGENCE_MODE` | `treatment` | A/B test group |
+| `RUVECTOR_MEMORY_BACKEND` | `rvlite` | Memory backend: `rvlite`, `json` |
+| `RUVECTOR_WASM_SIZE_LIMIT_KB` | `3072` | WASM size limit for rvlite |
+| `INTELLIGENCE_MODE` | `treatment` | A/B test group: `treatment`, `control` |
+
+### Claude Flow Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_FLOW_HOOKS_ENABLED` | `true` | Enable/disable all hooks |
+| `CLAUDE_FLOW_AUTO_COMMIT` | `false` | Auto-commit after changes |
+| `CLAUDE_FLOW_AUTO_PUSH` | `false` | Auto-push after commits |
+| `CLAUDE_FLOW_TELEMETRY_ENABLED` | `true` | Enable telemetry |
+| `CLAUDE_FLOW_REMOTE_EXECUTION` | `true` | Allow remote execution |
+| `CLAUDE_FLOW_CHECKPOINTS_ENABLED` | `true` | Enable session checkpoints |
 | `CLAUDE_FLOW_DEBUG` | `false` | Enable debug output |
 
 ---
