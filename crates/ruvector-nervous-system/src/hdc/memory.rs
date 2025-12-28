@@ -120,8 +120,8 @@ impl HdcMemory {
             .filter(|(_, sim)| *sim >= threshold)
             .collect();
 
-        // Sort by similarity descending
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // Sort by similarity descending (NaN-safe: treat NaN as less than any value)
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less));
 
         results
     }
@@ -153,8 +153,8 @@ impl HdcMemory {
             .map(|(key, vector)| (key.clone(), query.similarity(vector)))
             .collect();
 
-        // Partial sort to get top k
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // Partial sort to get top k (NaN-safe)
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less));
 
         results.into_iter().take(k).collect()
     }

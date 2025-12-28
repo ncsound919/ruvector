@@ -53,7 +53,12 @@ pub fn softmax(values: &[f32], beta: f32) -> Vec<f32> {
 
     let sum: f32 = exp_values.iter().sum();
 
-    // Normalize
+    // Normalize (guard against division by zero from underflow)
+    if sum <= f32::EPSILON {
+        // Uniform distribution fallback
+        let n = exp_values.len() as f32;
+        return vec![1.0 / n; exp_values.len()];
+    }
     exp_values.iter().map(|&x| x / sum).collect()
 }
 

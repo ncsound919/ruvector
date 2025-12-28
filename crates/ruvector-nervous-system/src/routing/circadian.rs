@@ -77,6 +77,37 @@ impl CircadianPhase {
     }
 }
 
+/// Phase modulation signal for deterministic velocity nudging
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct PhaseModulation {
+    /// Velocity multiplier (1.0 = normal, >1 = faster, <1 = slower)
+    pub velocity: f32,
+    /// Direct phase offset (radians, applied once)
+    pub offset: f32,
+}
+
+impl PhaseModulation {
+    /// No modulation (neutral)
+    pub fn neutral() -> Self {
+        Self { velocity: 1.0, offset: 0.0 }
+    }
+
+    /// Speed up phase progression
+    pub fn accelerate(factor: f32) -> Self {
+        Self { velocity: factor.max(0.1), offset: 0.0 }
+    }
+
+    /// Slow down phase progression
+    pub fn decelerate(factor: f32) -> Self {
+        Self { velocity: (1.0 / factor.max(0.1)).min(10.0), offset: 0.0 }
+    }
+
+    /// Nudge phase forward by offset radians
+    pub fn nudge_forward(radians: f32) -> Self {
+        Self { velocity: 1.0, offset: radians }
+    }
+}
+
 /// Circadian controller for temporal gating of compute resources
 ///
 /// Implements a simple but effective phase-based scheduler that reduces costs
@@ -87,6 +118,11 @@ impl CircadianPhase {
 /// - **5-50x** reduction in always-on compute costs
 /// - **3-10x** reduction in write amplification
 /// - Predictable peak loads enable smaller cluster sizing
+///
+/// # Production Features
+///
+/// - **Phase modulation**: External signals (coherence, error rate) can nudge phase velocity
+/// - **Monotonic decisions**: Once a window opens, it stays open until next phase boundary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircadianController {
     /// Current phase in radians (0 to 2π)
@@ -121,6 +157,15 @@ pub struct CircadianController {
     active_start: f32,
     dusk_start: f32,
     rest_start: f32,
+
+    // === Production Features ===
+    /// External phase modulation (coherence, error signals)
+    modulation: PhaseModulation,
+
+    /// Latched decisions within phase (monotonic: no flapping)
+    compute_latch: Option<bool>,
+    learn_latch: Option<bool>,
+    consolidate_latch: Option<bool>,
 }
 
 impl CircadianController {
@@ -159,6 +204,11 @@ impl CircadianController {
             active_start: 0.33 * TAU, // 8:00
             dusk_start: 0.75 * TAU,   // 18:00
             rest_start: 0.92 * TAU,   // 22:00
+            // Production features
+            modulation: PhaseModulation::neutral(),
+            compute_latch: None,
+            learn_latch: None,
+            consolidate_latch: None,
         }
     }
 
@@ -205,9 +255,17 @@ impl CircadianController {
             self.phase_shift += entrainment_rate * (self.light_signal - 0.5);
         }
 
-        // Update phase with wrap-around
-        let delta_phase = TAU * dt / self.period;
-        self.phase = (self.phase + delta_phase + self.phase_shift) % TAU;
+        // Apply phase modulation (deterministic external signals)
+        let velocity = self.modulation.velocity.clamp(0.1, 10.0);
+        let offset = self.modulation.offset;
+        self.modulation.offset = 0.0; // One-shot offset, consumed after use
+
+        // Update phase with wrap-around, applying velocity modulation
+        let delta_phase = TAU * dt * velocity / self.period;
+        self.phase = (self.phase + delta_phase + self.phase_shift + offset) % TAU;
+        if self.phase < 0.0 {
+            self.phase += TAU; // Handle negative wrap
+        }
         self.phase_shift *= 0.99; // Decay entrainment shift
 
         self.elapsed += dt as f64;
@@ -219,6 +277,10 @@ impl CircadianController {
             self.state = new_state;
             self.time_in_phase = 0.0;
             self.activity_count = 0;
+            // Reset latches on phase transition (monotonic decisions reset at boundary)
+            self.compute_latch = None;
+            self.learn_latch = None;
+            self.consolidate_latch = None;
         }
     }
 
@@ -256,30 +318,95 @@ impl CircadianController {
         self.coherence = coherence.clamp(0.0, 1.0);
     }
 
-    /// Check if expensive compute is permitted
+    /// Apply phase modulation from external signal
     ///
-    /// Returns true during Active and Dawn phases.
-    /// Even when true, duty_factor indicates recommended activity level.
-    #[inline]
-    pub fn should_compute(&self) -> bool {
-        matches!(self.state, CircadianPhase::Active | CircadianPhase::Dawn)
+    /// Use this for deterministic nudges from:
+    /// - Mincut coherence spikes → accelerate to active phase
+    /// - Error rate spikes → decelerate, extend rest
+    /// - External sync signals → phase offset alignment
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use ruvector_nervous_system::routing::{CircadianController, PhaseModulation};
+    ///
+    /// let mut clock = CircadianController::new(24.0);
+    ///
+    /// // High coherence detected - speed up towards active phase
+    /// clock.modulate(PhaseModulation::accelerate(1.5));
+    ///
+    /// // Error spike - slow down, stay in rest longer
+    /// clock.modulate(PhaseModulation::decelerate(2.0));
+    ///
+    /// // External sync - nudge phase forward by 0.1 radians
+    /// clock.modulate(PhaseModulation::nudge_forward(0.1));
+    /// ```
+    pub fn modulate(&mut self, modulation: PhaseModulation) {
+        self.modulation = modulation;
     }
 
-    /// Check if learning/writes are permitted
+    /// Get current phase modulation
+    pub fn current_modulation(&self) -> PhaseModulation {
+        self.modulation
+    }
+
+    /// Check if expensive compute is permitted (monotonic within phase)
+    ///
+    /// Returns true during Active and Dawn phases.
+    /// Once true in a phase, stays true until phase boundary (no flapping).
+    #[inline]
+    pub fn should_compute(&mut self) -> bool {
+        if let Some(latched) = self.compute_latch {
+            return latched;
+        }
+        let decision = matches!(self.state, CircadianPhase::Active | CircadianPhase::Dawn);
+        self.compute_latch = Some(decision);
+        decision
+    }
+
+    /// Check if learning/writes are permitted (monotonic within phase)
     ///
     /// Returns true only during high-confidence periods.
     /// Combines phase gating with coherence signal.
+    /// Once decided, stays constant until phase boundary.
     #[inline]
-    pub fn should_learn(&self) -> bool {
-        self.state.allows_learning() && self.coherence > 0.3
+    pub fn should_learn(&mut self) -> bool {
+        if let Some(latched) = self.learn_latch {
+            return latched;
+        }
+        let decision = self.state.allows_learning() && self.coherence > 0.3;
+        self.learn_latch = Some(decision);
+        decision
     }
 
-    /// Check if consolidation operations should run
+    /// Check if consolidation operations should run (monotonic within phase)
     ///
     /// Returns true during Rest and Dusk phases.
+    /// Once decided, stays constant until phase boundary.
     #[inline]
-    pub fn should_consolidate(&self) -> bool {
-        self.state.allows_consolidation()
+    pub fn should_consolidate(&mut self) -> bool {
+        if let Some(latched) = self.consolidate_latch {
+            return latched;
+        }
+        let decision = self.state.allows_consolidation();
+        self.consolidate_latch = Some(decision);
+        decision
+    }
+
+    /// Check decisions without latching (for inspection only)
+    #[inline]
+    pub fn peek_compute(&self) -> bool {
+        self.compute_latch.unwrap_or_else(|| {
+            matches!(self.state, CircadianPhase::Active | CircadianPhase::Dawn)
+        })
+    }
+
+    /// Check decisions without latching (for inspection only)
+    #[inline]
+    pub fn peek_learn(&self) -> bool {
+        self.learn_latch.unwrap_or_else(|| {
+            self.state.allows_learning() && self.coherence > 0.3
+        })
     }
 
     /// Check if system should react to an event
@@ -370,6 +497,125 @@ impl CircadianController {
 impl Default for CircadianController {
     fn default() -> Self {
         Self::new(24.0)
+    }
+}
+
+/// Nervous system metrics scorecard
+///
+/// Four concrete metrics for measuring system restraint and efficiency:
+/// 1. Silence Ratio: How often the system stays calm
+/// 2. Time to Decision: Reflex speed (P50/P95)
+/// 3. Energy per Spike: True efficiency normalized across changes
+/// 4. Calmness Index: Post-learning stability
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NervousSystemMetrics {
+    /// Total ticks observed
+    pub total_ticks: u64,
+    /// Active ticks (processing events)
+    pub active_ticks: u64,
+    /// Total spikes/events processed
+    pub total_spikes: u64,
+    /// Total energy consumed (arbitrary units)
+    pub total_energy: f64,
+    /// Baseline spikes per hour (for calmness index)
+    pub baseline_spikes_per_hour: f64,
+    /// Decision latencies in microseconds (circular buffer)
+    decision_latencies: Vec<u64>,
+    /// Max latencies to track
+    max_latencies: usize,
+}
+
+impl NervousSystemMetrics {
+    /// Create new metrics tracker
+    pub fn new(baseline_spikes_per_hour: f64) -> Self {
+        Self {
+            total_ticks: 0,
+            active_ticks: 0,
+            total_spikes: 0,
+            total_energy: 0.0,
+            baseline_spikes_per_hour,
+            decision_latencies: Vec::with_capacity(1000),
+            max_latencies: 1000,
+        }
+    }
+
+    /// Record a tick (active or idle)
+    pub fn record_tick(&mut self, active: bool, spikes: u64, energy: f64) {
+        self.total_ticks += 1;
+        if active {
+            self.active_ticks += 1;
+        }
+        self.total_spikes += spikes;
+        self.total_energy += energy;
+    }
+
+    /// Record a decision latency in microseconds
+    pub fn record_decision(&mut self, latency_us: u64) {
+        if self.decision_latencies.len() >= self.max_latencies {
+            self.decision_latencies.remove(0);
+        }
+        self.decision_latencies.push(latency_us);
+    }
+
+    /// Silence Ratio: 1 - (active_ticks / total_ticks)
+    /// Higher is better - system stays calm
+    pub fn silence_ratio(&self) -> f64 {
+        if self.total_ticks == 0 {
+            return 1.0;
+        }
+        1.0 - (self.active_ticks as f64 / self.total_ticks as f64)
+    }
+
+    /// Time to Decision P50 (median) in microseconds
+    pub fn ttd_p50(&self) -> Option<u64> {
+        self.percentile(0.5)
+    }
+
+    /// Time to Decision P95 in microseconds
+    pub fn ttd_p95(&self) -> Option<u64> {
+        self.percentile(0.95)
+    }
+
+    fn percentile(&self, p: f64) -> Option<u64> {
+        if self.decision_latencies.is_empty() {
+            return None;
+        }
+        let mut sorted = self.decision_latencies.clone();
+        sorted.sort_unstable();
+        let idx = ((sorted.len() as f64 * p) as usize).min(sorted.len() - 1);
+        Some(sorted[idx])
+    }
+
+    /// Energy per Spike (nJ/spike equivalent)
+    pub fn energy_per_spike(&self) -> f64 {
+        if self.total_spikes == 0 {
+            return 0.0;
+        }
+        self.total_energy / self.total_spikes as f64
+    }
+
+    /// Calmness Index: exp(-spikes_per_hour / baseline_spikes)
+    /// Closer to 1 means stable, settled system
+    pub fn calmness_index(&self, hours_elapsed: f64) -> f64 {
+        if hours_elapsed <= 0.0 || self.baseline_spikes_per_hour <= 0.0 {
+            return 1.0;
+        }
+        let spikes_per_hour = self.total_spikes as f64 / hours_elapsed;
+        (-spikes_per_hour / self.baseline_spikes_per_hour).exp()
+    }
+
+    /// Check if TTD exceeds budget (for alerting)
+    pub fn ttd_exceeds_budget(&self, budget_us: u64) -> bool {
+        self.ttd_p95().map(|p95| p95 > budget_us).unwrap_or(false)
+    }
+
+    /// Reset metrics
+    pub fn reset(&mut self) {
+        self.total_ticks = 0;
+        self.active_ticks = 0;
+        self.total_spikes = 0;
+        self.total_energy = 0.0;
+        self.decision_latencies.clear();
     }
 }
 

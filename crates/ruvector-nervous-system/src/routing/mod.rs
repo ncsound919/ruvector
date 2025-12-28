@@ -100,7 +100,9 @@ pub mod coherence;
 pub mod predictive;
 pub mod workspace;
 
-pub use circadian::{CircadianController, CircadianPhase, CircadianScheduler};
+pub use circadian::{
+    CircadianController, CircadianPhase, CircadianScheduler, NervousSystemMetrics, PhaseModulation,
+};
 pub use coherence::OscillatoryRouter;
 pub use predictive::PredictiveLayer;
 pub use workspace::{GlobalWorkspace, Representation};

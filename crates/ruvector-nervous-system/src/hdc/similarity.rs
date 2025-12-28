@@ -131,8 +131,8 @@ pub fn top_k_similar(
         .map(|(idx, candidate)| (idx, query.similarity(candidate)))
         .collect();
 
-    // Partial sort to get top k
-    similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    // Partial sort to get top k (NaN-safe)
+    similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less));
 
     similarities.into_iter().take(k).collect()
 }

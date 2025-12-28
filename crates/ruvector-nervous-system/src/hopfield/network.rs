@@ -219,9 +219,9 @@ impl ModernHopfield {
 
         let (attention, _) = super::retrieval::compute_attention(&self.patterns, query, self.beta);
 
-        // Create (index, attention) pairs and sort
+        // Create (index, attention) pairs and sort (NaN-safe)
         let mut indexed: Vec<_> = attention.iter().copied().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less));
 
         // Take top k
         let k = k.min(indexed.len());

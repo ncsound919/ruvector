@@ -344,7 +344,8 @@ impl GlobalWorkspace {
     /// Retrieve top-k most salient representations
     pub fn retrieve_top_k(&self, k: usize) -> Vec<Representation> {
         let mut reps = self.retrieve();
-        reps.sort_by(|a, b| b.salience.partial_cmp(&a.salience).unwrap());
+        // NaN-safe sorting: treat NaN salience as less than any value
+        reps.sort_by(|a, b| b.salience.partial_cmp(&a.salience).unwrap_or(std::cmp::Ordering::Less));
         reps.truncate(k);
         reps
     }
@@ -382,7 +383,7 @@ impl GlobalWorkspace {
     /// Get most salient representation
     pub fn most_salient(&self) -> Option<&Representation> {
         self.buffer.iter().max_by(|a, b| {
-            a.salience.partial_cmp(&b.salience).unwrap()
+            a.salience.partial_cmp(&b.salience).unwrap_or(std::cmp::Ordering::Less)
         })
     }
 
