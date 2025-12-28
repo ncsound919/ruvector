@@ -71,33 +71,31 @@ impl WTALayer {
     ///
     /// # Performance
     ///
-    /// - O(n) for finding max
+    /// - O(n) single-pass for update and max finding
     /// - <1μs for 1000 neurons
     pub fn compete(&mut self, inputs: &[f32]) -> Option<usize> {
         assert_eq!(inputs.len(), self.membranes.len(), "Input size mismatch");
 
-        // Update membrane potentials with inputs
+        // Single-pass: update membrane potentials and find max simultaneously
+        let mut best_idx = None;
+        let mut best_val = f32::NEG_INFINITY;
+
         for (i, &input) in inputs.iter().enumerate() {
             if self.refractory_counters[i] == 0 {
                 self.membranes[i] = input;
+                if input > best_val {
+                    best_val = input;
+                    best_idx = Some(i);
+                }
             } else {
                 self.refractory_counters[i] = self.refractory_counters[i].saturating_sub(1);
             }
         }
 
-        // Find winner (argmax of valid neurons)
-        let winner_idx = self
-            .membranes
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| self.refractory_counters[*i] == 0)
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)?;
-
-        let winner_value = self.membranes[winner_idx];
+        let winner_idx = best_idx?;
 
         // Check if winner exceeds threshold
-        if winner_value < self.threshold {
+        if best_val < self.threshold {
             return None;
         }
 

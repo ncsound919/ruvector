@@ -62,43 +62,37 @@ fn benchmark_hdc(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(42);
 
     // Vector binding (target: <100ns)
-    group.bench_function("vector_binding", |b| {
-        let a = generate_bitvector(&mut rng, 10000);
-        let b = generate_bitvector(&mut rng, 10000);
-
-        b.iter(|| {
-            // hdc::bind(black_box(&a), black_box(&b))
-            xor_bitvectors(black_box(&a), black_box(&b))
+    let vec_a = generate_bitvector(&mut rng, 10000);
+    let vec_b = generate_bitvector(&mut rng, 10000);
+    group.bench_function("vector_binding", |bencher| {
+        bencher.iter(|| {
+            xor_bitvectors(black_box(&vec_a), black_box(&vec_b))
         });
     });
 
     // Vector bundling (target: <500ns)
-    group.bench_function("vector_bundling", |b| {
-        let vectors: Vec<_> = (0..10).map(|_| generate_bitvector(&mut rng, 10000)).collect();
-
-        b.iter(|| {
-            // hdc::bundle(black_box(&vectors))
-            majority_bitvectors(black_box(&vectors))
+    let bundle_vectors: Vec<_> = (0..10).map(|_| generate_bitvector(&mut rng, 10000)).collect();
+    group.bench_function("vector_bundling", |bencher| {
+        bencher.iter(|| {
+            majority_bitvectors(black_box(&bundle_vectors))
         });
     });
 
     // Hamming distance (target: <100ns)
-    group.bench_function("hamming_distance", |b| {
-        let a = generate_bitvector(&mut rng, 10000);
-        let b = generate_bitvector(&mut rng, 10000);
-
-        b.iter(|| {
-            hamming_distance(black_box(&a), black_box(&b))
+    let ham_a = generate_bitvector(&mut rng, 10000);
+    let ham_b = generate_bitvector(&mut rng, 10000);
+    group.bench_function("hamming_distance", |bencher| {
+        bencher.iter(|| {
+            hamming_distance(black_box(&ham_a), black_box(&ham_b))
         });
     });
 
     // Similarity check (target: <200ns)
-    group.bench_function("similarity_check", |b| {
-        let a = generate_bitvector(&mut rng, 10000);
-        let b = generate_bitvector(&mut rng, 10000);
-
-        b.iter(|| {
-            hdc_similarity(black_box(&a), black_box(&b))
+    let sim_a = generate_bitvector(&mut rng, 10000);
+    let sim_b = generate_bitvector(&mut rng, 10000);
+    group.bench_function("similarity_check", |bencher| {
+        bencher.iter(|| {
+            hdc_similarity(black_box(&sim_a), black_box(&sim_b))
         });
     });
 
