@@ -350,24 +350,25 @@ mod tests {
     fn test_eligibility_state() {
         let mut state = EligibilityState::new(1000.0);
 
-        state.update(1.0, 0);
+        state.update(1.0, 100);  // Start at time 100
         assert_eq!(state.trace(), 1.0);
 
         // After 1 time constant, should decay to ~0.37
-        state.update(0.0, 1000);
-        assert!(state.trace() > 0.3 && state.trace() < 0.4);
+        state.update(0.0, 1100);  // 1000ms later
+        assert!(state.trace() > 0.3 && state.trace() < 0.4, "trace: {}", state.trace());
     }
 
     #[test]
     fn test_consolidation_schedule() {
         let mut schedule = ConsolidationSchedule::new(3600, 32, 0.01);
 
-        // Never consolidated yet
+        // Never consolidated yet (last_consolidation == 0)
         assert!(!schedule.should_consolidate(0));
 
-        schedule.last_consolidation = 0;
-        // After 2 hours, should consolidate
-        assert!(schedule.should_consolidate(7200));
+        // Set initial consolidation time
+        schedule.last_consolidation = 1; // Mark as having consolidated once
+        // After 2+ hours, should consolidate
+        assert!(schedule.should_consolidate(7201));
 
         schedule.last_consolidation = 7200;
         // Immediately after, should not consolidate
@@ -425,14 +426,15 @@ mod tests {
         versioning.update_parameters(&params);
 
         let gradients: Vec<Vec<f32>> = vec![vec![0.1; 50]; 10];
-        let result = versioning.consolidate(&gradients, 0);
+        // Consolidate with timestamp 5
+        let result = versioning.consolidate(&gradients, 5);
 
         assert!(result.is_ok());
 
         // Should not consolidate immediately after
-        assert!(!versioning.should_consolidate(0));
+        assert!(!versioning.should_consolidate(5));
 
-        // Should consolidate after interval
+        // Should consolidate after interval (5 + 10 = 15 or later)
         assert!(versioning.should_consolidate(20));
     }
 
