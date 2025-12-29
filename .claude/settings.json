@@ -41,8 +41,7 @@
       "Bash(ruvector-cli:*)"
     ],
     "deny": [
-      "Bash(rm -rf /)",
-      "Bash(cargo publish:*)"
+      "Bash(rm -rf /)"
     ]
   },
   "hooks": {

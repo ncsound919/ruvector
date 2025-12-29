@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+description = "Bio-inspired neural system with spiking networks, BTSP learning, and EWC plasticity"
+keywords = ["neural", "spiking", "neuromorphic", "plasticity", "learning"]
+categories = ["science", "algorithms", "simulation"]
+readme = "README.md"
 
 [dependencies]
 # Core deps

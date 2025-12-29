@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 description = "Node.js bindings for subpolynomial-time dynamic minimum cut"
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords = ["mincut", "nodejs", "napi", "graph", "algorithm"]
+categories = ["api-bindings", "algorithms"]
+readme = "README.md"
 
 [lib]
 crate-type = ["cdylib"]
