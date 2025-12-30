@@ -8,36 +8,60 @@
 [![Node.js](https://img.shields.io/badge/Node.js-16+-green.svg)](https://nodejs.org/)
 [![Bundle Size](https://img.shields.io/bundlephobia/minzip/@ruvector/rudag)](https://bundlephobia.com/package/@ruvector/rudag)
 
-**The fastest way to work with task dependencies in JavaScript**
+**Smart task scheduling with self-learning optimization — powered by Rust/WASM**
 
-Ever needed to figure out the right order to run tasks? Or find out which step is the bottleneck in your pipeline? That's what rudag does - blazingly fast.
+> *"What order should I run these tasks? Which one is slowing everything down?"*
 
-## What Problem Does This Solve?
+rudag answers these questions instantly. It's a **Directed Acyclic Graph (DAG)** library that helps you manage dependencies, find bottlenecks, and optimize execution — all with self-learning intelligence that gets smarter over time.
 
-Imagine you're building a system where **Task C** can't start until **Task A** and **Task B** finish:
-
-```
-   [Task A: 5s]     [Task B: 3s]
-         \              /
-          \            /
-           v          v
-          [Task C: 2s]
-               |
-               v
-          [Task D: 1s]
+```typescript
+// 3 lines to find your bottleneck
+const dag = new RuDag({ name: 'my-pipeline' });
+await dag.init();
+const { path, cost } = dag.criticalPath();  // → "Task A → Task C takes 8 seconds"
 ```
 
-**Common questions:**
-- What order should I run these? → `topoSort()` gives you `[A, B, C, D]`
-- How long will everything take? → `criticalPath()` tells you `A → C → D = 8 seconds`
-- Which task should I optimize first? → `attention()` scores tasks by importance
+---
 
-**This pattern appears everywhere:**
-- 🗄️ Database queries (which tables to scan first?)
-- 🔨 Build systems (compile before linking)
-- 📦 Package managers (install dependencies first)
-- 🔄 CI/CD pipelines (test before deploy)
-- 📊 Data pipelines (extract → transform → load)
+## The Problem
+
+You have tasks with dependencies. **Task C** needs **A** and **B** to finish first:
+
+```
+   ┌─────────────┐     ┌─────────────┐
+   │ Task A: 5s  │     │ Task B: 3s  │
+   └──────┬──────┘     └──────┬──────┘
+          │                   │
+          └────────┬──────────┘
+                   ▼
+          ┌─────────────┐
+          │ Task C: 2s  │
+          └──────┬──────┘
+                 ▼
+          ┌─────────────┐
+          │ Task D: 1s  │
+          └─────────────┘
+```
+
+**You need answers:**
+
+| Question | rudag Method | Answer |
+|----------|--------------|--------|
+| What order to run tasks? | `topoSort()` | `[A, B, C, D]` |
+| How long will it all take? | `criticalPath()` | `A→C→D = 8s` (B runs parallel) |
+| What should I optimize? | `attention()` | Task A scores highest — fix that first! |
+
+## Where You'll Use This
+
+| Use Case | Example |
+|----------|---------|
+| 🗄️ **Query Optimization** | Find which table scan is the bottleneck |
+| 🔨 **Build Systems** | Compile dependencies in the right order |
+| 📦 **Package Managers** | Resolve and install dependencies |
+| 🔄 **CI/CD Pipelines** | Orchestrate test → build → deploy |
+| 📊 **ETL Pipelines** | Schedule extract → transform → load |
+| 🎮 **Game AI** | Plan action sequences with prerequisites |
+| 📋 **Workflow Engines** | Manage approval chains and state machines |
 
 ## Why rudag?
 
