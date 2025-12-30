@@ -45,6 +45,8 @@ members = [
     "crates/sona",
     "crates/rvlite",
     "crates/ruvector-nervous-system",
+    "crates/ruvector-dag",
+    "crates/ruvector-dag-wasm",
 ]
 resolver = "2"
 
