@@ -11,6 +11,9 @@
  *   claude mcp add ruvector npx ruvector mcp start
  */
 
+// Signal that this is an MCP server (enables parallel workers for embeddings)
+process.env.MCP_SERVER = '1';
+
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const {
@@ -291,7 +294,7 @@ class Intelligence {
 const server = new Server(
   {
     name: 'ruvector',
-    version: '0.1.53',
+    version: '0.1.58',
   },
   {
     capabilities: {
@@ -557,6 +560,178 @@ const TOOLS = [
   {
     name: 'hooks_force_learn',
     description: 'Force an immediate learning cycle',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  // ============================================
+  // NEW CAPABILITY TOOLS (AST, Diff, Coverage, Graph, Security, RAG)
+  // ============================================
+  {
+    name: 'hooks_ast_analyze',
+    description: 'Parse file AST and extract symbols, imports, complexity metrics',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: 'File path to analyze' }
+      },
+      required: ['file']
+    }
+  },
+  {
+    name: 'hooks_ast_complexity',
+    description: 'Get cyclomatic and cognitive complexity metrics for files',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        files: { type: 'array', items: { type: 'string' }, description: 'Files to analyze' },
+        threshold: { type: 'number', description: 'Warn if complexity exceeds threshold', default: 10 }
+      },
+      required: ['files']
+    }
+  },
+  {
+    name: 'hooks_diff_analyze',
+    description: 'Analyze git diff with semantic embeddings and risk scoring',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        commit: { type: 'string', description: 'Commit hash (defaults to staged changes)' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'hooks_diff_classify',
+    description: 'Classify change type (feature, bugfix, refactor, docs, test, config)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        commit: { type: 'string', description: 'Commit hash (defaults to HEAD)' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'hooks_diff_similar',
+    description: 'Find similar past commits based on diff embeddings',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        top_k: { type: 'number', description: 'Number of results', default: 5 },
+        commits: { type: 'number', description: 'Recent commits to search', default: 50 }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'hooks_coverage_route',
+    description: 'Get coverage-aware agent routing for a file',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: 'File to analyze' }
+      },
+      required: ['file']
+    }
+  },
+  {
+    name: 'hooks_coverage_suggest',
+    description: 'Suggest tests for files based on coverage data',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        files: { type: 'array', items: { type: 'string' }, description: 'Files to analyze' }
+      },
+      required: ['files']
+    }
+  },
+  {
+    name: 'hooks_graph_mincut',
+    description: 'Find optimal code boundaries using MinCut algorithm (Stoer-Wagner)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        files: { type: 'array', items: { type: 'string' }, description: 'Files to analyze' }
+      },
+      required: ['files']
+    }
+  },
+  {
+    name: 'hooks_graph_cluster',
+    description: 'Detect code communities using spectral or Louvain clustering',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        files: { type: 'array', items: { type: 'string' }, description: 'Files to analyze' },
+        method: { type: 'string', enum: ['spectral', 'louvain'], default: 'louvain' },
+        clusters: { type: 'number', description: 'Number of clusters (spectral only)', default: 3 }
+      },
+      required: ['files']
+    }
+  },
+  {
+    name: 'hooks_security_scan',
+    description: 'Parallel security vulnerability scan for common issues',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        files: { type: 'array', items: { type: 'string' }, description: 'Files to scan' }
+      },
+      required: ['files']
+    }
+  },
+  {
+    name: 'hooks_rag_context',
+    description: 'Get RAG-enhanced context for a query with optional reranking',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Query for context' },
+        top_k: { type: 'number', description: 'Number of results', default: 5 },
+        rerank: { type: 'boolean', description: 'Rerank results by relevance', default: false }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'hooks_git_churn',
+    description: 'Analyze git churn to find hot spots',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        days: { type: 'number', description: 'Number of days to analyze', default: 30 },
+        top: { type: 'number', description: 'Top N files', default: 10 }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'hooks_route_enhanced',
+    description: 'Enhanced routing using AST complexity, coverage, and diff analysis signals',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: 'Task description' },
+        file: { type: 'string', description: 'File context' }
+      },
+      required: ['task']
+    }
+  },
+  {
+    name: 'hooks_attention_info',
+    description: 'Get available attention mechanisms and their configurations',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  {
+    name: 'hooks_gnn_info',
+    description: 'Get GNN layer capabilities and configuration',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -1163,6 +1338,191 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: JSON.stringify({ success: true, result, stats: intel.stats() }, null, 2)
           }]
         };
+      }
+
+      // ============================================
+      // NEW CAPABILITY TOOL HANDLERS
+      // ============================================
+
+      case 'hooks_ast_analyze': {
+        try {
+          const output = execSync(`npx ruvector hooks ast-analyze "${args.file}" --json`, { encoding: 'utf-8', timeout: 30000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_ast_complexity': {
+        try {
+          const filesArg = args.files.map(f => `"${f}"`).join(' ');
+          const output = execSync(`npx ruvector hooks ast-complexity ${filesArg} --threshold ${args.threshold || 10}`, { encoding: 'utf-8', timeout: 60000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_diff_analyze': {
+        try {
+          const cmd = args.commit ? `npx ruvector hooks diff-analyze "${args.commit}" --json` : 'npx ruvector hooks diff-analyze --json';
+          const output = execSync(cmd, { encoding: 'utf-8', timeout: 60000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_diff_classify': {
+        try {
+          const cmd = args.commit ? `npx ruvector hooks diff-classify "${args.commit}"` : 'npx ruvector hooks diff-classify';
+          const output = execSync(cmd, { encoding: 'utf-8', timeout: 30000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_diff_similar': {
+        try {
+          const output = execSync(`npx ruvector hooks diff-similar -k ${args.top_k || 5} --commits ${args.commits || 50}`, { encoding: 'utf-8', timeout: 120000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_coverage_route': {
+        try {
+          const output = execSync(`npx ruvector hooks coverage-route "${args.file}"`, { encoding: 'utf-8', timeout: 15000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_coverage_suggest': {
+        try {
+          const filesArg = args.files.map(f => `"${f}"`).join(' ');
+          const output = execSync(`npx ruvector hooks coverage-suggest ${filesArg}`, { encoding: 'utf-8', timeout: 30000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_graph_mincut': {
+        try {
+          const filesArg = args.files.map(f => `"${f}"`).join(' ');
+          const output = execSync(`npx ruvector hooks graph-mincut ${filesArg}`, { encoding: 'utf-8', timeout: 60000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_graph_cluster': {
+        try {
+          const filesArg = args.files.map(f => `"${f}"`).join(' ');
+          const method = args.method || 'louvain';
+          const clusters = args.clusters || 3;
+          const output = execSync(`npx ruvector hooks graph-cluster ${filesArg} --method ${method} --clusters ${clusters}`, { encoding: 'utf-8', timeout: 60000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_security_scan': {
+        try {
+          const filesArg = args.files.map(f => `"${f}"`).join(' ');
+          const output = execSync(`npx ruvector hooks security-scan ${filesArg}`, { encoding: 'utf-8', timeout: 120000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_rag_context': {
+        try {
+          let cmd = `npx ruvector hooks rag-context "${args.query}" -k ${args.top_k || 5}`;
+          if (args.rerank) cmd += ' --rerank';
+          const output = execSync(cmd, { encoding: 'utf-8', timeout: 30000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_git_churn': {
+        try {
+          const output = execSync(`npx ruvector hooks git-churn --days ${args.days || 30} --top ${args.top || 10}`, { encoding: 'utf-8', timeout: 30000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_route_enhanced': {
+        try {
+          let cmd = `npx ruvector hooks route-enhanced "${args.task}"`;
+          if (args.file) cmd += ` --file "${args.file}"`;
+          const output = execSync(cmd, { encoding: 'utf-8', timeout: 30000 });
+          return { content: [{ type: 'text', text: output }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
+        }
+      }
+
+      case 'hooks_attention_info': {
+        // Return info about available attention mechanisms
+        let attentionInfo = { available: false, mechanisms: [] };
+        try {
+          const attention = require('@ruvector/attention');
+          attentionInfo = {
+            available: true,
+            version: attention.version || '1.0.0',
+            mechanisms: [
+              { name: 'DotProductAttention', description: 'Basic scaled dot-product attention' },
+              { name: 'MultiHeadAttention', description: 'Multi-head self-attention with parallel heads' },
+              { name: 'FlashAttention', description: 'Memory-efficient attention with tiling' },
+              { name: 'HyperbolicAttention', description: 'Attention in Poincaré ball hyperbolic space' },
+              { name: 'LinearAttention', description: 'O(n) linear complexity attention' },
+              { name: 'MoEAttention', description: 'Mixture-of-Experts sparse attention' },
+              { name: 'GraphRoPeAttention', description: 'Rotary position embeddings for graphs' },
+              { name: 'DualSpaceAttention', description: 'Euclidean + Hyperbolic hybrid' },
+              { name: 'LocalGlobalAttention', description: 'Sliding window + global tokens' }
+            ],
+            hyperbolic: { expMap: true, logMap: true, mobiusAddition: true, poincareDistance: true }
+          };
+        } catch (e) {
+          attentionInfo = { available: false, error: 'Attention package not installed' };
+        }
+        return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...attentionInfo }, null, 2) }] };
+      }
+
+      case 'hooks_gnn_info': {
+        // Return info about GNN capabilities
+        let gnnInfo = { available: false, layers: [] };
+        try {
+          const gnn = require('@ruvector/gnn');
+          gnnInfo = {
+            available: true,
+            version: gnn.version || '1.0.0',
+            layers: [
+              { name: 'RuvectorLayer', description: 'Differentiable vector search layer' },
+              { name: 'TensorCompress', description: 'Tensor compression for embeddings' }
+            ],
+            features: [
+              'differentiableSearch - Gradient-based vector search',
+              'hierarchicalForward - Multi-scale graph processing',
+              'getCompressionLevel - Adaptive compression'
+            ]
+          };
+        } catch (e) {
+          gnnInfo = { available: false, error: 'GNN package not installed' };
+        }
+        return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...gnnInfo }, null, 2) }] };
       }
 
       default:
