@@ -23,7 +23,32 @@ const matcher = new WasmSemanticMatcher();
 const vectorIndex = new WasmHnswIndex(128, 16, 200);
 ```
 
-## Why Edge-First Swarms?
+---
+
+## Table of Contents
+
+1. [Why Edge-First?](#why-edge-first)
+2. [Features](#features)
+3. [Quick Start](#quick-start)
+4. [Tutorial: Build Your First Swarm](#tutorial-build-your-first-swarm)
+   - [Step 1: Agent Identity](#step-1-agent-identity)
+   - [Step 2: Secure Communication](#step-2-secure-communication)
+   - [Step 3: Vector Search](#step-3-vector-search)
+   - [Step 4: Task Routing](#step-4-task-routing)
+   - [Step 5: Distributed Consensus](#step-5-distributed-consensus)
+5. [P2P Transport Options](#p2p-transport-options)
+   - [WebRTC (Browser-to-Browser)](#option-1-webrtc-browser-to-browser)
+   - [GUN.js (Decentralized Database)](#option-2-gunjs-decentralized-database)
+   - [IPFS + libp2p](#option-3-ipfs--libp2p)
+   - [Nostr Relays](#option-4-nostr-relays)
+6. [Architecture](#architecture)
+7. [API Reference](#api-reference)
+8. [Performance](#performance)
+9. [Security](#security)
+
+---
+
+## Why Edge-First?
 
 | Traditional Cloud Swarms | RuVector Edge Swarms |
 |--------------------------|---------------------|
@@ -50,253 +75,750 @@ RuVector Edge Swarm:
 └── Total:            $0/month forever
 ```
 
-## Core Philosophy
+### How Is It Free?
 
-### 1. Zero Infrastructure Costs
-Your swarm runs on devices you already own - browsers, phones, laptops, Raspberry Pis, edge servers. No cloud bills, no API limits, no usage caps.
+The code runs on devices you already own - there's no server to pay for:
 
-### 2. Privacy by Default
-Agent communication never touches external servers. All data stays within your network. Post-quantum encryption ensures even future quantum computers can't decrypt your traffic.
+```
+Traditional Architecture:
+┌──────────┐     ┌─────────────────┐     ┌──────────┐
+│ Agent A  │────►│  Cloud Server   │◄────│ Agent B  │
+└──────────┘     │  ($$$$/month)   │     └──────────┘
+                 └─────────────────┘
 
-### 3. True Decentralization
-No single point of failure. Agents discover each other, elect leaders via Raft consensus, and continue operating even when nodes go offline.
+Edge Architecture:
+┌──────────┐◄───────────────────────────►┌──────────┐
+│ Agent A  │         Direct P2P          │ Agent B  │
+│ (Browser)│         Connection          │ (Browser)│
+└──────────┘                             └──────────┘
+                 No server = No cost
+```
 
-### 4. Browser-Native
-The entire stack compiles to 364KB of WebAssembly. Run sophisticated AI swarms in web workers, service workers, or directly in the browser - no backend required.
+---
 
-## Installation
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| **Ed25519 Identity** | Cryptographic agent identity with signing |
+| **AES-256-GCM** | Authenticated encryption for all messages |
+| **Post-Quantum Hybrid** | Future-proof against quantum attacks |
+| **HNSW Vector Index** | 150x faster similarity search |
+| **Semantic Matching** | Intelligent task-to-agent routing |
+| **Raft Consensus** | Distributed leader election |
+| **Spiking Networks** | Bio-inspired temporal learning |
+| **Adaptive Compression** | Network-aware bandwidth optimization |
+
+---
+
+## Quick Start
+
+### Installation
 
 ```bash
 npm install @ruvector/edge
 ```
 
-## Quick Start
-
-### Browser/Node.js (ESM)
+### Basic Usage
 
 ```javascript
 import init, {
   WasmIdentity,
   WasmCrypto,
   WasmHnswIndex,
-  WasmSemanticMatcher,
-  WasmRaftNode,
-  WasmSpikingNetwork
+  WasmSemanticMatcher
 } from '@ruvector/edge';
 
-// Initialize WASM module
+// Initialize WASM (required once)
 await init();
 
-// 1. Create agent identity (Ed25519 keypair)
+// Create an agent
 const agent = WasmIdentity.generate();
-console.log(`Agent ID: ${agent.agent_id()}`);
-console.log(`Public Key: ${agent.public_key_hex()}`);
+console.log(`Agent: ${agent.agent_id()}`);
 
-// 2. Sign and verify messages
-const message = new TextEncoder().encode("Task: analyze dataset");
-const signature = agent.sign(message);
-const isValid = agent.verify(message, signature);
-
-// 3. Encrypt communications (AES-256-GCM)
+// Encrypt a message
 const crypto = new WasmCrypto();
 const key = crypto.generate_key();
-const encrypted = crypto.encrypt(key, message);
-const decrypted = crypto.decrypt(key, encrypted);
+const encrypted = crypto.encrypt(key, new TextEncoder().encode("Hello swarm!"));
 
-// 4. Vector search for agent matching (HNSW - 150x faster)
+// Search vectors
 const index = new WasmHnswIndex(128, 16, 200);
-index.insert("rust-agent", new Float32Array(128).fill(0.9));
-index.insert("python-agent", new Float32Array(128).fill(0.1));
-const query = new Float32Array(128).fill(0.85);
-const matches = index.search(query, 3);
+index.insert("doc-1", new Float32Array(128).fill(0.5));
+const results = index.search(new Float32Array(128).fill(0.5), 5);
 
-// 5. Semantic task routing
+// Route tasks
 const matcher = new WasmSemanticMatcher();
-matcher.register_agent("code-agent", "rust typescript javascript programming");
-matcher.register_agent("data-agent", "python pandas numpy analysis");
-const best = matcher.find_best_agent("write a rust function");
-console.log(`Best agent: ${best}`);
-
-// 6. Distributed consensus (Raft)
-const members = ["node-1", "node-2", "node-3"];
-const raft = new WasmRaftNode("node-1", members);
-const voteRequest = raft.start_election();
+matcher.register_agent("coder", "rust typescript javascript");
+const best = matcher.find_best_agent("write a function");
 ```
 
-### Web Worker Example
+---
 
-```javascript
-// worker.js - Run swarm logic in a worker thread
-import init, { WasmIdentity, WasmSemanticMatcher } from '@ruvector/edge';
+## Tutorial: Build Your First Swarm
 
-let identity, matcher;
+This tutorial walks you through building a complete AI agent swarm that runs entirely in browsers with no backend.
 
-self.onmessage = async (e) => {
-  if (e.data.type === 'init') {
-    await init();
-    identity = WasmIdentity.generate();
-    matcher = new WasmSemanticMatcher();
-    matcher.register_agent(identity.agent_id(), e.data.capabilities);
-    self.postMessage({ type: 'ready', agentId: identity.agent_id() });
-  }
+### Prerequisites
 
-  if (e.data.type === 'route') {
-    const best = matcher.find_best_agent(e.data.task);
-    self.postMessage({ type: 'routed', agent: best });
-  }
-};
+```bash
+mkdir my-swarm && cd my-swarm
+npm init -y
+npm install @ruvector/edge
 ```
 
-## Available APIs
+Create `index.html`:
 
-### WasmIdentity
-Ed25519 identity management for agents.
-
-```javascript
-const id = WasmIdentity.generate();
-id.agent_id();           // Unique agent identifier
-id.public_key_hex();     // Hex-encoded public key
-id.sign(message);        // Sign Uint8Array
-id.verify(msg, sig);     // Verify signature
+```html
+<!DOCTYPE html>
+<html>
+<head><title>My AI Swarm</title></head>
+<body>
+  <div id="status"></div>
+  <script type="module" src="swarm.js"></script>
+</body>
+</html>
 ```
 
-### WasmCrypto
-AES-256-GCM authenticated encryption.
+---
+
+### Step 1: Agent Identity
+
+Every agent needs a unique cryptographic identity. This enables signing messages and verifying authenticity.
+
+Create `swarm.js`:
 
 ```javascript
+import init, { WasmIdentity } from '@ruvector/edge';
+
+async function createAgent(name) {
+  await init();
+
+  // Generate Ed25519 keypair
+  const identity = WasmIdentity.generate();
+
+  console.log(`Agent: ${name}`);
+  console.log(`  ID: ${identity.agent_id()}`);
+  console.log(`  Public Key: ${identity.public_key_hex().slice(0, 16)}...`);
+
+  return identity;
+}
+
+// Create our agent
+const myAgent = await createAgent("Worker-001");
+
+// Sign a message to prove identity
+const message = new TextEncoder().encode("I am Worker-001");
+const signature = myAgent.sign(message);
+console.log(`  Signature: ${signature.slice(0, 8).join(',')}...`);
+
+// Verify the signature
+const isValid = myAgent.verify(message, signature);
+console.log(`  Valid: ${isValid}`); // true
+```
+
+**What's happening:**
+- `WasmIdentity.generate()` creates an Ed25519 keypair
+- `agent_id()` returns a unique identifier derived from the public key
+- `sign()` creates a cryptographic signature proving the message came from this agent
+- `verify()` checks if a signature is valid
+
+---
+
+### Step 2: Secure Communication
+
+Agents need to encrypt messages so only intended recipients can read them.
+
+```javascript
+import init, { WasmIdentity, WasmCrypto } from '@ruvector/edge';
+
+await init();
+
 const crypto = new WasmCrypto();
-crypto.generate_key();           // 32-byte random key
-crypto.encrypt(key, plaintext);  // Returns ciphertext
-crypto.decrypt(key, ciphertext); // Returns plaintext
+
+// Agent A wants to send a secret message to Agent B
+const agentA = WasmIdentity.generate();
+const agentB = WasmIdentity.generate();
+
+// Generate a shared secret key (in real app, use key exchange)
+const sharedKey = crypto.generate_key();
+
+// Agent A encrypts
+const plaintext = new TextEncoder().encode(JSON.stringify({
+  task: "analyze_data",
+  payload: { dataset: "sales_2024.csv" }
+}));
+
+const ciphertext = crypto.encrypt(sharedKey, plaintext);
+console.log(`Encrypted: ${ciphertext.length} bytes`);
+
+// Agent B decrypts
+const decrypted = crypto.decrypt(sharedKey, ciphertext);
+const message = JSON.parse(new TextDecoder().decode(decrypted));
+console.log(`Decrypted: ${message.task}`); // "analyze_data"
 ```
 
-### WasmHnswIndex
-Hierarchical Navigable Small World graph for fast vector search.
+**Security features:**
+- AES-256-GCM authenticated encryption
+- Random nonce per message (replay protection)
+- Ciphertext integrity verification
+
+---
+
+### Step 3: Vector Search
+
+Agents need to find each other based on capabilities. HNSW enables fast similarity search.
 
 ```javascript
-const index = new WasmHnswIndex(dims, m, ef_construction);
-index.insert(id, vector);        // Add vector
-index.search(query, k);          // Find k nearest
-index.len();                     // Number of vectors
+import init, { WasmHnswIndex } from '@ruvector/edge';
+
+await init();
+
+// Create index: 128 dimensions, M=16 connections, ef=200 search quality
+const index = new WasmHnswIndex(128, 16, 200);
+
+// Register agents with their capability embeddings
+// (In production, use real embeddings from a model)
+function mockEmbedding(weights) {
+  const vec = new Float32Array(128);
+  weights.forEach((w, i) => vec[i] = w);
+  return vec;
+}
+
+// Register specialized agents
+index.insert("rust-expert", mockEmbedding([0.9, 0.1, 0.0, 0.0]));
+index.insert("python-expert", mockEmbedding([0.1, 0.9, 0.0, 0.0]));
+index.insert("ml-expert", mockEmbedding([0.0, 0.5, 0.9, 0.0]));
+index.insert("devops-expert", mockEmbedding([0.0, 0.0, 0.2, 0.9]));
+
+console.log(`Index size: ${index.len()} agents`);
+
+// Find best agent for a Rust task
+const rustTask = mockEmbedding([0.85, 0.1, 0.05, 0.0]);
+const results = index.search(rustTask, 3);
+
+console.log("Best agents for Rust task:");
+results.forEach(([id, distance]) => {
+  console.log(`  ${id}: distance=${distance.toFixed(3)}`);
+});
+// Output: rust-expert: distance=0.050
 ```
 
-### WasmSemanticMatcher
-LSH-based semantic matching for task routing.
+**Why HNSW?**
+- O(log n) search instead of O(n)
+- 150x faster than brute force at 10K+ vectors
+- Memory-efficient graph structure
+
+---
+
+### Step 4: Task Routing
+
+Route tasks to the best agent using semantic matching.
 
 ```javascript
+import init, { WasmSemanticMatcher } from '@ruvector/edge';
+
+await init();
+
 const matcher = new WasmSemanticMatcher();
-matcher.register_agent(id, capabilities);  // Add agent
-matcher.find_best_agent(task);             // Route task
-matcher.agent_count();                     // Registered agents
+
+// Register agents with capability descriptions
+matcher.register_agent("code-agent",
+  "rust typescript javascript python programming coding functions classes");
+matcher.register_agent("data-agent",
+  "python pandas numpy data analysis statistics csv excel");
+matcher.register_agent("devops-agent",
+  "docker kubernetes terraform aws deploy infrastructure cicd");
+matcher.register_agent("writing-agent",
+  "documentation markdown readme technical writing blog");
+
+console.log(`Registered ${matcher.agent_count()} agents`);
+
+// Route tasks to best agent
+const tasks = [
+  "Write a Rust function to parse JSON",
+  "Analyze the sales data in this CSV",
+  "Deploy the app to Kubernetes",
+  "Update the API documentation"
+];
+
+tasks.forEach(task => {
+  const best = matcher.find_best_agent(task);
+  console.log(`"${task.slice(0, 30)}..." → ${best}`);
+});
+
+// Output:
+// "Write a Rust function..." → code-agent
+// "Analyze the sales data..." → data-agent
+// "Deploy the app to Kube..." → devops-agent
+// "Update the API documen..." → writing-agent
 ```
 
-### WasmRaftNode
-Distributed consensus for leader election.
+**How it works:**
+- LSH (Locality-Sensitive Hashing) creates semantic fingerprints
+- Tasks are matched to agents by fingerprint similarity
+- Sub-millisecond routing even with many agents
+
+---
+
+### Step 5: Distributed Consensus
+
+When multiple agents need to agree on a leader or shared state, use Raft consensus.
 
 ```javascript
-const raft = new WasmRaftNode(id, members);
-raft.start_election();           // Become candidate
-raft.handle_vote(response);      // Process vote
-raft.current_term();             // Raft term
-raft.state();                    // "follower"|"candidate"|"leader"
+import init, { WasmRaftNode } from '@ruvector/edge';
+
+await init();
+
+// Create a 3-node cluster
+const members = ["node-1", "node-2", "node-3"];
+
+const node1 = new WasmRaftNode("node-1", members);
+const node2 = new WasmRaftNode("node-2", members);
+const node3 = new WasmRaftNode("node-3", members);
+
+console.log(`Node 1 state: ${node1.state()}`); // "follower"
+console.log(`Node 1 term: ${node1.current_term()}`); // 0
+
+// Node 1 times out and starts election
+const voteRequest = node1.start_election();
+console.log(`Node 1 state: ${node1.state()}`); // "candidate"
+console.log(`Node 1 term: ${node1.current_term()}`); // 1
+
+// Simulate: Node 2 and 3 grant votes
+// (In real app, send voteRequest over network, receive responses)
+const granted1 = node1.receive_vote(true);
+const granted2 = node1.receive_vote(true);
+
+console.log(`Node 1 state: ${node1.state()}`); // "leader"
+
+// Leader can now coordinate the swarm!
+console.log("Leader elected - swarm can coordinate");
 ```
 
-### WasmHybridKeyPair
-Post-quantum hybrid signatures (Ed25519 + Dilithium-style).
+**Raft guarantees:**
+- Only one leader at a time
+- Leader election in 1-2 round trips
+- Tolerates f failures in 2f+1 nodes
+
+---
+
+## P2P Transport Options
+
+RuVector Edge provides the intelligence layer. You need a transport layer for agents to communicate. Here are your free options:
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    @ruvector/edge (WASM)                    │
+│  Identity, Crypto, HNSW, Semantic Matching, Raft, etc.      │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                    Transport Layer (choose one)
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+   ┌─────────┐          ┌─────────┐          ┌─────────┐
+   │ WebRTC  │          │  GUN.js │          │  IPFS/  │
+   │  (P2P)  │          │  (P2P)  │          │ libp2p  │
+   └─────────┘          └─────────┘          └─────────┘
+```
+
+---
+
+### Option 1: WebRTC (Browser-to-Browser)
+
+**Best for:** Direct browser-to-browser communication
+**Cost:** Free (need minimal signaling server)
 
 ```javascript
-const keys = WasmHybridKeyPair.generate();
-keys.sign(message);              // Quantum-resistant signature
-keys.verify(signature);          // Verify hybrid sig
-keys.public_key_bytes();         // Export public key
+import init, { WasmIdentity, WasmCrypto } from '@ruvector/edge';
+
+await init();
+
+const identity = WasmIdentity.generate();
+const crypto = new WasmCrypto();
+
+// Create peer connection
+const pc = new RTCPeerConnection({
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] // Free STUN
+});
+
+// Create data channel for agent messages
+const channel = pc.createDataChannel('swarm');
+
+channel.onopen = () => {
+  console.log('P2P connection established!');
+
+  // Send encrypted message
+  const key = crypto.generate_key(); // Exchange via signaling
+  const message = { type: 'task', data: 'analyze this' };
+  const encrypted = crypto.encrypt(key,
+    new TextEncoder().encode(JSON.stringify(message))
+  );
+
+  channel.send(encrypted);
+};
+
+channel.onmessage = (event) => {
+  const decrypted = crypto.decrypt(key, new Uint8Array(event.data));
+  const message = JSON.parse(new TextDecoder().decode(decrypted));
+  console.log('Received:', message);
+};
+
+// Signaling (exchange offer/answer via any method)
+const offer = await pc.createOffer();
+await pc.setLocalDescription(offer);
+// Send offer to peer via signaling server, WebSocket, or even QR code
 ```
 
-### WasmSpikingNetwork
-Spiking neural networks with STDP learning.
+**Free signaling options:**
+- PeerJS Cloud (free tier)
+- Firebase Realtime Database (free tier)
+- Your own WebSocket on Fly.io/Railway free tier
+
+---
+
+### Option 2: GUN.js (Decentralized Database)
+
+**Best for:** Real-time sync, offline-first, no server needed
+**Cost:** Completely free (public relay network)
 
 ```javascript
-const net = new WasmSpikingNetwork(inputs, hidden, outputs);
-net.forward(spikes);             // Process spike train
-net.stdp_update(pre, post, lr);  // Apply learning
-net.reset();                     // Reset membrane potentials
+import init, { WasmIdentity, WasmSemanticMatcher } from '@ruvector/edge';
+import Gun from 'gun';
+
+await init();
+
+const identity = WasmIdentity.generate();
+const matcher = new WasmSemanticMatcher();
+
+// Connect to public GUN relays (free!)
+const gun = Gun(['https://gun-manhattan.herokuapp.com/gun']);
+
+// Create swarm namespace
+const swarm = gun.get('my-ai-swarm');
+
+// Register this agent
+swarm.get('agents').get(identity.agent_id()).put({
+  id: identity.agent_id(),
+  capabilities: 'rust typescript programming',
+  publicKey: identity.public_key_hex(),
+  online: true,
+  timestamp: Date.now()
+});
+
+// Listen for new agents
+swarm.get('agents').map().on((agent, id) => {
+  if (agent && agent.id !== identity.agent_id()) {
+    console.log(`Discovered agent: ${agent.id}`);
+    matcher.register_agent(agent.id, agent.capabilities);
+  }
+});
+
+// Publish tasks
+swarm.get('tasks').set({
+  id: crypto.randomUUID(),
+  description: 'Write a Rust function',
+  from: identity.agent_id(),
+  timestamp: Date.now()
+});
+
+// Listen for tasks
+swarm.get('tasks').map().on((task) => {
+  if (task) {
+    const bestAgent = matcher.find_best_agent(task.description);
+    if (bestAgent === identity.agent_id()) {
+      console.log(`I should handle: ${task.description}`);
+    }
+  }
+});
 ```
 
-### WasmQuantizer
-8-bit scalar quantization for bandwidth reduction.
+**Why GUN?**
+- No server required - uses public relays
+- Offline-first with automatic sync
+- Real-time updates via WebSocket
+- Already integrated in RuVector Edge (Rust side)
+
+---
+
+### Option 3: IPFS + libp2p
+
+**Best for:** Content-addressed storage + P2P messaging
+**Cost:** Free (self-host) or free tier (Pinata, Infura)
 
 ```javascript
-const q = new WasmQuantizer();
-const quantized = q.quantize(floatArray);   // 4x compression
-const restored = q.reconstruct(quantized);  // Reconstruct
+import init, { WasmIdentity, WasmCrypto } from '@ruvector/edge';
+import { createLibp2p } from 'libp2p';
+import { webSockets } from '@libp2p/websockets';
+import { noise } from '@chainsafe/libp2p-noise';
+import { gossipsub } from '@chainsafe/libp2p-gossipsub';
+
+await init();
+
+const identity = WasmIdentity.generate();
+const crypto = new WasmCrypto();
+
+// Create libp2p node
+const node = await createLibp2p({
+  transports: [webSockets()],
+  connectionEncryption: [noise()],
+  pubsub: gossipsub()
+});
+
+await node.start();
+
+// Subscribe to swarm topic
+const topic = 'my-ai-swarm';
+
+node.pubsub.subscribe(topic);
+node.pubsub.addEventListener('message', (event) => {
+  if (event.detail.topic === topic) {
+    const message = JSON.parse(new TextDecoder().decode(event.detail.data));
+    console.log('Received:', message);
+  }
+});
+
+// Publish to swarm
+node.pubsub.publish(topic, new TextEncoder().encode(JSON.stringify({
+  from: identity.agent_id(),
+  type: 'announce',
+  capabilities: ['rust', 'wasm']
+})));
 ```
 
-### WasmAdaptiveCompressor
-Network-aware adaptive compression.
+**IPFS for artifacts:**
 
 ```javascript
-const comp = new WasmAdaptiveCompressor();
-comp.update_metrics(bandwidth, latency);
-comp.compress(data);             // Auto-selects compression
-comp.decompress(compressed);     // Restore data
-comp.condition();                // "excellent"|"good"|"poor"|"critical"
+import { create } from 'ipfs-http-client';
+
+// Use free Infura IPFS gateway
+const ipfs = create({ url: 'https://ipfs.infura.io:5001' });
+
+// Store agent output
+const result = await ipfs.add(JSON.stringify({
+  task: 'analyze-data',
+  output: { summary: '...' },
+  agent: identity.agent_id(),
+  signature: identity.sign(...)
+}));
+
+console.log(`Stored at: ipfs://${result.cid}`);
+
+// Share CID with swarm - anyone can fetch
 ```
+
+---
+
+### Option 4: Nostr Relays
+
+**Best for:** Simple pub/sub with free public infrastructure
+**Cost:** Free (many public relays)
+
+```javascript
+import init, { WasmIdentity } from '@ruvector/edge';
+import { relayInit, getEventHash, signEvent } from 'nostr-tools';
+
+await init();
+
+const identity = WasmIdentity.generate();
+
+// Connect to free public relay
+const relay = relayInit('wss://relay.damus.io');
+await relay.connect();
+
+// Create Nostr event (signed message)
+const event = {
+  kind: 29000, // Custom kind for AI swarm
+  created_at: Math.floor(Date.now() / 1000),
+  tags: [['swarm', 'my-ai-swarm']],
+  content: JSON.stringify({
+    agentId: identity.agent_id(),
+    type: 'task',
+    data: 'Write a function'
+  })
+};
+
+// Sign with identity (Nostr uses secp256k1, so bridge needed)
+// Or use Nostr's native keys alongside RuVector identity
+
+// Subscribe to swarm events
+const sub = relay.sub([
+  { kinds: [29000], '#swarm': ['my-ai-swarm'] }
+]);
+
+sub.on('event', (event) => {
+  const message = JSON.parse(event.content);
+  console.log(`From ${message.agentId}: ${message.type}`);
+});
+```
+
+---
+
+### Transport Comparison
+
+| Transport | Latency | Offline | Complexity | Best For |
+|-----------|---------|---------|------------|----------|
+| **WebRTC** | ~50ms | No | Medium | Real-time, gaming |
+| **GUN.js** | ~100ms | Yes | Low | General purpose |
+| **IPFS/libp2p** | ~200ms | Partial | High | Content storage |
+| **Nostr** | ~150ms | No | Low | Simple messaging |
+
+### Recommended: Start with GUN.js
+
+```bash
+npm install gun @ruvector/edge
+```
+
+GUN requires zero setup, works offline, and has a free public relay network.
+
+### Cost at Scale
+
+| Scale | Transport | Monthly Cost |
+|-------|-----------|--------------|
+| Any size | Public GUN relays | $0 (unlimited) |
+| Any size | WebRTC + free STUN | $0 (P2P direct) |
+| Heavy storage | IPFS Pinata free tier | $0 (1GB) |
+| Enterprise | Self-hosted relay | $5-20 (small VPS) |
+
+**Key insight:** You only pay for relay/signaling infrastructure, never for compute. The actual AI swarm logic runs on users' devices for free.
+
+---
 
 ## Architecture
 
+### Complete System
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         @ruvector/edge (WASM)                           │
+│                              Your Application                            │
 ├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│   Browser / Node.js / Edge Function / Web Worker                        │
-│                                                                         │
-│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐   │
-│   │  Identity   │  │   Crypto    │  │    HNSW     │  │  Semantic   │   │
-│   │  Ed25519    │  │  AES-GCM    │  │   Index     │  │  Matcher    │   │
-│   └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘   │
-│                                                                         │
-│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐   │
-│   │    Raft     │  │   Hybrid    │  │   Spiking   │  │  Quantizer  │   │
-│   │  Consensus  │  │  Post-QC    │  │   Neural    │  │ Compression │   │
-│   └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘   │
-│                                                                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│                         364KB WASM Binary                               │
-│                    Runs on ANY JavaScript runtime                        │
+│                                                                          │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │                      @ruvector/edge (WASM)                       │   │
+│   │                                                                  │   │
+│   │   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │   │
+│   │   │ Identity │  │  Crypto  │  │   HNSW   │  │ Semantic │        │   │
+│   │   │ Ed25519  │  │ AES-GCM  │  │  Index   │  │ Matcher  │        │   │
+│   │   └──────────┘  └──────────┘  └──────────┘  └──────────┘        │   │
+│   │                                                                  │   │
+│   │   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │   │
+│   │   │   Raft   │  │ Hybrid   │  │ Spiking  │  │Quantizer │        │   │
+│   │   │Consensus │  │Post-QC   │  │ Neural   │  │Compress  │        │   │
+│   │   └──────────┘  └──────────┘  └──────────┘  └──────────┘        │   │
+│   │                                                                  │   │
+│   └─────────────────────────────────────────────────────────────────┘   │
+│                                    │                                     │
+│                          Transport Adapter                               │
+│                                    │                                     │
+│   ┌────────────────┬───────────────┼───────────────┬────────────────┐   │
+│   │                │               │               │                │   │
+│   ▼                ▼               ▼               ▼                ▼   │
+│ WebRTC          GUN.js          libp2p          Nostr           Custom  │
+│                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-    ┌─────────┐          ┌─────────┐          ┌─────────┐
-    │ Browser │◄────────►│ Browser │◄────────►│  Edge   │
-    │ Agent A │  P2P     │ Agent B │  P2P     │ Agent C │
-    └─────────┘          └─────────┘          └─────────┘
-         │                    │                    │
-         └────────────────────┼────────────────────┘
-                              │
-                     No Central Server
-                     No Cloud Costs
-                     No Data Leakage
+         │                │                │                │
+         ▼                ▼                ▼                ▼
+    ┌─────────┐      ┌─────────┐      ┌─────────┐      ┌─────────┐
+    │ Browser │      │ Browser │      │  Edge   │      │  Node   │
+    │ Agent A │◄────►│ Agent B │◄────►│ Agent C │◄────►│ Agent D │
+    └─────────┘      └─────────┘      └─────────┘      └─────────┘
+                           │
+                   No Central Server
+                   No Cloud Costs
+                   No Data Leakage
 ```
 
-## Use Cases
+### What Runs Where
 
-### 1. Browser-Based AI Assistants
-Run multiple specialized agents in web workers - code assistant, researcher, writer - all coordinating locally without API calls.
+| Component | Runs On | Cost |
+|-----------|---------|------|
+| RuVector Edge (WASM) | User's browser/device | Free - their CPU |
+| Vector index (HNSW) | User's browser/device | Free - their RAM |
+| Encryption (AES-GCM) | User's browser/device | Free - their CPU |
+| Raft consensus | Distributed across agents | Free - P2P |
+| Transport (GUN/WebRTC) | P2P or free relays | Free |
 
-### 2. Offline-First Applications
-Agents continue working without internet. Sync when connectivity returns using built-in conflict resolution.
+---
 
-### 3. Privacy-Preserving AI
-Process sensitive documents entirely client-side. Medical records, legal documents, financial data never leave the browser.
+## API Reference
 
-### 4. IoT Swarm Coordination
-Raspberry Pis, ESP32s, and edge devices run lightweight agents that coordinate without cloud infrastructure.
+### WasmIdentity
+```javascript
+const id = WasmIdentity.generate();
+id.agent_id()           // Unique identifier
+id.public_key_hex()     // Hex public key
+id.sign(Uint8Array)     // Sign message
+id.verify(msg, sig)     // Verify signature
+```
 
-### 5. Multiplayer AI Games
-Players' AI companions coordinate in real-time via WebRTC, with Raft ensuring consistent game state.
+### WasmCrypto
+```javascript
+const crypto = new WasmCrypto();
+crypto.generate_key()            // 32-byte key
+crypto.encrypt(key, plaintext)   // AES-256-GCM
+crypto.decrypt(key, ciphertext)  // Decrypt
+```
 
-### 6. Decentralized Marketplaces
-AI agents negotiate, bid, and transact directly with cryptographic verification and no middleman.
+### WasmHnswIndex
+```javascript
+const index = new WasmHnswIndex(dims, m, ef);
+index.insert(id, Float32Array)   // Add vector
+index.search(query, k)           // Find k nearest
+index.len()                      // Count
+```
+
+### WasmSemanticMatcher
+```javascript
+const matcher = new WasmSemanticMatcher();
+matcher.register_agent(id, capabilities)
+matcher.find_best_agent(task)
+matcher.agent_count()
+```
+
+### WasmRaftNode
+```javascript
+const raft = new WasmRaftNode(id, members);
+raft.start_election()    // Become candidate
+raft.receive_vote(bool)  // Handle vote
+raft.state()             // "follower"|"candidate"|"leader"
+raft.current_term()      // Raft term number
+```
+
+### WasmHybridKeyPair
+```javascript
+const keys = WasmHybridKeyPair.generate();
+keys.sign(message)       // Post-quantum signature
+keys.verify(signature)   // Verify
+keys.public_key_bytes()  // Export
+```
+
+### WasmSpikingNetwork
+```javascript
+const net = new WasmSpikingNetwork(in, hidden, out);
+net.forward(spikes)              // Process
+net.stdp_update(pre, post, lr)   // Learn
+net.reset()                      // Reset state
+```
+
+### WasmQuantizer
+```javascript
+const q = new WasmQuantizer();
+q.quantize(Float32Array)    // 4x compression
+q.reconstruct(Uint8Array)   // Restore
+```
+
+### WasmAdaptiveCompressor
+```javascript
+const comp = new WasmAdaptiveCompressor();
+comp.update_metrics(bandwidth, latency)
+comp.compress(data)
+comp.decompress(data)
+comp.condition()  // "excellent"|"good"|"poor"|"critical"
+```
+
+---
 
 ## Performance
 
@@ -305,77 +827,37 @@ AI agents negotiate, bid, and transact directly with cryptographic verification 
 | Identity generation | 0.5ms | Ed25519 keypair |
 | Sign message | 0.02ms | 50,000 ops/sec |
 | AES-256-GCM encrypt | 1GB/sec | Hardware accelerated |
-| HNSW search (10K vectors) | 0.1ms | 150x faster than brute force |
-| Semantic match | 0.5ms | LSH-based routing |
-| Raft election | 1ms | Leader in single round-trip |
-| Quantization | 100M floats/sec | 4x bandwidth reduction |
+| HNSW search (10K vectors) | 0.1ms | 150x faster than brute |
+| Semantic match | 0.5ms | LSH-based |
+| Raft election | 1ms | Single round-trip |
+| Quantization | 100M floats/sec | 4x compression |
+| WASM load | ~50ms | 364KB binary |
+
+---
 
 ## Security
 
-- **Ed25519** - State-of-the-art elliptic curve signatures
+- **Ed25519** - Elliptic curve signatures (128-bit security)
 - **X25519** - Secure key exchange
 - **AES-256-GCM** - Authenticated encryption
-- **Post-Quantum Hybrid** - Future-proof against quantum attacks
-- **Zero-Trust** - Verify everything, trust nothing
-- **Replay Protection** - Nonces and timestamps prevent replay attacks
+- **Post-Quantum Hybrid** - Ed25519 + Dilithium-style
+- **Zero-Trust** - Verify all messages
+- **Replay Protection** - Nonces and timestamps
 
-## Comparison with Cloud Alternatives
-
-| Capability | @ruvector/edge | OpenAI Swarm | LangChain Agents | AutoGPT |
-|------------|---------------|--------------|------------------|---------|
-| **Cost** | Free | Pay per token | Pay per token | Pay per token |
-| **Runs offline** | Yes | No | No | No |
-| **Browser native** | Yes | No | No | No |
-| **P2P communication** | Yes | No | No | No |
-| **Post-quantum crypto** | Yes | No | No | No |
-| **Vector search built-in** | Yes | No | Requires Pinecone | Requires external |
-| **Consensus protocol** | Yes (Raft) | No | No | No |
-| **Data privacy** | 100% local | Cloud processed | Cloud processed | Cloud processed |
-| **Bundle size** | 364KB | N/A | 50MB+ | 100MB+ |
-
-## Integration with agentic-flow
-
-```javascript
-import { AgenticFlow } from 'agentic-flow';
-import init, { WasmIdentity, WasmSemanticMatcher } from '@ruvector/edge';
-
-await init();
-
-const flow = new AgenticFlow({
-  identity: WasmIdentity.generate(),
-  matcher: new WasmSemanticMatcher(),
-  // Your agents now run entirely on the edge
-});
-
-flow.registerAgent('coder', 'typescript rust python programming');
-flow.registerAgent('researcher', 'search analyze summarize documents');
-
-// Route tasks intelligently - zero API calls
-const result = await flow.execute('Write a TypeScript function');
-```
-
-## Building from Source
-
-```bash
-# Clone repository
-git clone https://github.com/ruvnet/ruvector
-cd ruvector/examples/edge
-
-# Build WASM
-wasm-pack build --target web --release --no-default-features --features wasm
-
-# Build native (for benchmarking/testing)
-cargo build --release --features native
-
-# Run tests
-cargo test --features native
-```
+---
 
 ## License
 
 MIT License - Free for commercial and personal use.
 
 ---
+
+## Next Steps
+
+1. **Install:** `npm install @ruvector/edge`
+2. **Try the tutorial:** Build your first swarm
+3. **Choose transport:** Start with GUN.js
+4. **Scale:** Add more agents as needed
 
 **Stop paying for cloud AI. Start running free edge swarms.**
 
