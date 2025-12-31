@@ -45,7 +45,8 @@ This library gives you everything you need to build distributed AI systems: cryp
 | **Encryption** | AES-256-GCM | 1 GB/sec |
 | **Vector Search** | HNSW index | 150x faster than brute force |
 | **Task Routing** | Semantic LSH | Sub-millisecond |
-| **Consensus** | Raft protocol | 1-2 round-trip election |
+| **Trusted Consensus** | Raft protocol | For stable cohorts (teams, rooms) |
+| **Open Swarm** | Gossip + CRDT | High-churn, Byzantine-tolerant |
 | **Post-Quantum** | Hybrid signatures | Future-proof |
 | **Neural Networks** | Spiking + STDP | Bio-inspired learning |
 | **Compression** | Adaptive 4-32x | Network-aware |
@@ -78,16 +79,17 @@ RuVector provides a complete edge AI platform. This package (`@ruvector/edge`) i
 │  ✓ AES-256-GCM Encryption                                                   │
 │  ✓ HNSW Vector Search                ✓ Graph DB (288KB)                     │
 │  ✓ Semantic Task Routing               Neo4j-style API, Cypher queries      │
-│  ✓ Raft Consensus                      Relationship modeling, traversals    │
-│  ✓ Post-Quantum Crypto                                                      │
-│  ✓ Spiking Neural Networks           ✓ RVLite Vector DB (260KB)             │
-│  ✓ Adaptive Compression                SQL + SPARQL + Cypher queries        │
-│                                        IndexedDB persistence                │
-│  Best for:                                                                  │
-│  • Lightweight P2P apps              ✓ SONA Neural Router (238KB)           │
-│  • Secure messaging                    Self-learning with LoRA              │
-│  • Simple agent swarms                 EWC++ continual learning             │
-│  • Mobile/embedded                     ReasoningBank experience replay      │
+│  ✓ Raft (trusted cohorts)              Relationship modeling, traversals    │
+│  ✓ Gossip + CRDT (open swarms)                                              │
+│  ✓ Post-Quantum Crypto               ✓ RVLite Vector DB (260KB)             │
+│  ✓ Spiking Neural Networks             SQL + SPARQL + Cypher queries        │
+│  ✓ Adaptive Compression                IndexedDB persistence                │
+│                                                                             │
+│  Best for:                           ✓ SONA Neural Router (238KB)           │
+│  • Lightweight P2P apps                Self-learning with LoRA              │
+│  • Secure messaging                    EWC++ continual learning             │
+│  • Trusted team swarms                 ReasoningBank experience replay      │
+│  • Mobile/embedded                                                          │
 │                                                                             │
 │                                      ✓ DAG Workflows (132KB)                │
 │                                        Task orchestration                   │
@@ -128,6 +130,29 @@ import init, { WasmIdentity, WasmHnswIndex } from '@ruvector/edge';
 import { graph, rvlite, sona, dag } from '@ruvector/edge-full';
 import onnxInit from '@ruvector/edge-full/onnx';
 ```
+
+---
+
+### Consensus Modes: Trusted vs Open
+
+RuVector provides two coordination strategies for different deployment scenarios:
+
+| Mode | Protocol | When to Use |
+|------|----------|-------------|
+| **Trusted Cohort** | Raft | Private teams, enterprise LANs, known membership, low churn |
+| **Open Swarm** | Gossip + CRDT | Public networks, anonymous browsers, high churn, adversarial environments |
+
+```javascript
+// Trusted cohort (Raft) - stable team of 3-7 nodes
+const raftNode = new WasmRaftNode('node-1', ['node-1', 'node-2', 'node-3']);
+raftNode.start_election();  // Leader election for consistent state
+
+// Open swarm (Gossip + CRDT) - dynamic browser mesh
+const gossipNode = new WasmGossipNode(identity);
+gossipNode.join_swarm(relayUrl);  // Eventually consistent, Byzantine-tolerant
+```
+
+**Why two modes?** Raft assumes known membership and trusted nodes - perfect for your dev team or enterprise deployment. But a public browser swarm has nodes joining/leaving constantly and can't trust everyone. Gossip protocols with CRDTs handle this gracefully: no leader election, no membership tracking, eventual consistency that converges even with malicious actors.
 
 ---
 
