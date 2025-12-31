@@ -15,7 +15,8 @@ default = ["websocket", "shared-memory"]
 websocket = ["ruv-swarm-transport/default"]
 shared-memory = []
 wasm = ["ruv-swarm-transport/wasm", "wasm-bindgen", "web-sys", "js-sys"]
-full = ["websocket", "shared-memory"]
+gun = ["dep:gundb"]
+full = ["websocket", "shared-memory", "gun"]
 
 [dependencies]
 # Swarm transport
@@ -41,8 +42,25 @@ chrono = { version = "0.4", features = ["serde"] }
 # Compression (for tensor sync)
 lz4_flex = "0.11"
 
+# Cryptography (for P2P security)
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets", "serde"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+multihash = "0.19"
+parking_lot = "0.12"
+hex = { version = "0.4", features = ["serde"] }
+serde_bytes = "0.11"
+serde-big-array = "0.5"
+
 # CLI
 clap = { version = "4.5", features = ["derive"] }
+
+# GUN decentralized database (optional)
+gundb = { version = "0.2", optional = true }
 
 # WASM support (optional)
 wasm-bindgen = { version = "0.2", optional = true }

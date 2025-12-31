@@ -22,7 +22,7 @@
 //!         .with_transport(Transport::WebSocket)
 //!         .with_agent_id("agent-001");
 //!
-//!     let agent = SwarmAgent::new(config).await.unwrap();
+//!     let mut agent = SwarmAgent::new(config).await.unwrap();
 //!     agent.join_swarm("ws://coordinator:8080").await.unwrap();
 //!
 //!     // Sync learning patterns
@@ -36,6 +36,8 @@ pub mod memory;
 pub mod compression;
 pub mod protocol;
 pub mod agent;
+pub mod gun;
+pub mod p2p;
 
 // Re-exports
 pub use agent::{SwarmAgent, AgentRole};
@@ -44,6 +46,8 @@ pub use intelligence::{IntelligenceSync, LearningState, Pattern};
 pub use memory::{SharedMemory, VectorMemory};
 pub use compression::{TensorCodec, CompressionLevel};
 pub use protocol::{SwarmMessage, MessageType};
+pub use gun::{GunSync, GunSwarmBuilder, GunSwarmConfig, GunSwarmStats};
+pub use p2p::{P2PSwarmV2, SwarmStatus, IdentityManager, CryptoV2, RelayManager, ArtifactStore};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
