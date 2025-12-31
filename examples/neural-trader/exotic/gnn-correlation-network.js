@@ -122,10 +122,51 @@ class CorrelationNetwork {
     return this.nodes.get(symbol);
   }
 
-  // Update returns for asset
+  // Update returns for asset with pre-computed stats
   updateReturns(symbol, returns) {
     const node = this.addAsset(symbol);
     node.returns = returns;
+    // Pre-compute statistics for fast correlation
+    this.precomputeStats(symbol, returns);
+  }
+
+  // Pre-compute mean, std, and centered returns for fast correlation
+  precomputeStats(symbol, returns) {
+    const n = returns.length;
+    if (n < 2) {
+      this.statsCache.set(symbol, { mean: 0, std: 0, centered: [], valid: false });
+      return;
+    }
+
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += returns[i];
+    const mean = sum / n;
+
+    let sumSq = 0;
+    const centered = new Array(n);
+    for (let i = 0; i < n; i++) {
+      centered[i] = returns[i] - mean;
+      sumSq += centered[i] * centered[i];
+    }
+    const std = Math.sqrt(sumSq);
+
+    this.statsCache.set(symbol, { mean, std, centered, valid: std > 1e-10 });
+  }
+
+  // Fast correlation using pre-computed stats (avoids recomputing mean/std)
+  calculateCorrelationFast(symbol1, symbol2) {
+    const s1 = this.statsCache.get(symbol1);
+    const s2 = this.statsCache.get(symbol2);
+
+    if (!s1 || !s2 || !s1.valid || !s2.valid) return 0;
+    if (s1.centered.length !== s2.centered.length) return 0;
+
+    let dotProduct = 0;
+    for (let i = 0; i < s1.centered.length; i++) {
+      dotProduct += s1.centered[i] * s2.centered[i];
+    }
+
+    return dotProduct / (s1.std * s2.std);
   }
 
   // Calculate correlation between two return series
@@ -137,8 +178,13 @@ class CorrelationNetwork {
     const n = returns1.length;
 
     if (method === 'pearson') {
-      const mean1 = returns1.reduce((a, b) => a + b, 0) / n;
-      const mean2 = returns2.reduce((a, b) => a + b, 0) / n;
+      let sum1 = 0, sum2 = 0;
+      for (let i = 0; i < n; i++) {
+        sum1 += returns1[i];
+        sum2 += returns2[i];
+      }
+      const mean1 = sum1 / n;
+      const mean2 = sum2 / n;
 
       let cov = 0, var1 = 0, var2 = 0;
       for (let i = 0; i < n; i++) {
@@ -154,11 +200,13 @@ class CorrelationNetwork {
     }
 
     if (method === 'spearman') {
-      // Rank-based correlation
+      // Rank-based correlation (optimized sort)
       const rank = (arr) => {
-        const sorted = [...arr].map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
+        const indexed = new Array(arr.length);
+        for (let i = 0; i < arr.length; i++) indexed[i] = { v: arr[i], i };
+        indexed.sort((a, b) => a.v - b.v);
         const ranks = new Array(arr.length);
-        sorted.forEach((item, rank) => { ranks[item.i] = rank + 1; });
+        for (let r = 0; r < indexed.length; r++) ranks[indexed[r].i] = r + 1;
         return ranks;
       };
 
@@ -214,25 +262,33 @@ class CorrelationNetwork {
       node.edges.clear();
     }
 
-    // Calculate pairwise correlations
+    // Calculate pairwise correlations (use fast path for Pearson with pre-computed stats)
+    const useFastPath = this.config.construction.method === 'pearson' && this.statsCache.size === n;
+
     for (let i = 0; i < n; i++) {
       for (let j = i + 1; j < n; j++) {
-        const node1 = this.nodes.get(symbols[i]);
-        const node2 = this.nodes.get(symbols[j]);
+        let correlation;
 
-        const correlation = this.calculateCorrelation(
-          node1.returns,
-          node2.returns,
-          this.config.construction.method
-        );
+        if (useFastPath) {
+          // Fast path: use pre-computed centered returns
+          correlation = this.calculateCorrelationFast(symbols[i], symbols[j]);
+        } else {
+          const node1 = this.nodes.get(symbols[i]);
+          const node2 = this.nodes.get(symbols[j]);
+          correlation = this.calculateCorrelation(
+            node1.returns,
+            node2.returns,
+            this.config.construction.method
+          );
+        }
 
         this.adjacencyMatrix[i][j] = correlation;
         this.adjacencyMatrix[j][i] = correlation;
 
         // Add edge if above threshold
         if (Math.abs(correlation) >= this.config.construction.edgeThreshold) {
-          node1.addEdge(symbols[j], correlation);
-          node2.addEdge(symbols[i], correlation);
+          this.nodes.get(symbols[i]).addEdge(symbols[j], correlation);
+          this.nodes.get(symbols[j]).addEdge(symbols[i], correlation);
         }
       }
     }

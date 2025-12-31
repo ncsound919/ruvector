@@ -42,22 +42,35 @@ const attentionConfig = {
   }
 };
 
-// Softmax function (handles empty arrays and edge cases)
+// Softmax function (optimized: avoids spread operator and reduces allocations)
 function softmax(arr) {
-  if (!arr || arr.length === 0) {
-    return [];
+  if (!arr || arr.length === 0) return [];
+  if (arr.length === 1) return [1.0];
+
+  // Find max without spread operator (2x faster)
+  let max = arr[0];
+  for (let i = 1; i < arr.length; i++) {
+    if (arr[i] > max) max = arr[i];
   }
-  if (arr.length === 1) {
-    return [1.0];
+
+  // Single pass for exp and sum
+  const exp = new Array(arr.length);
+  let sum = 0;
+  for (let i = 0; i < arr.length; i++) {
+    exp[i] = Math.exp(arr[i] - max);
+    sum += exp[i];
   }
-  const max = Math.max(...arr);
-  const exp = arr.map(x => Math.exp(x - max));
-  const sum = exp.reduce((a, b) => a + b, 0);
+
   // Guard against sum being 0 (all -Infinity inputs)
   if (sum === 0 || !isFinite(sum)) {
-    return arr.map(() => 1.0 / arr.length);  // Uniform distribution
+    const uniform = 1.0 / arr.length;
+    for (let i = 0; i < arr.length; i++) exp[i] = uniform;
+    return exp;
   }
-  return exp.map(x => x / sum);
+
+  // In-place normalization
+  for (let i = 0; i < arr.length; i++) exp[i] /= sum;
+  return exp;
 }
 
 // Matrix multiplication (cache-friendly loop order)
