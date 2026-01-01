@@ -519,6 +519,591 @@ fn bench_network_coordination(b: &mut Bencher) {
     });
 }
 
+// ============================================================================
+// Spike-Driven Attention Benchmarks
+// ============================================================================
+
+#[bench]
+fn bench_spike_encoding_small(b: &mut Bencher) {
+    let attn = learning::SpikeDrivenAttention::new();
+    let values: Vec<i8> = (0..64).map(|i| (i % 128) as i8).collect();
+
+    b.iter(|| {
+        attn.encode_spikes(&values)
+    });
+}
+
+#[bench]
+fn bench_spike_encoding_medium(b: &mut Bencher) {
+    let attn = learning::SpikeDrivenAttention::new();
+    let values: Vec<i8> = (0..256).map(|i| (i % 128) as i8).collect();
+
+    b.iter(|| {
+        attn.encode_spikes(&values)
+    });
+}
+
+#[bench]
+fn bench_spike_encoding_large(b: &mut Bencher) {
+    let attn = learning::SpikeDrivenAttention::new();
+    let values: Vec<i8> = (0..1024).map(|i| (i % 128) as i8).collect();
+
+    b.iter(|| {
+        attn.encode_spikes(&values)
+    });
+}
+
+#[bench]
+fn bench_spike_attention_seq16_dim64(b: &mut Bencher) {
+    let attn = learning::SpikeDrivenAttention::new();
+    let values: Vec<i8> = (0..64).map(|i| (i % 128 - 64) as i8).collect();
+    let spikes = attn.encode_spikes(&values);
+
+    b.iter(|| {
+        attn.attention(&spikes[0..16], &spikes[0..16], &spikes[0..64])
+    });
+}
+
+#[bench]
+fn bench_spike_attention_seq64_dim128(b: &mut Bencher) {
+    let attn = learning::SpikeDrivenAttention::new();
+    let values: Vec<i8> = (0..128).map(|i| (i % 128 - 64) as i8).collect();
+    let spikes = attn.encode_spikes(&values);
+
+    b.iter(|| {
+        attn.attention(&spikes[0..64], &spikes[0..64], &spikes[0..128])
+    });
+}
+
+#[bench]
+fn bench_spike_attention_seq128_dim256(b: &mut Bencher) {
+    let attn = learning::SpikeDrivenAttention::new();
+    let values: Vec<i8> = (0..256).map(|i| (i % 128 - 64) as i8).collect();
+    let spikes = attn.encode_spikes(&values);
+
+    b.iter(|| {
+        attn.attention(&spikes[0..128], &spikes[0..128], &spikes[0..256])
+    });
+}
+
+#[bench]
+fn bench_spike_energy_ratio_calculation(b: &mut Bencher) {
+    let attn = learning::SpikeDrivenAttention::new();
+
+    b.iter(|| {
+        attn.energy_ratio(64, 256)
+    });
+}
+
+// ============================================================================
+// RAC Coherence Benchmarks
+// ============================================================================
+
+#[bench]
+fn bench_rac_event_ingestion(b: &mut Bencher) {
+    use sha2::{Sha256, Digest};
+    use rac::{Event, EventKind, AssertEvent, Ruvector, EvidenceRef};
+
+    let mut engine = rac::CoherenceEngine::new();
+
+    b.iter(|| {
+        let proposition = b"test-proposition";
+        let mut hasher = Sha256::new();
+        hasher.update(proposition);
+        let id_bytes = hasher.finalize();
+        let mut event_id = [0u8; 32];
+        event_id.copy_from_slice(&id_bytes);
+
+        let event = Event {
+            id: event_id,
+            prev: None,
+            ts_unix_ms: js_sys::Date::now() as u64,
+            author: [0u8; 32],
+            context: [0u8; 32],
+            ruvector: Ruvector::new(vec![0.1, 0.2, 0.3]),
+            kind: EventKind::Assert(AssertEvent {
+                proposition: proposition.to_vec(),
+                evidence: vec![EvidenceRef::hash(&[1, 2, 3])],
+                confidence: 0.9,
+                expires_at_unix_ms: None,
+            }),
+            sig: vec![0u8; 64],
+        };
+
+        engine.ingest(event);
+    });
+}
+
+#[bench]
+fn bench_rac_event_ingestion_1k(b: &mut Bencher) {
+    use sha2::{Sha256, Digest};
+    use rac::{Event, EventKind, AssertEvent, Ruvector, EvidenceRef};
+
+    b.iter(|| {
+        let mut engine = rac::CoherenceEngine::new();
+
+        for i in 0..1000 {
+            let proposition = format!("test-proposition-{}", i);
+            let mut hasher = Sha256::new();
+            hasher.update(proposition.as_bytes());
+            let id_bytes = hasher.finalize();
+            let mut event_id = [0u8; 32];
+            event_id.copy_from_slice(&id_bytes);
+
+            let event = Event {
+                id: event_id,
+                prev: None,
+                ts_unix_ms: js_sys::Date::now() as u64,
+                author: [0u8; 32],
+                context: [0u8; 32],
+                ruvector: Ruvector::new(vec![0.1, 0.2, 0.3]),
+                kind: EventKind::Assert(AssertEvent {
+                    proposition: proposition.as_bytes().to_vec(),
+                    evidence: vec![EvidenceRef::hash(&[1, 2, 3])],
+                    confidence: 0.9,
+                    expires_at_unix_ms: None,
+                }),
+                sig: vec![0u8; 64],
+            };
+
+            engine.ingest(event);
+        }
+    });
+}
+
+#[bench]
+fn bench_rac_quarantine_check(b: &mut Bencher) {
+    let quarantine = rac::QuarantineManager::new();
+
+    // Setup some quarantined claims
+    for i in 0..100 {
+        quarantine.set_level(&format!("claim-{}", i), i % 4);
+    }
+
+    b.iter(|| {
+        quarantine.can_use("claim-50")
+    });
+}
+
+#[bench]
+fn bench_rac_quarantine_set_level(b: &mut Bencher) {
+    let quarantine = rac::QuarantineManager::new();
+
+    let mut counter = 0;
+    b.iter(|| {
+        quarantine.set_level(&format!("claim-{}", counter), counter % 4);
+        counter += 1;
+    });
+}
+
+#[bench]
+fn bench_rac_merkle_root_update(b: &mut Bencher) {
+    use sha2::{Sha256, Digest};
+    use rac::{Event, EventKind, AssertEvent, Ruvector, EvidenceRef};
+
+    let mut engine = rac::CoherenceEngine::new();
+
+    // Pre-populate with some events
+    for i in 0..100 {
+        let proposition = format!("test-{}", i);
+        let mut hasher = Sha256::new();
+        hasher.update(proposition.as_bytes());
+        let id_bytes = hasher.finalize();
+        let mut event_id = [0u8; 32];
+        event_id.copy_from_slice(&id_bytes);
+
+        let event = Event {
+            id: event_id,
+            prev: None,
+            ts_unix_ms: js_sys::Date::now() as u64,
+            author: [0u8; 32],
+            context: [0u8; 32],
+            ruvector: Ruvector::new(vec![0.1, 0.2, 0.3]),
+            kind: EventKind::Assert(AssertEvent {
+                proposition: proposition.as_bytes().to_vec(),
+                evidence: vec![],
+                confidence: 0.9,
+                expires_at_unix_ms: None,
+            }),
+            sig: vec![0u8; 64],
+        };
+
+        engine.ingest(event);
+    }
+
+    b.iter(|| {
+        engine.get_merkle_root()
+    });
+}
+
+#[bench]
+fn bench_rac_ruvector_similarity(b: &mut Bencher) {
+    let v1 = rac::Ruvector::new(vec![1.0, 0.5, 0.3, 0.2, 0.1, 0.05, 0.02, 0.01]);
+    let v2 = rac::Ruvector::new(vec![0.9, 0.6, 0.25, 0.15, 0.12, 0.04, 0.03, 0.015]);
+
+    b.iter(|| {
+        v1.similarity(&v2)
+    });
+}
+
+// ============================================================================
+// Learning Module Benchmarks
+// ============================================================================
+
+#[bench]
+fn bench_reasoning_bank_lookup_1k(b: &mut Bencher) {
+    let bank = learning::ReasoningBank::new();
+
+    // Store 1000 patterns
+    for i in 0..1000 {
+        let pattern = learning::LearnedPattern::new(
+            vec![i as f32 * 0.01, 0.5, 0.3],
+            0.8,
+            100,
+            0.9,
+            10,
+            50.0,
+            Some(0.95),
+        );
+        let json = serde_json::to_string(&pattern).unwrap();
+        bank.store(&json);
+    }
+
+    let query = vec![0.5f32, 0.5, 0.3];
+    let query_json = serde_json::to_string(&query).unwrap();
+
+    b.iter(|| {
+        bank.lookup(&query_json, 10)
+    });
+}
+
+#[bench]
+fn bench_reasoning_bank_lookup_10k(b: &mut Bencher) {
+    let bank = learning::ReasoningBank::new();
+
+    // Store 10000 patterns
+    for i in 0..10000 {
+        let pattern = learning::LearnedPattern::new(
+            vec![i as f32 * 0.001, 0.5, 0.3],
+            0.8,
+            100,
+            0.9,
+            10,
+            50.0,
+            Some(0.95),
+        );
+        let json = serde_json::to_string(&pattern).unwrap();
+        bank.store(&json);
+    }
+
+    let query = vec![0.5f32, 0.5, 0.3];
+    let query_json = serde_json::to_string(&query).unwrap();
+
+    b.iter(|| {
+        bank.lookup(&query_json, 10)
+    });
+}
+
+#[bench]
+fn bench_reasoning_bank_store(b: &mut Bencher) {
+    let bank = learning::ReasoningBank::new();
+
+    let mut counter = 0;
+    b.iter(|| {
+        let pattern = learning::LearnedPattern::new(
+            vec![counter as f32 * 0.01, 0.5, 0.3],
+            0.8,
+            100,
+            0.9,
+            10,
+            50.0,
+            Some(0.95),
+        );
+        let json = serde_json::to_string(&pattern).unwrap();
+        bank.store(&json);
+        counter += 1;
+    });
+}
+
+#[bench]
+fn bench_trajectory_recording(b: &mut Bencher) {
+    let tracker = learning::TrajectoryTracker::new(1000);
+
+    let mut counter = 0;
+    b.iter(|| {
+        let trajectory = learning::TaskTrajectory::new(
+            vec![1.0, 0.5, 0.3],
+            100,
+            50,
+            100,
+            true,
+            format!("node-{}", counter),
+        );
+        let json = serde_json::to_string(&trajectory).unwrap();
+        tracker.record(&json);
+        counter += 1;
+    });
+}
+
+#[bench]
+fn bench_pattern_similarity_computation(b: &mut Bencher) {
+    let pattern = learning::LearnedPattern::new(
+        vec![1.0, 0.5, 0.3, 0.2, 0.1],
+        0.8,
+        100,
+        0.9,
+        10,
+        50.0,
+        Some(0.95),
+    );
+
+    let query = vec![0.9, 0.6, 0.25, 0.15, 0.12];
+
+    b.iter(|| {
+        pattern.similarity(&query)
+    });
+}
+
+// ============================================================================
+// Multi-Head Attention Scaling Benchmarks
+// ============================================================================
+
+#[bench]
+fn bench_multi_head_attention_2heads_dim8(b: &mut Bencher) {
+    let attn = learning::MultiHeadAttention::new(8, 2);
+    let query = vec![1.0f32; 8];
+    let key = vec![0.5f32; 8];
+    let val = vec![1.0f32; 8];
+    let keys: Vec<&[f32]> = vec![key.as_slice()];
+    let values: Vec<&[f32]> = vec![val.as_slice()];
+
+    b.iter(|| {
+        attn.compute(&query, &keys, &values)
+    });
+}
+
+#[bench]
+fn bench_multi_head_attention_4heads_dim64(b: &mut Bencher) {
+    let attn = learning::MultiHeadAttention::new(64, 4);
+    let query = vec![1.0f32; 64];
+    let key = vec![0.5f32; 64];
+    let val = vec![1.0f32; 64];
+    let keys: Vec<&[f32]> = vec![key.as_slice()];
+    let values: Vec<&[f32]> = vec![val.as_slice()];
+
+    b.iter(|| {
+        attn.compute(&query, &keys, &values)
+    });
+}
+
+#[bench]
+fn bench_multi_head_attention_8heads_dim128(b: &mut Bencher) {
+    let attn = learning::MultiHeadAttention::new(128, 8);
+    let query = vec![1.0f32; 128];
+    let key = vec![0.5f32; 128];
+    let val = vec![1.0f32; 128];
+    let keys: Vec<&[f32]> = vec![key.as_slice()];
+    let values: Vec<&[f32]> = vec![val.as_slice()];
+
+    b.iter(|| {
+        attn.compute(&query, &keys, &values)
+    });
+}
+
+#[bench]
+fn bench_multi_head_attention_8heads_dim256_10keys(b: &mut Bencher) {
+    let attn = learning::MultiHeadAttention::new(256, 8);
+    let query = vec![1.0f32; 256];
+    let keys_data: Vec<Vec<f32>> = (0..10).map(|_| vec![0.5f32; 256]).collect();
+    let values_data: Vec<Vec<f32>> = (0..10).map(|_| vec![1.0f32; 256]).collect();
+    let keys: Vec<&[f32]> = keys_data.iter().map(|k| k.as_slice()).collect();
+    let values: Vec<&[f32]> = values_data.iter().map(|v| v.as_slice()).collect();
+
+    b.iter(|| {
+        attn.compute(&query, &keys, &values)
+    });
+}
+
+// ============================================================================
+// Integration Benchmarks
+// ============================================================================
+
+#[bench]
+fn bench_end_to_end_task_routing_with_learning(b: &mut Bencher) {
+    use tokio::runtime::Runtime;
+
+    let rt = Runtime::new().unwrap();
+
+    b.iter(|| {
+        rt.block_on(async {
+            let identity = identity::WasmNodeIdentity::generate("bench").unwrap();
+            let learning = learning::NetworkLearning::new();
+            let mut queue = tasks::WasmTaskQueue::new().unwrap();
+
+            // Create task
+            let payload = vec![0u8; 256];
+            let task = queue.create_task("vectors", &payload, 100, &identity).unwrap();
+
+            // Record trajectory
+            let trajectory = learning::TaskTrajectory::new(
+                vec![1.0, 0.5, 0.3],
+                100,
+                50,
+                100,
+                true,
+                identity.node_id(),
+            );
+            let traj_json = serde_json::to_string(&trajectory).unwrap();
+            learning.record_trajectory(&traj_json);
+
+            // Lookup patterns
+            let query = vec![1.0f32, 0.5, 0.3];
+            let query_json = serde_json::to_string(&query).unwrap();
+            learning.lookup_patterns(&query_json, 5);
+
+            // Submit task
+            queue.submit(task).await.unwrap();
+        });
+    });
+}
+
+#[bench]
+fn bench_combined_learning_coherence_overhead(b: &mut Bencher) {
+    use sha2::{Sha256, Digest};
+    use rac::{Event, EventKind, AssertEvent, Ruvector, EvidenceRef};
+
+    b.iter(|| {
+        let learning = learning::NetworkLearning::new();
+        let mut coherence = rac::CoherenceEngine::new();
+
+        // Learning operations
+        for i in 0..10 {
+            let trajectory = learning::TaskTrajectory::new(
+                vec![i as f32 * 0.1, 0.5, 0.3],
+                100,
+                50,
+                100,
+                true,
+                format!("node-{}", i),
+            );
+            let json = serde_json::to_string(&trajectory).unwrap();
+            learning.record_trajectory(&json);
+        }
+
+        // Coherence operations
+        for i in 0..10 {
+            let proposition = format!("test-{}", i);
+            let mut hasher = Sha256::new();
+            hasher.update(proposition.as_bytes());
+            let id_bytes = hasher.finalize();
+            let mut event_id = [0u8; 32];
+            event_id.copy_from_slice(&id_bytes);
+
+            let event = Event {
+                id: event_id,
+                prev: None,
+                ts_unix_ms: js_sys::Date::now() as u64,
+                author: [0u8; 32],
+                context: [0u8; 32],
+                ruvector: Ruvector::new(vec![0.1, 0.2, 0.3]),
+                kind: EventKind::Assert(AssertEvent {
+                    proposition: proposition.as_bytes().to_vec(),
+                    evidence: vec![],
+                    confidence: 0.9,
+                    expires_at_unix_ms: None,
+                }),
+                sig: vec![0u8; 64],
+            };
+
+            coherence.ingest(event);
+        }
+
+        // Query operations
+        let query = vec![0.5f32, 0.5, 0.3];
+        let query_json = serde_json::to_string(&query).unwrap();
+        learning.lookup_patterns(&query_json, 5);
+        coherence.get_stats();
+    });
+}
+
+#[bench]
+fn bench_memory_usage_trajectory_1k(b: &mut Bencher) {
+    b.iter(|| {
+        let tracker = learning::TrajectoryTracker::new(1000);
+
+        for i in 0..1000 {
+            let trajectory = learning::TaskTrajectory::new(
+                vec![i as f32 * 0.001, 0.5, 0.3],
+                100,
+                50,
+                100,
+                true,
+                format!("node-{}", i),
+            );
+            let json = serde_json::to_string(&trajectory).unwrap();
+            tracker.record(&json);
+        }
+
+        tracker.get_stats()
+    });
+}
+
+#[bench]
+fn bench_concurrent_learning_and_rac_ops(b: &mut Bencher) {
+    use sha2::{Sha256, Digest};
+    use rac::{Event, EventKind, AssertEvent, Ruvector, EvidenceRef};
+
+    let learning = learning::NetworkLearning::new();
+    let mut coherence = rac::CoherenceEngine::new();
+
+    b.iter(|| {
+        // Concurrent pattern lookup
+        let query = vec![0.5f32, 0.5, 0.3];
+        let query_json = serde_json::to_string(&query).unwrap();
+        let _patterns = learning.lookup_patterns(&query_json, 5);
+
+        // Concurrent quarantine check
+        let _can_use = coherence.can_use_claim("claim-test");
+
+        // Concurrent trajectory recording
+        let trajectory = learning::TaskTrajectory::new(
+            vec![0.5, 0.5, 0.3],
+            100,
+            50,
+            100,
+            true,
+            "node-test".to_string(),
+        );
+        let traj_json = serde_json::to_string(&trajectory).unwrap();
+        learning.record_trajectory(&traj_json);
+
+        // Concurrent event ingestion
+        let mut hasher = Sha256::new();
+        hasher.update(b"concurrent-test");
+        let id_bytes = hasher.finalize();
+        let mut event_id = [0u8; 32];
+        event_id.copy_from_slice(&id_bytes);
+
+        let event = Event {
+            id: event_id,
+            prev: None,
+            ts_unix_ms: js_sys::Date::now() as u64,
+            author: [0u8; 32],
+            context: [0u8; 32],
+            ruvector: Ruvector::new(vec![0.1, 0.2, 0.3]),
+            kind: EventKind::Assert(AssertEvent {
+                proposition: b"concurrent-test".to_vec(),
+                evidence: vec![],
+                confidence: 0.9,
+                expires_at_unix_ms: None,
+            }),
+            sig: vec![0u8; 64],
+        };
+
+        coherence.ingest(event);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

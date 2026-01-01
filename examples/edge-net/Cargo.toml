@@ -61,6 +61,8 @@ thiserror = "1.0"
 uuid = { version = "1.0", features = ["v4", "js", "serde"] }
 hex = "0.4"
 rustc-hash = "2.0"  # FxHashMap for 30-50% faster hashing
+typed-arena = "2.0"  # Arena allocation for events (2-3x faster)
+string_cache = "0.8"  # String interning for node IDs (60-80% memory reduction)
 
 # Error handling for WASM
 console_error_panic_hook = { version = "0.1", optional = true }

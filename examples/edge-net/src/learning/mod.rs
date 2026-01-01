@@ -29,7 +29,7 @@
 
 use wasm_bindgen::prelude::*;
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::RwLock;
 
 // ============================================================================
@@ -239,13 +239,22 @@ struct PatternEntry {
     last_used: u64,
 }
 
+/// Spatial bucket for fast approximate nearest neighbor search
+struct SpatialBucket {
+    pattern_ids: Vec<usize>,
+}
+
 /// ReasoningBank for storing and retrieving learned patterns
+/// Optimized with spatial indexing for O(1) approximate lookups
 #[wasm_bindgen]
 pub struct ReasoningBank {
     /// Stored patterns indexed by ID
-    patterns: RwLock<HashMap<usize, PatternEntry>>,
+    patterns: RwLock<FxHashMap<usize, PatternEntry>>,
     /// Next pattern ID
     next_id: RwLock<usize>,
+    /// Spatial index for fast approximate nearest neighbor
+    /// Maps quantized vector hash to pattern IDs
+    spatial_index: RwLock<FxHashMap<u64, SpatialBucket>>,
 }
 
 #[wasm_bindgen]
@@ -254,9 +263,23 @@ impl ReasoningBank {
     #[wasm_bindgen(constructor)]
     pub fn new() -> ReasoningBank {
         ReasoningBank {
-            patterns: RwLock::new(HashMap::new()),
+            patterns: RwLock::new(FxHashMap::default()),
             next_id: RwLock::new(0),
+            spatial_index: RwLock::new(FxHashMap::default()),
         }
+    }
+
+    /// Hash a vector into a spatial bucket (locality-sensitive hashing)
+    fn spatial_hash(vector: &[f32]) -> u64 {
+        // Simple grid-based quantization for fast approximate matching
+        // Quantize each dimension to 8 levels (3 bits)
+        let mut hash = 0u64;
+        for (i, &val) in vector.iter().take(20).enumerate() {
+            // Normalize to [0, 7] range
+            let quantized = ((val + 1.0) * 3.5).clamp(0.0, 7.0) as u64;
+            hash |= quantized << (i * 3);
+        }
+        hash
     }
 
     /// Store a new pattern (JSON format)
@@ -266,6 +289,9 @@ impl ReasoningBank {
             Ok(p) => p,
             Err(_) => return -1,
         };
+
+        // Compute spatial hash for indexing
+        let hash = Self::spatial_hash(&pattern.centroid);
 
         let mut next_id = self.next_id.write().unwrap();
         let id = *next_id;
@@ -278,10 +304,17 @@ impl ReasoningBank {
         };
 
         self.patterns.write().unwrap().insert(id, entry);
+
+        // Add to spatial index
+        let mut index = self.spatial_index.write().unwrap();
+        index.entry(hash)
+            .or_insert_with(|| SpatialBucket { pattern_ids: Vec::with_capacity(10) })
+            .pattern_ids.push(id);
+
         id as i32
     }
 
-    /// Lookup most similar patterns
+    /// Lookup most similar patterns (OPTIMIZED with spatial indexing)
     #[wasm_bindgen]
     pub fn lookup(&self, query_json: &str, k: usize) -> String {
         let query: Vec<f32> = match serde_json::from_str(query_json) {
@@ -289,21 +322,52 @@ impl ReasoningBank {
             Err(_) => return "[]".to_string(),
         };
 
-        let mut patterns = self.patterns.write().unwrap();
+        let query_hash = Self::spatial_hash(&query);
         let now = js_sys::Date::now() as u64;
 
-        let mut similarities: Vec<(usize, LearnedPattern, f64)> = patterns
-            .iter_mut()
-            .map(|(&id, entry)| {
+        // Step 1: Fast approximate search using spatial index
+        let index = self.spatial_index.read().unwrap();
+        let mut candidate_ids = Vec::with_capacity(k * 3);  // Pre-allocate
+
+        // Get patterns from same bucket
+        if let Some(bucket) = index.get(&query_hash) {
+            candidate_ids.extend_from_slice(&bucket.pattern_ids);
+        }
+
+        // Check neighboring buckets (increase recall)
+        // Flip 1-2 bits in hash to find nearby buckets
+        for bit_flip in 0..6 {
+            let neighbor_hash = query_hash ^ (1u64 << (bit_flip * 3));
+            if let Some(bucket) = index.get(&neighbor_hash) {
+                candidate_ids.extend_from_slice(&bucket.pattern_ids);
+            }
+        }
+
+        // Fallback: if too few candidates, scan more buckets
+        if candidate_ids.len() < k * 2 {
+            for bucket in index.values().take(10) {
+                candidate_ids.extend_from_slice(&bucket.pattern_ids);
+                if candidate_ids.len() >= k * 3 {
+                    break;
+                }
+            }
+        }
+
+        // Step 2: Exact similarity computation only for candidates
+        let mut patterns = self.patterns.write().unwrap();
+        let mut similarities = Vec::with_capacity(candidate_ids.len());
+
+        for &id in &candidate_ids {
+            if let Some(entry) = patterns.get_mut(&id) {
                 let similarity = entry.pattern.similarity(&query);
                 entry.usage_count += 1;
                 entry.last_used = now;
-                (id, entry.pattern.clone(), similarity)
-            })
-            .collect();
+                similarities.push((id, entry.pattern.clone(), similarity));
+            }
+        }
 
         // Sort by weighted score (similarity * confidence)
-        similarities.sort_by(|a, b| {
+        similarities.sort_unstable_by(|a, b| {
             let score_a = a.2 * a.1.confidence;
             let score_b = b.2 * b.1.confidence;
             score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
@@ -311,17 +375,24 @@ impl ReasoningBank {
 
         similarities.truncate(k);
 
-        let results: Vec<String> = similarities
-            .iter()
-            .map(|(id, pattern, sim)| {
-                format!(
-                    r#"{{"id":{},"similarity":{:.4},"confidence":{:.4},"optimal_allocation":{:.4},"optimal_energy":{}}}"#,
-                    id, sim, pattern.confidence, pattern.optimal_allocation, pattern.optimal_energy
-                )
-            })
-            .collect();
+        // Pre-allocate string with estimated capacity
+        let mut result = String::with_capacity(k * 120);
+        result.push('[');
 
-        format!("[{}]", results.join(","))
+        for (i, (id, pattern, sim)) in similarities.iter().enumerate() {
+            if i > 0 {
+                result.push(',');
+            }
+            use std::fmt::Write;
+            let _ = write!(
+                result,
+                r#"{{"id":{},"similarity":{:.4},"confidence":{:.4},"optimal_allocation":{:.4},"optimal_energy":{}}}"#,
+                id, sim, pattern.confidence, pattern.optimal_allocation, pattern.optimal_energy
+            );
+        }
+
+        result.push(']');
+        result
     }
 
     /// Prune low-quality patterns
@@ -389,6 +460,14 @@ impl SpikeTrain {
         Self {
             times: Vec::new(),
             polarities: Vec::new(),
+        }
+    }
+
+    /// Create spike train with pre-allocated capacity
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            times: Vec::with_capacity(capacity),
+            polarities: Vec::with_capacity(capacity),
         }
     }
 
@@ -501,13 +580,14 @@ impl Default for SpikeDrivenAttention {
 }
 
 impl SpikeDrivenAttention {
-    /// Encode values to spike trains using rate coding
+    /// Encode values to spike trains using rate coding (OPTIMIZED with pre-allocation)
     pub fn encode_spikes(&self, values: &[i8]) -> Vec<SpikeTrain> {
-        let steps = self.config.temporal_coding_steps;
+        let steps = self.config.temporal_coding_steps as usize;
         let mut trains = Vec::with_capacity(values.len());
 
         for &value in values {
-            let mut train = SpikeTrain::new();
+            // Pre-allocate spike train capacity (max possible spikes)
+            let mut train = SpikeTrain::with_capacity(steps);
 
             let abs_val = if value == i8::MIN { 128u16 } else { value.abs() as u16 };
             let polarity = value.signum();
@@ -532,7 +612,7 @@ impl SpikeDrivenAttention {
                 membrane_potential = membrane_potential.saturating_add(rate_q15 as u32);
 
                 if membrane_potential >= self.config.spike_threshold_q15 as u32 {
-                    train.add_spike(step, polarity);
+                    train.add_spike(step as u8, polarity);
                     membrane_potential = 0;
                     refractory_counter = self.config.refractory_period;
                 }

@@ -37,10 +37,10 @@
 //! │  │ (Merkle)    │──│   Engine    │──│   Policy    │──│   Engine  │  │
 //! │  └─────────────┘  └─────────────┘  └─────────────┘  └───────────┘  │
 //! ├─────────────────────────────────────────────────────────────────────┤
-//! │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │
-//! │  │  Ruvector   │  │  Quarantine │  │   Audit     │                 │
-//! │  │  Routing    │  │   Manager   │  │   Proofs    │                 │
-//! │  └─────────────┘  └─────────────┘  └─────────────┘                 │
+//! │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌───────────┐  │
+//! │  │  Ruvector   │  │  Quarantine │  │   Audit     │  │  Witness  │  │
+//! │  │  Routing    │  │   Manager   │  │   Proofs    │  │  Tracker  │  │
+//! │  └─────────────┘  └─────────────┘  └─────────────┘  └───────────┘  │
 //! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -53,8 +53,36 @@
 
 use wasm_bindgen::prelude::*;
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::RwLock;
+
+// Economic layer with staking, reputation, and rewards
+pub mod economics;
+pub use economics::{
+    EconomicEngine, StakeManager, ReputationManager, RewardManager,
+    SlashReason, StakeRecord, ReputationRecord, RewardRecord,
+};
+
+// ============================================================================
+// Cross-Platform Utilities
+// ============================================================================
+
+/// Get current timestamp in milliseconds (works in both WASM and native)
+#[inline]
+fn current_timestamp_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
 
 // ============================================================================
 // Core Types (from Adversarial Coherence Thesis)
@@ -85,6 +113,11 @@ impl Ruvector {
         Self { dims }
     }
 
+    /// Create a zero vector of given dimension
+    pub fn zeros(dim: usize) -> Self {
+        Self { dims: vec![0.0; dim] }
+    }
+
     /// Calculate cosine similarity to another RuVector
     pub fn similarity(&self, other: &Ruvector) -> f64 {
         if self.dims.len() != other.dims.len() {
@@ -105,6 +138,18 @@ impl Ruvector {
     /// Compute semantic drift from a baseline
     pub fn drift_from(&self, baseline: &Ruvector) -> f64 {
         1.0 - self.similarity(baseline)
+    }
+
+    /// L2 distance to another vector
+    pub fn distance(&self, other: &Ruvector) -> f64 {
+        if self.dims.len() != other.dims.len() {
+            return f64::MAX;
+        }
+        self.dims.iter()
+            .zip(&other.dims)
+            .map(|(a, b)| (a - b).powi(2) as f64)
+            .sum::<f64>()
+            .sqrt()
     }
 }
 
@@ -131,6 +176,14 @@ impl EvidenceRef {
         Self {
             kind: "url".to_string(),
             pointer: url.as_bytes().to_vec(),
+        }
+    }
+
+    /// Create a log evidence reference
+    pub fn log(log_id: &[u8]) -> Self {
+        Self {
+            kind: "log".to_string(),
+            pointer: log_id.to_vec(),
         }
     }
 }
@@ -235,17 +288,57 @@ pub struct Event {
     pub sig: SignatureBytes,
 }
 
+impl Event {
+    /// Create a new event with auto-generated ID and timestamp
+    pub fn new(
+        author: PublicKeyBytes,
+        context: ContextId,
+        ruvector: Ruvector,
+        kind: EventKind,
+        prev: Option<EventId>,
+    ) -> Self {
+        use sha2::{Sha256, Digest};
+
+        let ts_unix_ms = current_timestamp_ms();
+
+        // Generate event ID from content
+        let mut hasher = Sha256::new();
+        hasher.update(&author);
+        hasher.update(&context);
+        hasher.update(&ts_unix_ms.to_le_bytes());
+        if let Some(prev_id) = &prev {
+            hasher.update(prev_id);
+        }
+        let result = hasher.finalize();
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&result);
+
+        Self {
+            id,
+            prev,
+            ts_unix_ms,
+            author,
+            context,
+            ruvector,
+            kind,
+            sig: Vec::new(), // Signature added separately
+        }
+    }
+}
+
 // ============================================================================
 // Merkle Event Log (Axiom 2, Axiom 3: Append-only, tamper-evident)
 // ============================================================================
 
-/// Append-only Merkle log for audit
+/// Append-only Merkle log for audit (FIXED: proper event storage)
 #[wasm_bindgen]
 pub struct EventLog {
-    /// Events in order
+    /// Events in order (main storage)
     events: RwLock<Vec<Event>>,
     /// Current Merkle root
     root: RwLock<[u8; 32]>,
+    /// Event index by ID for O(1) lookups
+    index: RwLock<FxHashMap<[u8; 32], usize>>,
 }
 
 #[wasm_bindgen]
@@ -254,12 +347,13 @@ impl EventLog {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         Self {
-            events: RwLock::new(Vec::new()),
+            events: RwLock::new(Vec::with_capacity(1000)),
             root: RwLock::new([0u8; 32]),
+            index: RwLock::new(FxHashMap::default()),
         }
     }
 
-    /// Get current event count
+    /// Get current event count (includes all events)
     #[wasm_bindgen]
     pub fn len(&self) -> usize {
         self.events.read().unwrap().len()
@@ -277,6 +371,12 @@ impl EventLog {
         let root = self.root.read().unwrap();
         hex::encode(&*root)
     }
+
+    /// Get total event count
+    #[wasm_bindgen(js_name = totalEvents)]
+    pub fn total_events(&self) -> usize {
+        self.events.read().unwrap().len()
+    }
 }
 
 impl Default for EventLog {
@@ -286,23 +386,38 @@ impl Default for EventLog {
 }
 
 impl EventLog {
-    /// Append an event to the log
+    /// Append an event to the log (FIXED: immediate storage + incremental Merkle)
     pub fn append(&self, event: Event) -> EventId {
-        let mut events = self.events.write().unwrap();
         let id = event.id;
-        events.push(event);
 
-        // Update Merkle root (simplified - real impl would use proper tree)
+        let mut events = self.events.write().unwrap();
+        let mut index = self.index.write().unwrap();
         let mut root = self.root.write().unwrap();
-        *root = self.compute_root(&events);
+
+        // Store event
+        let event_idx = events.len();
+        events.push(event);
+        index.insert(id, event_idx);
+
+        // Incremental Merkle root update
+        *root = self.compute_incremental_root(&id, &root);
 
         id
     }
 
-    /// Get event by ID
+    /// Get current root (no flushing needed - immediate storage)
+    pub fn get_root_bytes(&self) -> [u8; 32] {
+        *self.root.read().unwrap()
+    }
+
+    /// Get event by ID (O(1) lookup via index)
     pub fn get(&self, id: &EventId) -> Option<Event> {
+        let index = self.index.read().unwrap();
         let events = self.events.read().unwrap();
-        events.iter().find(|e| &e.id == id).cloned()
+
+        index.get(id)
+            .and_then(|&idx| events.get(idx))
+            .cloned()
     }
 
     /// Get events since a timestamp
@@ -323,33 +438,79 @@ impl EventLog {
             .collect()
     }
 
-    /// Compute Merkle root (simplified hash chain)
-    fn compute_root(&self, events: &[Event]) -> [u8; 32] {
+    /// Get all events (for iteration)
+    pub fn all_events(&self) -> Vec<Event> {
+        self.events.read().unwrap().clone()
+    }
+
+    /// Compute incremental Merkle root (chain new event ID to existing root)
+    fn compute_incremental_root(&self, new_id: &EventId, prev_root: &[u8; 32]) -> [u8; 32] {
         use sha2::{Sha256, Digest};
 
         let mut hasher = Sha256::new();
-        for event in events {
-            hasher.update(&event.id);
-        }
+        hasher.update(prev_root);
+        hasher.update(new_id);
         let result = hasher.finalize();
         let mut root = [0u8; 32];
         root.copy_from_slice(&result);
         root
     }
 
-    /// Generate inclusion proof for an event
+    /// Generate inclusion proof for an event (Axiom 11: Equivocation detectable)
     pub fn prove_inclusion(&self, event_id: &EventId) -> Option<InclusionProof> {
+        let index = self.index.read().unwrap();
         let events = self.events.read().unwrap();
-        let index = events.iter().position(|e| &e.id == event_id)?;
         let root = *self.root.read().unwrap();
+
+        let &event_idx = index.get(event_id)?;
+
+        // Build Merkle path (simplified chain proof)
+        let mut path = Vec::with_capacity(32);
+        let mut current_hash = [0u8; 32];
+
+        // Compute path from genesis to this event
+        for (i, event) in events.iter().take(event_idx + 1).enumerate() {
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(&current_hash);
+            hasher.update(&event.id);
+            let result = hasher.finalize();
+            current_hash.copy_from_slice(&result);
+
+            if i < event_idx {
+                path.push(current_hash);
+            }
+        }
 
         Some(InclusionProof {
             event_id: *event_id,
-            index,
+            index: event_idx,
             root,
-            // Simplified - real impl would include Merkle path
-            path: Vec::new(),
+            path,
         })
+    }
+
+    /// Verify an inclusion proof
+    pub fn verify_proof(&self, proof: &InclusionProof) -> bool {
+        use sha2::{Sha256, Digest};
+
+        let events = self.events.read().unwrap();
+
+        if proof.index >= events.len() {
+            return false;
+        }
+
+        // Recompute root from genesis to claimed index
+        let mut current = [0u8; 32];
+        for event in events.iter().take(proof.index + 1) {
+            let mut hasher = Sha256::new();
+            hasher.update(&current);
+            hasher.update(&event.id);
+            let result = hasher.finalize();
+            current.copy_from_slice(&result);
+        }
+
+        current == proof.root || current == self.get_root_bytes()
     }
 }
 
@@ -360,6 +521,258 @@ pub struct InclusionProof {
     pub index: usize,
     pub root: [u8; 32],
     pub path: Vec<[u8; 32]>,
+}
+
+// ============================================================================
+// Witness Tracking (Axiom 8: Witnesses matter)
+// ============================================================================
+
+/// Witness record for a claim
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WitnessRecord {
+    /// Claim being witnessed
+    pub claim_id: EventId,
+    /// Witness public key
+    pub witness: PublicKeyBytes,
+    /// Witness path (how the witness learned of the claim)
+    pub path: Vec<PublicKeyBytes>,
+    /// Timestamp of witnessing
+    pub witnessed_at: u64,
+    /// Signature of witness
+    pub signature: SignatureBytes,
+}
+
+/// Manages witness tracking for claims
+#[wasm_bindgen]
+pub struct WitnessTracker {
+    /// Witnesses by claim ID
+    witnesses: RwLock<FxHashMap<String, Vec<WitnessRecord>>>,
+    /// Minimum independent witnesses required
+    min_witnesses: usize,
+}
+
+#[wasm_bindgen]
+impl WitnessTracker {
+    /// Create a new witness tracker
+    #[wasm_bindgen(constructor)]
+    pub fn new(min_witnesses: usize) -> Self {
+        Self {
+            witnesses: RwLock::new(FxHashMap::default()),
+            min_witnesses: min_witnesses.max(1),
+        }
+    }
+
+    /// Get witness count for a claim
+    #[wasm_bindgen(js_name = witnessCount)]
+    pub fn witness_count(&self, claim_id: &str) -> usize {
+        self.witnesses.read().unwrap()
+            .get(claim_id)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    /// Check if claim has sufficient independent witnesses
+    #[wasm_bindgen(js_name = hasSufficientWitnesses)]
+    pub fn has_sufficient_witnesses(&self, claim_id: &str) -> bool {
+        let witnesses = self.witnesses.read().unwrap();
+        if let Some(records) = witnesses.get(claim_id) {
+            // Count independent witness paths (no common intermediate nodes)
+            let independent = self.count_independent_paths(records);
+            independent >= self.min_witnesses
+        } else {
+            false
+        }
+    }
+
+    /// Get confidence score based on witness diversity
+    #[wasm_bindgen(js_name = witnessConfidence)]
+    pub fn witness_confidence(&self, claim_id: &str) -> f32 {
+        let witnesses = self.witnesses.read().unwrap();
+        if let Some(records) = witnesses.get(claim_id) {
+            let independent = self.count_independent_paths(records);
+            // Confidence scales with independent witnesses, capped at 1.0
+            (independent as f32 / (self.min_witnesses as f32 * 2.0)).min(1.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+impl WitnessTracker {
+    /// Add a witness record
+    pub fn add_witness(&self, record: WitnessRecord) {
+        let claim_key = hex::encode(&record.claim_id);
+        let mut witnesses = self.witnesses.write().unwrap();
+        witnesses.entry(claim_key).or_default().push(record);
+    }
+
+    /// Get all witnesses for a claim
+    pub fn get_witnesses(&self, claim_id: &EventId) -> Vec<WitnessRecord> {
+        let claim_key = hex::encode(claim_id);
+        self.witnesses.read().unwrap()
+            .get(&claim_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Count independent witness paths (no common intermediate nodes)
+    fn count_independent_paths(&self, records: &[WitnessRecord]) -> usize {
+        if records.is_empty() {
+            return 0;
+        }
+
+        let mut independent_count = 1;
+        let mut seen_intermediates: FxHashMap<[u8; 32], bool> = FxHashMap::default();
+
+        // First witness path is always independent
+        for key in &records[0].path {
+            seen_intermediates.insert(*key, true);
+        }
+
+        // Check remaining witnesses for path independence
+        for record in records.iter().skip(1) {
+            let mut has_common = false;
+            for key in &record.path {
+                if seen_intermediates.contains_key(key) {
+                    has_common = true;
+                    break;
+                }
+            }
+
+            if !has_common {
+                independent_count += 1;
+                // Add this path's intermediates
+                for key in &record.path {
+                    seen_intermediates.insert(*key, true);
+                }
+            }
+        }
+
+        independent_count
+    }
+}
+
+impl Default for WitnessTracker {
+    fn default() -> Self {
+        Self::new(3)
+    }
+}
+
+// ============================================================================
+// Drift Tracking (Axiom 5: Semantics drift is expected)
+// ============================================================================
+
+/// Semantic drift record
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DriftRecord {
+    /// Context being tracked
+    pub context: ContextId,
+    /// Baseline embedding
+    pub baseline: Ruvector,
+    /// Current centroid
+    pub current: Ruvector,
+    /// Drift magnitude (0.0 - 1.0)
+    pub drift: f64,
+    /// Last updated timestamp
+    pub updated_at: u64,
+    /// Sample count
+    pub sample_count: usize,
+}
+
+/// Manages semantic drift tracking
+#[wasm_bindgen]
+pub struct DriftTracker {
+    /// Drift records by context
+    records: RwLock<FxHashMap<String, DriftRecord>>,
+    /// Drift threshold for alerts
+    drift_threshold: f64,
+}
+
+#[wasm_bindgen]
+impl DriftTracker {
+    /// Create a new drift tracker
+    #[wasm_bindgen(constructor)]
+    pub fn new(drift_threshold: f64) -> Self {
+        Self {
+            records: RwLock::new(FxHashMap::default()),
+            drift_threshold: drift_threshold.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Get drift for a context
+    #[wasm_bindgen(js_name = getDrift)]
+    pub fn get_drift(&self, context_hex: &str) -> f64 {
+        self.records.read().unwrap()
+            .get(context_hex)
+            .map(|r| r.drift)
+            .unwrap_or(0.0)
+    }
+
+    /// Check if context has drifted beyond threshold
+    #[wasm_bindgen(js_name = hasDrifted)]
+    pub fn has_drifted(&self, context_hex: &str) -> bool {
+        self.get_drift(context_hex) > self.drift_threshold
+    }
+
+    /// Get contexts with significant drift
+    #[wasm_bindgen(js_name = getDriftedContexts)]
+    pub fn get_drifted_contexts(&self) -> String {
+        let records = self.records.read().unwrap();
+        let drifted: Vec<&str> = records.iter()
+            .filter(|(_, r)| r.drift > self.drift_threshold)
+            .map(|(k, _)| k.as_str())
+            .collect();
+        serde_json::to_string(&drifted).unwrap_or_else(|_| "[]".to_string())
+    }
+}
+
+impl DriftTracker {
+    /// Update drift tracking for a context with new embedding
+    pub fn update(&self, context: &ContextId, embedding: &Ruvector) {
+        let context_key = hex::encode(context);
+        let mut records = self.records.write().unwrap();
+
+        let now = current_timestamp_ms();
+
+        records.entry(context_key)
+            .and_modify(|r| {
+                // Update running centroid with exponential moving average
+                let alpha = 0.1; // Smoothing factor
+                for (i, dim) in r.current.dims.iter_mut().enumerate() {
+                    if i < embedding.dims.len() {
+                        *dim = *dim * (1.0 - alpha as f32) + embedding.dims[i] * alpha as f32;
+                    }
+                }
+                r.drift = r.current.drift_from(&r.baseline);
+                r.updated_at = now;
+                r.sample_count += 1;
+            })
+            .or_insert_with(|| DriftRecord {
+                context: *context,
+                baseline: embedding.clone(),
+                current: embedding.clone(),
+                drift: 0.0,
+                updated_at: now,
+                sample_count: 1,
+            });
+    }
+
+    /// Reset baseline for a context
+    pub fn reset_baseline(&self, context: &ContextId) {
+        let context_key = hex::encode(context);
+        let mut records = self.records.write().unwrap();
+
+        if let Some(record) = records.get_mut(&context_key) {
+            record.baseline = record.current.clone();
+            record.drift = 0.0;
+        }
+    }
+}
+
+impl Default for DriftTracker {
+    fn default() -> Self {
+        Self::new(0.3)
+    }
 }
 
 // ============================================================================
@@ -381,6 +794,8 @@ pub struct Conflict {
     pub status: ConflictStatus,
     /// Epistemic temperature (how heated the dispute is)
     pub temperature: f32,
+    /// Escalation count
+    pub escalation_count: u32,
 }
 
 /// Status of a conflict
@@ -398,12 +813,33 @@ pub enum ConflictStatus {
     Escalated,
 }
 
+/// Escalation configuration
+#[derive(Clone, Debug)]
+pub struct EscalationConfig {
+    /// Temperature threshold for escalation
+    pub temperature_threshold: f32,
+    /// Duration threshold in ms for escalation
+    pub duration_threshold_ms: u64,
+    /// Maximum escalation levels
+    pub max_escalation: u32,
+}
+
+impl Default for EscalationConfig {
+    fn default() -> Self {
+        Self {
+            temperature_threshold: 0.8,
+            duration_threshold_ms: 3600_000, // 1 hour
+            max_escalation: 3,
+        }
+    }
+}
+
 // ============================================================================
 // Quarantine Manager (Axiom 9: Quarantine is mandatory)
 // ============================================================================
 
 /// Quarantine levels for contested claims
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum QuarantineLevel {
     /// Claim can be used normally
     None = 0,
@@ -419,9 +855,9 @@ pub enum QuarantineLevel {
 #[wasm_bindgen]
 pub struct QuarantineManager {
     /// Quarantine levels by claim ID
-    levels: RwLock<HashMap<String, QuarantineLevel>>,
+    levels: RwLock<FxHashMap<String, QuarantineLevel>>,
     /// Active conflicts by context
-    conflicts: RwLock<HashMap<String, Vec<Conflict>>>,
+    conflicts: RwLock<FxHashMap<String, Vec<Conflict>>>,
 }
 
 #[wasm_bindgen]
@@ -430,8 +866,8 @@ impl QuarantineManager {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         Self {
-            levels: RwLock::new(HashMap::new()),
-            conflicts: RwLock::new(HashMap::new()),
+            levels: RwLock::new(FxHashMap::default()),
+            conflicts: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -476,6 +912,17 @@ impl Default for QuarantineManager {
     }
 }
 
+impl QuarantineManager {
+    /// Get all quarantined claims
+    pub fn get_quarantined(&self) -> Vec<(String, QuarantineLevel)> {
+        let levels = self.levels.read().unwrap();
+        levels.iter()
+            .filter(|(_, &l)| l != QuarantineLevel::None)
+            .map(|(k, &v)| (k.clone(), v))
+            .collect()
+    }
+}
+
 // ============================================================================
 // Authority Policy (Axiom 7: Authority is scoped, not global)
 // ============================================================================
@@ -493,6 +940,28 @@ pub struct ScopedAuthority {
     pub allowed_evidence: Vec<String>,
 }
 
+impl ScopedAuthority {
+    /// Create a new scoped authority
+    pub fn new(context: ContextId, authorized_keys: Vec<PublicKeyBytes>, threshold: usize) -> Self {
+        Self {
+            context,
+            authorized_keys,
+            threshold: threshold.max(1),
+            allowed_evidence: vec!["hash".to_string(), "url".to_string(), "log".to_string()],
+        }
+    }
+
+    /// Check if resolution has sufficient authorized signatures
+    pub fn verify_resolution(&self, resolution: &ResolutionEvent) -> bool {
+        if resolution.authority_sigs.len() < self.threshold {
+            return false;
+        }
+        // In a real implementation, we would verify each signature
+        // against the authorized keys and count valid ones
+        true
+    }
+}
+
 /// Trait for authority policy verification
 pub trait AuthorityPolicy: Send + Sync {
     /// Check if a resolution is authorized for this context
@@ -502,10 +971,34 @@ pub trait AuthorityPolicy: Send + Sync {
     fn quarantine_level(&self, context: &ContextId, conflict_id: &[u8; 32]) -> QuarantineLevel;
 }
 
+/// Default authority policy that allows all resolutions (for testing)
+pub struct DefaultAuthorityPolicy;
+
+impl AuthorityPolicy for DefaultAuthorityPolicy {
+    fn authorized(&self, _context: &ContextId, resolution: &ResolutionEvent) -> bool {
+        // Require at least one signature
+        !resolution.authority_sigs.is_empty()
+    }
+
+    fn quarantine_level(&self, _context: &ContextId, _conflict_id: &[u8; 32]) -> QuarantineLevel {
+        QuarantineLevel::RequiresWitness
+    }
+}
+
 /// Trait for semantic verification
 pub trait Verifier: Send + Sync {
     /// Check if two assertions are incompatible
     fn incompatible(&self, context: &ContextId, a: &AssertEvent, b: &AssertEvent) -> bool;
+}
+
+/// Default verifier that checks proposition equality
+pub struct DefaultVerifier;
+
+impl Verifier for DefaultVerifier {
+    fn incompatible(&self, _context: &ContextId, a: &AssertEvent, b: &AssertEvent) -> bool {
+        // Simple: different propositions with high confidence are incompatible
+        a.proposition != b.proposition && a.confidence > 0.7 && b.confidence > 0.7
+    }
 }
 
 // ============================================================================
@@ -520,6 +1013,19 @@ pub struct CoherenceStats {
     pub conflicts_resolved: usize,
     pub claims_deprecated: usize,
     pub quarantined_claims: usize,
+    pub escalations: usize,
+    pub unauthorized_resolutions: usize,
+}
+
+/// Result of event ingestion
+#[derive(Clone, Debug)]
+pub enum IngestResult {
+    /// Event ingested successfully
+    Success(EventId),
+    /// Resolution was unauthorized
+    UnauthorizedResolution,
+    /// Event was invalid
+    Invalid(String),
 }
 
 /// The main coherence engine running the RAC protocol
@@ -529,12 +1035,20 @@ pub struct CoherenceEngine {
     log: EventLog,
     /// Quarantine manager
     quarantine: QuarantineManager,
+    /// Witness tracker
+    witnesses: WitnessTracker,
+    /// Drift tracker
+    drift: DriftTracker,
     /// Statistics
     stats: RwLock<CoherenceStats>,
     /// Active conflicts by context
-    conflicts: RwLock<HashMap<String, Vec<Conflict>>>,
+    conflicts: RwLock<FxHashMap<String, Vec<Conflict>>>,
     /// Semantic clusters for conflict detection
-    clusters: RwLock<HashMap<String, Vec<EventId>>>,
+    clusters: RwLock<FxHashMap<String, Vec<EventId>>>,
+    /// Authority policies by context
+    authorities: RwLock<FxHashMap<String, ScopedAuthority>>,
+    /// Escalation configuration
+    escalation_config: EscalationConfig,
 }
 
 #[wasm_bindgen]
@@ -545,9 +1059,13 @@ impl CoherenceEngine {
         Self {
             log: EventLog::new(),
             quarantine: QuarantineManager::new(),
+            witnesses: WitnessTracker::new(3),
+            drift: DriftTracker::new(0.3),
             stats: RwLock::new(CoherenceStats::default()),
-            conflicts: RwLock::new(HashMap::new()),
-            clusters: RwLock::new(HashMap::new()),
+            conflicts: RwLock::new(FxHashMap::default()),
+            clusters: RwLock::new(FxHashMap::default()),
+            authorities: RwLock::new(FxHashMap::default()),
+            escalation_config: EscalationConfig::default(),
         }
     }
 
@@ -593,6 +1111,30 @@ impl CoherenceEngine {
     pub fn can_use_claim(&self, claim_id: &str) -> bool {
         self.quarantine.can_use(claim_id)
     }
+
+    /// Get witness count for a claim
+    #[wasm_bindgen(js_name = witnessCount)]
+    pub fn witness_count(&self, claim_id: &str) -> usize {
+        self.witnesses.witness_count(claim_id)
+    }
+
+    /// Check if claim has sufficient witnesses
+    #[wasm_bindgen(js_name = hasSufficientWitnesses)]
+    pub fn has_sufficient_witnesses(&self, claim_id: &str) -> bool {
+        self.witnesses.has_sufficient_witnesses(claim_id)
+    }
+
+    /// Get drift for a context
+    #[wasm_bindgen(js_name = getDrift)]
+    pub fn get_drift(&self, context_hex: &str) -> f64 {
+        self.drift.get_drift(context_hex)
+    }
+
+    /// Check if context has drifted
+    #[wasm_bindgen(js_name = hasDrifted)]
+    pub fn has_drifted(&self, context_hex: &str) -> bool {
+        self.drift.has_drifted(context_hex)
+    }
 }
 
 impl Default for CoherenceEngine {
@@ -602,16 +1144,51 @@ impl Default for CoherenceEngine {
 }
 
 impl CoherenceEngine {
-    /// Ingest an event into the coherence engine
-    pub fn ingest(&mut self, event: Event) {
-        // 1. Append to log
+    /// Register an authority policy for a context
+    pub fn register_authority(&self, authority: ScopedAuthority) {
+        let context_key = hex::encode(&authority.context);
+        self.authorities.write().unwrap().insert(context_key, authority);
+    }
+
+    /// Check if a resolution is authorized (Axiom 7)
+    fn verify_authority(&self, context: &ContextId, resolution: &ResolutionEvent) -> bool {
+        let context_key = hex::encode(context);
+        let authorities = self.authorities.read().unwrap();
+
+        if let Some(authority) = authorities.get(&context_key) {
+            authority.verify_resolution(resolution)
+        } else {
+            // No registered authority - require at least one signature
+            !resolution.authority_sigs.is_empty()
+        }
+    }
+
+    /// Ingest an event into the coherence engine with full validation
+    pub fn ingest(&mut self, event: Event) -> IngestResult {
+        // Track drift for all events (Axiom 5)
+        self.drift.update(&event.context, &event.ruvector);
+
+        // Handle based on event type
+        match &event.kind {
+            EventKind::Resolution(resolution) => {
+                // CRITICAL: Verify authority before applying resolution (Axiom 7)
+                if !self.verify_authority(&event.context, resolution) {
+                    let mut stats = self.stats.write().unwrap();
+                    stats.unauthorized_resolutions += 1;
+                    return IngestResult::UnauthorizedResolution;
+                }
+            }
+            _ => {}
+        }
+
+        // Append to log
         let event_id = self.log.append(event.clone());
 
-        // 2. Update statistics
+        // Update statistics
         let mut stats = self.stats.write().unwrap();
         stats.events_processed += 1;
 
-        // 3. Handle based on event type
+        // Handle based on event type
         match &event.kind {
             EventKind::Assert(_) => {
                 // Add to semantic cluster for conflict detection
@@ -620,7 +1197,7 @@ impl CoherenceEngine {
                 clusters.entry(context_key).or_default().push(event_id);
             }
             EventKind::Challenge(challenge) => {
-                // Record conflict
+                // Record conflict with escalation tracking
                 let context_key = hex::encode(&event.context);
                 let conflict = Conflict {
                     id: challenge.conflict_id,
@@ -629,20 +1206,44 @@ impl CoherenceEngine {
                     detected_at: event.ts_unix_ms,
                     status: ConflictStatus::Challenged,
                     temperature: 0.5,
+                    escalation_count: 0,
                 };
 
                 let mut conflicts = self.conflicts.write().unwrap();
                 conflicts.entry(context_key).or_default().push(conflict);
 
-                // Quarantine disputed claims
+                // Quarantine disputed claims (Axiom 9)
                 for claim_id in &challenge.claim_ids {
                     self.quarantine.set_level(&hex::encode(claim_id), 2);
                 }
 
                 stats.conflicts_detected += 1;
             }
+            EventKind::Support(support) => {
+                // Update conflict temperature based on support (Axiom 6)
+                let context_key = hex::encode(&event.context);
+                let mut conflicts = self.conflicts.write().unwrap();
+
+                if let Some(context_conflicts) = conflicts.get_mut(&context_key) {
+                    for conflict in context_conflicts.iter_mut() {
+                        if conflict.id == support.conflict_id {
+                            // Increase temperature based on support cost/weight
+                            conflict.temperature = (conflict.temperature + 0.1).min(1.0);
+
+                            // Check for escalation (Axiom 6)
+                            if conflict.temperature > self.escalation_config.temperature_threshold
+                                && conflict.escalation_count < self.escalation_config.max_escalation
+                            {
+                                conflict.status = ConflictStatus::Escalated;
+                                conflict.escalation_count += 1;
+                                stats.escalations += 1;
+                            }
+                        }
+                    }
+                }
+            }
             EventKind::Resolution(resolution) => {
-                // Apply resolution
+                // Apply resolution (already verified above)
                 for claim_id in &resolution.deprecated {
                     self.quarantine.set_level(&hex::encode(claim_id), 3);
                     stats.claims_deprecated += 1;
@@ -653,18 +1254,38 @@ impl CoherenceEngine {
                     self.quarantine.set_level(&hex::encode(claim_id), 0);
                 }
 
+                // Update conflict status
+                let context_key = hex::encode(&event.context);
+                let mut conflicts = self.conflicts.write().unwrap();
+                if let Some(context_conflicts) = conflicts.get_mut(&context_key) {
+                    for conflict in context_conflicts.iter_mut() {
+                        if conflict.id == resolution.conflict_id {
+                            conflict.status = ConflictStatus::Resolved;
+                        }
+                    }
+                }
+
                 stats.conflicts_resolved += 1;
             }
             EventKind::Deprecate(deprecate) => {
                 self.quarantine.set_level(&hex::encode(&deprecate.claim_id), 3);
                 stats.claims_deprecated += 1;
             }
-            EventKind::Support(_) => {
-                // Support events don't change state directly
-            }
         }
 
         stats.quarantined_claims = self.quarantine.quarantined_count();
+
+        IngestResult::Success(event_id)
+    }
+
+    /// Legacy ingest method for compatibility (does not return result)
+    pub fn ingest_event(&mut self, event: Event) {
+        let _ = self.ingest(event);
+    }
+
+    /// Add a witness record for a claim
+    pub fn add_witness(&self, record: WitnessRecord) {
+        self.witnesses.add_witness(record);
     }
 
     /// Detect conflicts in a context
@@ -681,6 +1302,7 @@ impl CoherenceEngine {
         };
 
         let mut conflicts = Vec::new();
+        let now = current_timestamp_ms();
 
         // Check all pairs for incompatibility
         for (i, id_a) in event_ids.iter().enumerate() {
@@ -692,19 +1314,22 @@ impl CoherenceEngine {
                 let EventKind::Assert(assert_b) = &event_b.kind else { continue };
 
                 if verifier.incompatible(context, assert_a, assert_b) {
+                    use sha2::{Sha256, Digest};
+                    let mut hasher = Sha256::new();
+                    hasher.update(id_a);
+                    hasher.update(id_b);
+                    let result = hasher.finalize();
                     let mut conflict_id = [0u8; 32];
-                    // Generate conflict ID from claim IDs
-                    for (i, b) in id_a.iter().enumerate() {
-                        conflict_id[i % 32] ^= b ^ id_b[i % 32];
-                    }
+                    conflict_id.copy_from_slice(&result);
 
                     conflicts.push(Conflict {
                         id: conflict_id,
                         context: *context,
                         claim_ids: vec![*id_a, *id_b],
-                        detected_at: js_sys::Date::now() as u64,
+                        detected_at: now,
                         status: ConflictStatus::Detected,
                         temperature: 0.3,
+                        escalation_count: 0,
                     });
                 }
             }
@@ -713,9 +1338,33 @@ impl CoherenceEngine {
         conflicts
     }
 
+    /// Get all conflicts for a context
+    pub fn get_conflicts(&self, context: &ContextId) -> Vec<Conflict> {
+        let context_key = hex::encode(context);
+        self.conflicts.read().unwrap()
+            .get(&context_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Get audit proof for event inclusion
     pub fn prove_inclusion(&self, event_id: &EventId) -> Option<InclusionProof> {
         self.log.prove_inclusion(event_id)
+    }
+
+    /// Verify an inclusion proof
+    pub fn verify_proof(&self, proof: &InclusionProof) -> bool {
+        self.log.verify_proof(proof)
+    }
+
+    /// Get event by ID
+    pub fn get_event(&self, id: &EventId) -> Option<Event> {
+        self.log.get(id)
+    }
+
+    /// Get all events for a context
+    pub fn get_context_events(&self, context: &ContextId) -> Vec<Event> {
+        self.log.for_context(context)
     }
 }
 
@@ -758,7 +1407,30 @@ impl DecisionTrace {
         Self {
             id,
             dependencies,
-            timestamp: js_sys::Date::now() as u64,
+            timestamp: current_timestamp_ms(),
+            has_disputed: false,
+            quarantine_policy: "default".to_string(),
+            outcome,
+        }
+    }
+
+    /// Create with explicit timestamp (for testing)
+    pub fn with_timestamp(dependencies: Vec<EventId>, outcome: Vec<u8>, timestamp: u64) -> Self {
+        use sha2::{Sha256, Digest};
+
+        let mut hasher = Sha256::new();
+        for dep in &dependencies {
+            hasher.update(dep);
+        }
+        hasher.update(&outcome);
+        let result = hasher.finalize();
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&result);
+
+        Self {
+            id,
+            dependencies,
+            timestamp,
             has_disputed: false,
             quarantine_policy: "default".to_string(),
             outcome,
@@ -766,15 +1438,154 @@ impl DecisionTrace {
     }
 
     /// Check if decision can be replayed given current state
+    /// For decisions, any quarantine level blocks replay (Axiom 9)
     pub fn can_replay(&self, engine: &CoherenceEngine) -> bool {
-        // All dependencies must exist and be usable
+        // All dependencies must exist and have no quarantine (any level)
         for dep in &self.dependencies {
             let dep_hex = hex::encode(dep);
-            if !engine.can_use_claim(&dep_hex) {
+            // Decisions cannot use any disputed claims (stricter than general can_use)
+            if engine.get_quarantine_level(&dep_hex) > 0 {
                 return false;
             }
         }
         true
+    }
+
+    /// Mark disputed dependencies
+    pub fn check_disputes(&mut self, engine: &CoherenceEngine) {
+        for dep in &self.dependencies {
+            let dep_hex = hex::encode(dep);
+            if engine.get_quarantine_level(&dep_hex) > 0 {
+                self.has_disputed = true;
+                return;
+            }
+        }
+        self.has_disputed = false;
+    }
+}
+
+// ============================================================================
+// Semantic Gossip Routing
+// ============================================================================
+
+/// Peer routing entry for semantic gossip
+#[derive(Clone, Debug)]
+pub struct PeerRoute {
+    /// Peer public key
+    pub peer_id: PublicKeyBytes,
+    /// Peer's semantic centroid
+    pub centroid: Ruvector,
+    /// Last seen timestamp
+    pub last_seen: u64,
+    /// Latency estimate in ms
+    pub latency_ms: u32,
+}
+
+/// Semantic gossip router for event propagation
+#[wasm_bindgen]
+pub struct SemanticRouter {
+    /// Known peers
+    peers: RwLock<Vec<PeerRoute>>,
+    /// Random peer sample size
+    random_sample: usize,
+    /// Semantic neighbor count
+    semantic_neighbors: usize,
+}
+
+#[wasm_bindgen]
+impl SemanticRouter {
+    /// Create a new semantic router
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            peers: RwLock::new(Vec::new()),
+            random_sample: 3,
+            semantic_neighbors: 5,
+        }
+    }
+
+    /// Get peer count
+    #[wasm_bindgen(js_name = peerCount)]
+    pub fn peer_count(&self) -> usize {
+        self.peers.read().unwrap().len()
+    }
+}
+
+impl Default for SemanticRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SemanticRouter {
+    /// Register a peer
+    pub fn register_peer(&self, peer_id: PublicKeyBytes, centroid: Ruvector, latency_ms: u32) {
+        let mut peers = self.peers.write().unwrap();
+
+        // Update existing or add new
+        if let Some(peer) = peers.iter_mut().find(|p| p.peer_id == peer_id) {
+            peer.centroid = centroid;
+            peer.last_seen = current_timestamp_ms();
+            peer.latency_ms = latency_ms;
+        } else {
+            peers.push(PeerRoute {
+                peer_id,
+                centroid,
+                last_seen: current_timestamp_ms(),
+                latency_ms,
+            });
+        }
+    }
+
+    /// Get routing targets for an event (semantic neighbors + random sample)
+    pub fn get_routes(&self, event: &Event) -> Vec<PublicKeyBytes> {
+        let peers = self.peers.read().unwrap();
+
+        if peers.is_empty() {
+            return Vec::new();
+        }
+
+        let mut routes = Vec::with_capacity(self.semantic_neighbors + self.random_sample);
+
+        // Sort by semantic similarity
+        let mut scored: Vec<_> = peers.iter()
+            .map(|p| (p, event.ruvector.similarity(&p.centroid)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Take semantic neighbors
+        for (peer, _) in scored.iter().take(self.semantic_neighbors) {
+            routes.push(peer.peer_id);
+        }
+
+        // Add random sample for robustness
+        use std::collections::HashSet;
+        let selected: HashSet<_> = routes.iter().cloned().collect();
+
+        // Simple deterministic "random" selection based on event ID
+        let mut seed = 0u64;
+        for byte in event.id.iter() {
+            seed = seed.wrapping_mul(31).wrapping_add(*byte as u64);
+        }
+
+        for (i, peer) in peers.iter().enumerate() {
+            if routes.len() >= self.semantic_neighbors + self.random_sample {
+                break;
+            }
+            let pseudo_random = (seed.wrapping_add(i as u64)) % (peers.len() as u64);
+            if pseudo_random < self.random_sample as u64 && !selected.contains(&peer.peer_id) {
+                routes.push(peer.peer_id);
+            }
+        }
+
+        routes
+    }
+
+    /// Prune stale peers
+    pub fn prune_stale(&self, max_age_ms: u64) {
+        let now = current_timestamp_ms();
+        let mut peers = self.peers.write().unwrap();
+        peers.retain(|p| now - p.last_seen < max_age_ms);
     }
 }
 
@@ -806,10 +1617,54 @@ mod tests {
     }
 
     #[test]
-    fn test_event_log() {
+    fn test_event_log_append() {
         let log = EventLog::new();
         assert!(log.is_empty());
         assert_eq!(log.len(), 0);
+
+        // Create and append events
+        let event1 = Event::new(
+            [1u8; 32],
+            [0u8; 32],
+            Ruvector::new(vec![1.0, 0.0, 0.0]),
+            EventKind::Assert(AssertEvent {
+                proposition: b"test".to_vec(),
+                evidence: vec![],
+                confidence: 0.9,
+                expires_at_unix_ms: None,
+            }),
+            None,
+        );
+
+        let id1 = log.append(event1.clone());
+        assert_eq!(log.len(), 1);
+        assert!(!log.is_empty());
+
+        // Verify event can be retrieved
+        let retrieved = log.get(&id1);
+        assert!(retrieved.is_some());
+
+        // Append another event
+        let event2 = Event::new(
+            [2u8; 32],
+            [0u8; 32],
+            Ruvector::new(vec![0.0, 1.0, 0.0]),
+            EventKind::Assert(AssertEvent {
+                proposition: b"test2".to_vec(),
+                evidence: vec![],
+                confidence: 0.8,
+                expires_at_unix_ms: None,
+            }),
+            Some(id1),
+        );
+
+        let id2 = log.append(event2);
+        assert_eq!(log.len(), 2);
+
+        // Root should have changed
+        let root = log.get_root();
+        assert!(!root.is_empty());
+        assert_ne!(root, hex::encode([0u8; 32]));
     }
 
     #[test]
@@ -827,12 +1682,179 @@ mod tests {
     }
 
     #[test]
-    fn test_coherence_engine() {
+    fn test_coherence_engine_basic() {
         let engine = CoherenceEngine::new();
 
         assert_eq!(engine.event_count(), 0);
         assert_eq!(engine.conflict_count(), 0);
         assert_eq!(engine.quarantined_count(), 0);
+    }
+
+    #[test]
+    fn test_coherence_engine_ingest() {
+        let mut engine = CoherenceEngine::new();
+
+        let event = Event::new(
+            [1u8; 32],
+            [0u8; 32],
+            Ruvector::new(vec![1.0, 0.0, 0.0]),
+            EventKind::Assert(AssertEvent {
+                proposition: b"test".to_vec(),
+                evidence: vec![],
+                confidence: 0.9,
+                expires_at_unix_ms: None,
+            }),
+            None,
+        );
+
+        let result = engine.ingest(event);
+        assert!(matches!(result, IngestResult::Success(_)));
+        assert_eq!(engine.event_count(), 1);
+    }
+
+    #[test]
+    fn test_authority_verification() {
+        let mut engine = CoherenceEngine::new();
+        let context = [42u8; 32];
+        let author = [1u8; 32];
+
+        // Register authority requiring signatures
+        let authority = ScopedAuthority::new(context, vec![author], 1);
+        engine.register_authority(authority);
+
+        // Create a resolution without signature - should fail
+        let resolution_no_sig = Event::new(
+            author,
+            context,
+            Ruvector::new(vec![1.0, 0.0, 0.0]),
+            EventKind::Resolution(ResolutionEvent {
+                conflict_id: [0u8; 32],
+                accepted: vec![],
+                deprecated: vec![[99u8; 32]],
+                rationale: vec![],
+                authority_sigs: vec![], // No signatures!
+            }),
+            None,
+        );
+
+        let result = engine.ingest(resolution_no_sig);
+        assert!(matches!(result, IngestResult::UnauthorizedResolution));
+
+        // Create resolution with signature - should succeed
+        let resolution_with_sig = Event::new(
+            author,
+            context,
+            Ruvector::new(vec![1.0, 0.0, 0.0]),
+            EventKind::Resolution(ResolutionEvent {
+                conflict_id: [0u8; 32],
+                accepted: vec![],
+                deprecated: vec![[99u8; 32]],
+                rationale: vec![],
+                authority_sigs: vec![vec![0u8; 64]], // Has signature
+            }),
+            None,
+        );
+
+        let result = engine.ingest(resolution_with_sig);
+        assert!(matches!(result, IngestResult::Success(_)));
+    }
+
+    #[test]
+    fn test_witness_tracking() {
+        let tracker = WitnessTracker::new(2);
+        let claim_id = [1u8; 32];
+        let claim_key = hex::encode(&claim_id);
+
+        assert_eq!(tracker.witness_count(&claim_key), 0);
+        assert!(!tracker.has_sufficient_witnesses(&claim_key));
+
+        // Add first witness
+        tracker.add_witness(WitnessRecord {
+            claim_id,
+            witness: [1u8; 32],
+            path: vec![[10u8; 32]],
+            witnessed_at: current_timestamp_ms(),
+            signature: vec![],
+        });
+
+        assert_eq!(tracker.witness_count(&claim_key), 1);
+        assert!(!tracker.has_sufficient_witnesses(&claim_key));
+
+        // Add second independent witness
+        tracker.add_witness(WitnessRecord {
+            claim_id,
+            witness: [2u8; 32],
+            path: vec![[20u8; 32]], // Different path
+            witnessed_at: current_timestamp_ms(),
+            signature: vec![],
+        });
+
+        assert_eq!(tracker.witness_count(&claim_key), 2);
+        assert!(tracker.has_sufficient_witnesses(&claim_key));
+    }
+
+    #[test]
+    fn test_drift_tracking() {
+        let tracker = DriftTracker::new(0.3);
+        let context = [1u8; 32];
+        let context_key = hex::encode(&context);
+
+        // Initial embedding
+        tracker.update(&context, &Ruvector::new(vec![1.0, 0.0, 0.0]));
+        assert!((tracker.get_drift(&context_key) - 0.0).abs() < 0.001);
+
+        // Update with same embedding - no drift
+        tracker.update(&context, &Ruvector::new(vec![1.0, 0.0, 0.0]));
+        assert!(!tracker.has_drifted(&context_key));
+
+        // Update with very different embedding
+        for _ in 0..20 {
+            tracker.update(&context, &Ruvector::new(vec![0.0, 1.0, 0.0]));
+        }
+
+        // After many updates, drift should be significant
+        assert!(tracker.get_drift(&context_key) > 0.1);
+    }
+
+    #[test]
+    fn test_decision_trace() {
+        let deps = vec![[1u8; 32], [2u8; 32]];
+        let outcome = b"accepted".to_vec();
+
+        let trace = DecisionTrace::with_timestamp(deps.clone(), outcome.clone(), 1000);
+
+        assert_eq!(trace.dependencies.len(), 2);
+        assert_eq!(trace.timestamp, 1000);
+        assert!(!trace.has_disputed);
+    }
+
+    #[test]
+    fn test_semantic_router() {
+        let router = SemanticRouter::new();
+
+        router.register_peer([1u8; 32], Ruvector::new(vec![1.0, 0.0, 0.0]), 50);
+        router.register_peer([2u8; 32], Ruvector::new(vec![0.0, 1.0, 0.0]), 100);
+        router.register_peer([3u8; 32], Ruvector::new(vec![0.5, 0.5, 0.0]), 75);
+
+        assert_eq!(router.peer_count(), 3);
+
+        let event = Event::new(
+            [0u8; 32],
+            [0u8; 32],
+            Ruvector::new(vec![1.0, 0.0, 0.0]),
+            EventKind::Assert(AssertEvent {
+                proposition: b"test".to_vec(),
+                evidence: vec![],
+                confidence: 0.9,
+                expires_at_unix_ms: None,
+            }),
+            None,
+        );
+
+        let routes = router.get_routes(&event);
+        assert!(!routes.is_empty());
+        // First route should be most similar peer (peer 1)
+        assert_eq!(routes[0], [1u8; 32]);
     }
 
     #[test]
@@ -842,11 +1864,99 @@ mod tests {
 
         let url_evidence = EvidenceRef::url("https://example.com");
         assert_eq!(url_evidence.kind, "url");
+
+        let log_evidence = EvidenceRef::log(&[4, 5, 6]);
+        assert_eq!(log_evidence.kind, "log");
     }
 
     #[test]
     fn test_conflict_status() {
         let status = ConflictStatus::Detected;
         assert_eq!(status, ConflictStatus::Detected);
+        assert_ne!(status, ConflictStatus::Resolved);
+    }
+
+    #[test]
+    fn test_inclusion_proof() {
+        let log = EventLog::new();
+
+        let event = Event::new(
+            [1u8; 32],
+            [0u8; 32],
+            Ruvector::new(vec![1.0]),
+            EventKind::Assert(AssertEvent {
+                proposition: b"test".to_vec(),
+                evidence: vec![],
+                confidence: 0.9,
+                expires_at_unix_ms: None,
+            }),
+            None,
+        );
+
+        let id = log.append(event);
+        let proof = log.prove_inclusion(&id);
+
+        assert!(proof.is_some());
+        let proof = proof.unwrap();
+        assert_eq!(proof.event_id, id);
+        assert_eq!(proof.index, 0);
+    }
+
+    #[test]
+    fn test_escalation() {
+        let mut engine = CoherenceEngine::new();
+        let context = [0u8; 32];
+        let author = [1u8; 32];
+
+        // Create two conflicting assertions
+        let assert1 = Event::new(
+            author,
+            context,
+            Ruvector::new(vec![1.0, 0.0]),
+            EventKind::Assert(AssertEvent {
+                proposition: b"claim A".to_vec(),
+                evidence: vec![],
+                confidence: 0.95,
+                expires_at_unix_ms: None,
+            }),
+            None,
+        );
+        engine.ingest(assert1);
+
+        // Create challenge
+        let challenge = Event::new(
+            author,
+            context,
+            Ruvector::new(vec![1.0, 0.0]),
+            EventKind::Challenge(ChallengeEvent {
+                conflict_id: [99u8; 32],
+                claim_ids: vec![[1u8; 32]],
+                reason: "Disputed".to_string(),
+                requested_proofs: vec![],
+            }),
+            None,
+        );
+        engine.ingest(challenge);
+
+        // Add many support events to increase temperature
+        for i in 0..10 {
+            let support = Event::new(
+                [i + 10; 32],
+                context,
+                Ruvector::new(vec![1.0, 0.0]),
+                EventKind::Support(SupportEvent {
+                    conflict_id: [99u8; 32],
+                    claim_id: [1u8; 32],
+                    evidence: vec![],
+                    cost: 100,
+                }),
+                None,
+            );
+            engine.ingest(support);
+        }
+
+        // Check that escalation occurred
+        let stats: CoherenceStats = serde_json::from_str(&engine.get_stats()).unwrap();
+        assert!(stats.escalations > 0);
     }
 }
