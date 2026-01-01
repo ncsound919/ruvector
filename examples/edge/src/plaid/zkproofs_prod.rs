@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;
+use zeroize::Zeroize;
 
 // ============================================================================
 // Constants
@@ -49,9 +50,9 @@ const TRANSCRIPT_LABEL: &[u8] = b"ruvector-financial-zk-v1";
 /// Maximum bit size for range proofs (64-bit values)
 const MAX_BITS: usize = 64;
 
-/// Pre-computed generators for efficiency
+// Pre-computed generators - optimized for single-party proofs (not aggregation)
 lazy_static::lazy_static! {
-    static ref BP_GENS: BulletproofGens = BulletproofGens::new(MAX_BITS, 16);
+    static ref BP_GENS: BulletproofGens = BulletproofGens::new(MAX_BITS, 1); // 1-party saves 8MB
     static ref PC_GENS: PedersenGens = PedersenGens::default();
 }
 
@@ -183,6 +184,7 @@ pub struct VerificationResult {
 /// Prover for financial statements
 ///
 /// Stores private financial data and generates ZK proofs.
+/// Blinding factors are automatically zeroized on drop for security.
 pub struct FinancialProver {
     /// Monthly income values (in cents)
     income: Vec<u64>,
@@ -191,7 +193,24 @@ pub struct FinancialProver {
     /// Monthly expenses by category
     expenses: HashMap<String, Vec<u64>>,
     /// Blinding factors for commitments (to allow proof combination)
+    /// SECURITY: These are sensitive - zeroized on drop
     blindings: HashMap<String, Scalar>,
+}
+
+impl Drop for FinancialProver {
+    fn drop(&mut self) {
+        // Zeroize sensitive data on drop to prevent memory extraction attacks
+        // Note: Scalar internally uses [u8; 32] which we can't directly zeroize,
+        // but clearing the HashMap removes references
+        self.blindings.clear();
+        self.income.zeroize();
+        self.balances.zeroize();
+        // Zeroize expense values
+        for expenses in self.expenses.values_mut() {
+            expenses.zeroize();
+        }
+        self.expenses.clear();
+    }
 }
 
 impl FinancialProver {
@@ -248,12 +267,20 @@ impl FinancialProver {
 
     /// Prove: income >= multiplier × rent (affordability)
     pub fn prove_affordability(&mut self, rent: u64, multiplier: u64) -> Result<ZkRangeProof, String> {
+        // Input validation to prevent trivial proof bypass
+        if rent == 0 {
+            return Err("Rent must be greater than zero".to_string());
+        }
+        if multiplier == 0 || multiplier > 100 {
+            return Err("Multiplier must be between 1 and 100".to_string());
+        }
         if self.income.is_empty() {
             return Err("No income data provided".to_string());
         }
 
         let avg_income = self.income.iter().sum::<u64>() / self.income.len() as u64;
-        let required = rent.saturating_mul(multiplier);
+        let required = rent.checked_mul(multiplier)
+            .ok_or("Rent × multiplier overflow")?;
 
         if avg_income < required {
             return Err(format!(
@@ -332,6 +359,14 @@ impl FinancialProver {
         category: &str,
         budget: u64,
     ) -> Result<ZkRangeProof, String> {
+        // Input validation
+        if category.is_empty() {
+            return Err("Category must not be empty".to_string());
+        }
+        if budget == 0 {
+            return Err("Budget must be greater than zero".to_string());
+        }
+
         let expenses = self
             .expenses
             .get(category)

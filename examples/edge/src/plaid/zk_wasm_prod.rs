@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::zkproofs_prod::{
     FinancialProver, FinancialVerifier, ZkRangeProof,
-    RentalApplicationBundle, ProdVerificationResult,
+    RentalApplicationBundle, VerificationResult,
 };
 
 /// Production ZK Financial Prover for browser use
