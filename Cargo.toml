@@ -52,6 +52,8 @@ members = [
     "crates/ruvector-learning-wasm",
     "crates/ruvector-exotic-wasm",
     "crates/ruvector-attention-unified-wasm",
+    "crates/ruvector-fpga-transformer",
+    "crates/ruvector-fpga-transformer-wasm",
 ]
 resolver = "2"
 
