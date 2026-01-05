@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;

@@ -388,6 +388,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         epsilon: 0.15,
         parallel: true,
         track_boundaries: true,
+        similarity_threshold: 0.4,  // Lower threshold for cross-domain connections
+        use_embeddings: true,
+        hnsw_k_neighbors: 40,       // More neighbors for multi-domain
+        hnsw_min_records: 50,
     };
 
     let mut coherence = CoherenceEngine::new(coherence_config);

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::time::sleep;
 
 use crate::api_clients::SimpleEmbedder;

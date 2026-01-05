@@ -19,7 +19,6 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::api_clients::SimpleEmbedder;
-use crate::physics_clients::GeoUtils;
 use crate::ruvector_native::{Domain, SemanticVector};
 use crate::{FrameworkError, Result};
 

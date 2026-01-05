@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::hnsw::{HnswConfig, HnswIndex, DistanceMetric};
+use crate::ruvector_native::{Domain, SemanticVector};
+use crate::utils::cosine_similarity;
 use crate::{DataRecord, FrameworkError, Result, Relationship, TemporalWindow};
 
 /// Configuration for coherence engine
@@ -30,6 +33,18 @@ pub struct CoherenceConfig {
 
     /// Track boundary evolution
     pub track_boundaries: bool,
+
+    /// Similarity threshold for auto-connecting embeddings (0.0-1.0)
+    pub similarity_threshold: f64,
+
+    /// Use embeddings to create edges when relationships are empty
+    pub use_embeddings: bool,
+
+    /// Number of neighbors to search for each vector when using HNSW
+    pub hnsw_k_neighbors: usize,
+
+    /// Minimum records to trigger HNSW indexing (below this, use brute force)
+    pub hnsw_min_records: usize,
 }
 
 impl Default for CoherenceConfig {
@@ -42,6 +57,10 @@ impl Default for CoherenceConfig {
             epsilon: 0.1,
             parallel: true,
             track_boundaries: true,
+            similarity_threshold: 0.5,
+            use_embeddings: true,
+            hnsw_k_neighbors: 50,
+            hnsw_min_records: 100,
         }
     }
 }
@@ -213,11 +232,126 @@ impl CoherenceEngine {
 
     /// Build graph from data records
     pub fn build_from_records(&mut self, records: &[DataRecord]) {
+        // First pass: add all nodes and explicit relationships
         for record in records {
             self.add_node(&record.id);
 
             for rel in &record.relationships {
                 self.add_edge(&record.id, &rel.target_id, rel.weight);
+            }
+        }
+
+        // Second pass: create edges based on embedding similarity
+        if self.config.use_embeddings {
+            self.connect_by_embeddings(records);
+        }
+    }
+
+    /// Connect records based on embedding similarity using HNSW for O(n log n) performance
+    fn connect_by_embeddings(&mut self, records: &[DataRecord]) {
+        let threshold = self.config.similarity_threshold;
+        let min_weight = self.config.min_edge_weight;
+
+        // Collect records with embeddings
+        let embedded: Vec<_> = records.iter()
+            .filter(|r| r.embedding.is_some())
+            .collect();
+
+        if embedded.len() < 2 {
+            return;
+        }
+
+        // Use HNSW for large datasets, brute force for small ones
+        if embedded.len() >= self.config.hnsw_min_records {
+            self.connect_by_embeddings_hnsw(&embedded, threshold, min_weight);
+        } else {
+            self.connect_by_embeddings_bruteforce(&embedded, threshold, min_weight);
+        }
+    }
+
+    /// HNSW-accelerated edge creation: O(n * k * log n)
+    fn connect_by_embeddings_hnsw(&mut self, embedded: &[&DataRecord], threshold: f64, min_weight: f64) {
+        let dim = match &embedded[0].embedding {
+            Some(emb) => emb.len(),
+            None => return,
+        };
+
+        let hnsw_config = HnswConfig {
+            dimension: dim,
+            metric: DistanceMetric::Cosine,
+            m: 16,
+            m_max_0: 32,
+            ef_construction: 200,
+            ef_search: self.config.hnsw_k_neighbors.max(50),
+            ..HnswConfig::default()
+        };
+
+        let mut hnsw = HnswIndex::with_config(hnsw_config);
+
+        for record in embedded.iter() {
+            if let Some(embedding) = &record.embedding {
+                let vector = SemanticVector {
+                    id: record.id.clone(),
+                    embedding: embedding.clone(),
+                    timestamp: record.timestamp,
+                    domain: Domain::CrossDomain,
+                    metadata: std::collections::HashMap::new(),
+                };
+                let _ = hnsw.insert(vector);
+            }
+        }
+
+        let k = self.config.hnsw_k_neighbors;
+        let threshold_f32 = threshold as f32;
+        let min_weight_f32 = min_weight as f32;
+
+        use std::collections::HashSet;
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+
+        for record in embedded.iter() {
+            if let Some(embedding) = &record.embedding {
+                if let Ok(neighbors) = hnsw.search_knn(embedding, k + 1) {
+                    for neighbor in neighbors {
+                        if neighbor.external_id == record.id {
+                            continue;
+                        }
+                        if let Some(similarity) = neighbor.similarity {
+                            if similarity >= threshold_f32 {
+                                let key = if record.id < neighbor.external_id {
+                                    (record.id.clone(), neighbor.external_id.clone())
+                                } else {
+                                    (neighbor.external_id.clone(), record.id.clone())
+                                };
+                                if seen.insert(key) {
+                                    self.add_edge(&record.id, &neighbor.external_id, similarity.max(min_weight_f32) as f64);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Brute-force edge creation for small datasets: O(n²)
+    fn connect_by_embeddings_bruteforce(&mut self, embedded: &[&DataRecord], threshold: f64, min_weight: f64) {
+        let threshold_f32 = threshold as f32;
+        let min_weight_f32 = min_weight as f32;
+
+        for i in 0..embedded.len() {
+            for j in (i + 1)..embedded.len() {
+                if let (Some(emb_a), Some(emb_b)) =
+                    (&embedded[i].embedding, &embedded[j].embedding)
+                {
+                    let similarity = cosine_similarity(emb_a, emb_b);
+                    if similarity >= threshold_f32 {
+                        self.add_edge(
+                            &embedded[i].id,
+                            &embedded[j].id,
+                            similarity.max(min_weight_f32) as f64,
+                        );
+                    }
+                }
             }
         }
     }

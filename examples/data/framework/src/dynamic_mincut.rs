@@ -17,7 +17,6 @@ use std::sync::{Arc, RwLock};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::ruvector_native::{GraphNode, GraphEdge};
 
 /// Error types for dynamic min-cut operations
 #[derive(Debug, Clone, thiserror::Error)]

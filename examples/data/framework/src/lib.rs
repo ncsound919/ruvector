@@ -65,6 +65,7 @@ pub mod semantic_scholar;
 pub mod space_clients;
 pub mod streaming;
 pub mod transportation_clients;
+pub mod utils;
 pub mod visualization;
 pub mod wiki_clients;
 
@@ -78,7 +79,11 @@ use thiserror::Error;
 
 // Re-exports
 pub use academic_clients::{CoreClient, EricClient, UnpaywallClient};
-pub use api_clients::{EdgarClient, NoaaClient, OpenAlexClient, SimpleEmbedder};
+pub use api_clients::{EdgarClient, Embedder, NoaaClient, OpenAlexClient, SimpleEmbedder};
+#[cfg(feature = "onnx-embeddings")]
+pub use api_clients::OnnxEmbedder;
+#[cfg(feature = "onnx-embeddings")]
+pub use ruvector_onnx_embeddings::{PretrainedModel, EmbedderConfig, PoolingStrategy};
 pub use arxiv_client::ArxivClient;
 pub use biorxiv_client::{BiorxivClient, MedrxivClient};
 pub use crossref_client::CrossRefClient;

@@ -7,14 +7,26 @@
 //! - Pattern trends and anomalies
 //!
 //! This demonstrates real-world discovery on live academic data.
+//!
+//! ## Embedder Options
+//! - Default: SimpleEmbedder (bag-of-words, fast but low quality)
+//! - With `onnx-embeddings` feature: OnnxEmbedder (neural, high quality)
+//!
+//! Run with ONNX:
+//! ```bash
+//! cargo run --example real_data_discovery --features onnx-embeddings --release
+//! ```
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use ruvector_data_framework::{
     CoherenceConfig, CoherenceEngine, DiscoveryConfig, DiscoveryEngine, OpenAlexClient,
-    PatternCategory, SimpleEmbedder,
+    PatternCategory, SimpleEmbedder, Embedder,
 };
+
+#[cfg(feature = "onnx-embeddings")]
+use ruvector_data_framework::OnnxEmbedder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -88,6 +100,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================================
+    // Phase 1.5: Re-embed with ONNX (if feature enabled)
+    // ============================================================================
+    #[cfg(feature = "onnx-embeddings")]
+    {
+        println!();
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("🧠 Phase 1.5: Generating Neural Embeddings (ONNX)");
+        println!();
+        println!("   Loading MiniLM-L6-v2 model (384-dim semantic embeddings)...");
+
+        let onnx_start = Instant::now();
+        match OnnxEmbedder::new().await {
+            Ok(embedder) => {
+                println!("   ✓ Model loaded in {:?}", onnx_start.elapsed());
+                println!("   Embedding {} papers...", all_records.len());
+
+                let embed_start = Instant::now();
+                for record in &mut all_records {
+                    // Extract text from JSON data for embedding
+                    let title = record.data.get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let abstract_text = record.data.get("abstract")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let concepts = record.data.get("concepts")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter()
+                            .filter_map(|c| c.get("display_name").and_then(|n| n.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(" "))
+                        .unwrap_or_default();
+
+                    let text = format!("{} {} {}", title, abstract_text, concepts);
+                    let embedding = embedder.embed_text(&text);
+                    record.embedding = Some(embedding);
+                }
+
+                println!("   ✓ Embedded {} papers in {:?}", all_records.len(), embed_start.elapsed());
+                println!("   Embedding dimension: 384 (semantic)");
+            }
+            Err(e) => {
+                println!("   ⚠️  ONNX model failed to load: {}", e);
+                println!("   Falling back to bag-of-words embeddings");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "onnx-embeddings"))]
+    {
+        println!();
+        println!("   💡 Tip: Enable ONNX embeddings for better discovery quality:");
+        println!("      cargo run --example real_data_discovery --features onnx-embeddings --release");
+    }
+
+    // ============================================================================
     // Phase 2: Build Coherence Graph
     // ============================================================================
     println!();
@@ -103,6 +171,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         epsilon: 0.1,
         parallel: true,
         track_boundaries: true,
+        similarity_threshold: 0.5,  // Connect papers with >= 50% similarity
+        use_embeddings: true,       // Use ONNX embeddings for edge creation
+        hnsw_k_neighbors: 30,       // Search 30 nearest neighbors per paper
+        hnsw_min_records: 50,       // Use HNSW for datasets >= 50 records
     };
 
     let mut coherence = CoherenceEngine::new(coherence_config);
@@ -273,6 +345,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     println!("   🔬 Methodology:");
+    #[cfg(feature = "onnx-embeddings")]
+    println!("      • Semantic embeddings: ONNX MiniLM-L6-v2 (384-dim neural)");
+    #[cfg(not(feature = "onnx-embeddings"))]
     println!("      • Semantic embeddings: Simple bag-of-words (128-dim)");
     println!("      • Graph construction: Citation + concept relationships");
     println!("      • Coherence metric: Dynamic minimum cut");

@@ -106,6 +106,192 @@ impl SimpleEmbedder {
 }
 
 // ============================================================================
+// ONNX Semantic Embedder (Optional Feature)
+// ============================================================================
+
+/// ONNX-based semantic embedder for high-quality embeddings
+/// Requires the `onnx-embeddings` feature flag
+#[cfg(feature = "onnx-embeddings")]
+pub struct OnnxEmbedder {
+    embedder: std::sync::RwLock<ruvector_onnx_embeddings::Embedder>,
+}
+
+#[cfg(feature = "onnx-embeddings")]
+impl OnnxEmbedder {
+    /// Create a new ONNX embedder with the default model (all-MiniLM-L6-v2)
+    pub async fn new() -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let embedder = ruvector_onnx_embeddings::Embedder::default_model().await?;
+        Ok(Self {
+            embedder: std::sync::RwLock::new(embedder),
+        })
+    }
+
+    /// Create with a specific pretrained model
+    pub async fn with_model(
+        model: ruvector_onnx_embeddings::PretrainedModel,
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let embedder = ruvector_onnx_embeddings::Embedder::pretrained(model).await?;
+        Ok(Self {
+            embedder: std::sync::RwLock::new(embedder),
+        })
+    }
+
+    /// Generate semantic embedding from text
+    pub fn embed_text(&self, text: &str) -> Vec<f32> {
+        let mut embedder = self.embedder.write().unwrap();
+        embedder.embed_one(text).unwrap_or_else(|_| vec![0.0; 384])
+    }
+
+    /// Generate embeddings for multiple texts (batch processing)
+    pub fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        let mut embedder = self.embedder.write().unwrap();
+        match embedder.embed(texts) {
+            Ok(output) => (0..texts.len())
+                .map(|i| output.get(i).unwrap_or(&vec![0.0; 384]).clone())
+                .collect(),
+            Err(_) => texts.iter().map(|_| vec![0.0; 384]).collect(),
+        }
+    }
+
+    /// Generate embeddings in optimized chunks (for large batches)
+    ///
+    /// Processes texts in chunks of `batch_size` to:
+    /// - Reduce memory pressure
+    /// - Enable better GPU/CPU utilization
+    /// - Allow progress tracking
+    ///
+    /// # Arguments
+    /// * `texts` - Input texts to embed
+    /// * `batch_size` - Number of texts per batch (default: 32)
+    ///
+    /// # Returns
+    /// Vector of embeddings in the same order as input texts
+    pub fn embed_batch_chunked(&self, texts: &[&str], batch_size: usize) -> Vec<Vec<f32>> {
+        let batch_size = batch_size.max(1);
+        let dim = self.dimension();
+        let mut all_embeddings = Vec::with_capacity(texts.len());
+
+        for chunk in texts.chunks(batch_size) {
+            let chunk_embeddings = self.embed_batch(chunk);
+            all_embeddings.extend(chunk_embeddings);
+        }
+
+        // Ensure we have the right number of embeddings
+        while all_embeddings.len() < texts.len() {
+            all_embeddings.push(vec![0.0; dim]);
+        }
+
+        all_embeddings
+    }
+
+    /// Generate embeddings with progress callback (for large datasets)
+    ///
+    /// # Arguments
+    /// * `texts` - Input texts to embed
+    /// * `batch_size` - Number of texts per batch
+    /// * `progress_fn` - Callback called with (processed, total) after each batch
+    pub fn embed_batch_with_progress<F>(
+        &self,
+        texts: &[&str],
+        batch_size: usize,
+        mut progress_fn: F,
+    ) -> Vec<Vec<f32>>
+    where
+        F: FnMut(usize, usize),
+    {
+        let batch_size = batch_size.max(1);
+        let total = texts.len();
+        let dim = self.dimension();
+        let mut all_embeddings = Vec::with_capacity(total);
+        let mut processed = 0;
+
+        for chunk in texts.chunks(batch_size) {
+            let chunk_embeddings = self.embed_batch(chunk);
+            all_embeddings.extend(chunk_embeddings);
+            processed += chunk.len();
+            progress_fn(processed, total);
+        }
+
+        // Ensure we have the right number of embeddings
+        while all_embeddings.len() < total {
+            all_embeddings.push(vec![0.0; dim]);
+        }
+
+        all_embeddings
+    }
+
+    /// Get the embedding dimension (384 for MiniLM, 768 for larger models)
+    pub fn dimension(&self) -> usize {
+        let embedder = self.embedder.read().unwrap();
+        embedder.dimension()
+    }
+
+    /// Compute cosine similarity between two texts
+    pub fn similarity(&self, text1: &str, text2: &str) -> f32 {
+        let mut embedder = self.embedder.write().unwrap();
+        embedder.similarity(text1, text2).unwrap_or(0.0)
+    }
+
+    /// Generate embedding from JSON value by extracting text
+    pub fn embed_json(&self, value: &serde_json::Value) -> Vec<f32> {
+        let text = extract_text_from_json(value);
+        self.embed_text(&text)
+    }
+}
+
+/// Helper to extract text from JSON (used by both embedders)
+fn extract_text_from_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(map) => {
+            let mut text = String::new();
+            for (key, val) in map {
+                text.push_str(key);
+                text.push(' ');
+                text.push_str(&extract_text_from_json(val));
+                text.push(' ');
+            }
+            text
+        }
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .map(|v| extract_text_from_json(v))
+            .collect::<Vec<_>>()
+            .join(" "),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => String::new(),
+    }
+}
+
+/// Unified embedder trait for both SimpleEmbedder and OnnxEmbedder
+pub trait Embedder: Send + Sync {
+    /// Generate embedding from text
+    fn embed(&self, text: &str) -> Vec<f32>;
+    /// Get embedding dimension
+    fn dim(&self) -> usize;
+}
+
+impl Embedder for SimpleEmbedder {
+    fn embed(&self, text: &str) -> Vec<f32> {
+        self.embed_text(text)
+    }
+    fn dim(&self) -> usize {
+        self.dimension
+    }
+}
+
+#[cfg(feature = "onnx-embeddings")]
+impl Embedder for OnnxEmbedder {
+    fn embed(&self, text: &str) -> Vec<f32> {
+        self.embed_text(text)
+    }
+    fn dim(&self) -> usize {
+        self.dimension()
+    }
+}
+
+// ============================================================================
 // OpenAlex API Client
 // ============================================================================
 

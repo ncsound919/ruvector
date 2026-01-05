@@ -1,10 +1,13 @@
 [package]
 name = "ruvector-data-framework"
-version.workspace = true
+version = "0.3.0"
 edition.workspace = true
-description = "Core discovery framework for RuVector dataset integrations"
+description = "Core discovery framework for RuVector dataset integrations - find hidden patterns in massive datasets using vector memory, graph structures, and dynamic min-cut algorithms"
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+documentation = "https://docs.rs/ruvector-data-framework"
+authors = ["RuVector Team <team@ruvector.dev>"]
 keywords = ["vector-database", "discovery", "graph", "mincut", "coherence"]
 categories = ["science", "database", "data-structures"]
 
@@ -47,6 +50,9 @@ flate2 = "1.1"
 clap = { version = "4.5", features = ["derive"] }
 num_cpus = "1.16"
 warp = { version = "0.3", optional = true }
+
+# ONNX embeddings (optional - for semantic embeddings)
+ruvector-onnx-embeddings = { version = "0.1.0", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -119,3 +125,4 @@ default = ["async", "parallel"]
 async = []
 parallel = ["rayon"]
 sse = ["warp"]
+onnx-embeddings = ["dep:ruvector-onnx-embeddings"]

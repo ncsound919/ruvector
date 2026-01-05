@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{CoherenceSignal, FrameworkError, Result};
+use crate::{CoherenceSignal, Result};
 
 /// Configuration for discovery engine
 #[derive(Debug, Clone, Serialize, Deserialize)]

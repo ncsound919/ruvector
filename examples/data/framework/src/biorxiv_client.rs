@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use tokio::time::sleep;

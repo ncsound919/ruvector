@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use tokio::time::sleep;

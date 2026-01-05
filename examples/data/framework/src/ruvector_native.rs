@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::utils::cosine_similarity;
+
 /// Vector embedding for semantic similarity
 /// Uses RuVector's native vector storage format
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -791,22 +793,7 @@ pub struct CoherenceHistoryEntry {
     pub snapshot: CoherenceSnapshot,
 }
 
-/// Compute cosine similarity between two vectors
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    dot / (norm_a * norm_b)
-}
+// Note: cosine_similarity is imported from crate::utils
 
 // Implement ordering for Domain to use in HashMap keys
 impl PartialOrd for Domain {
