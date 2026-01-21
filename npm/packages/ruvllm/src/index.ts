@@ -80,6 +80,15 @@ export * from './export';
 // Training pipeline
 export * from './training';
 
+// Contrastive fine-tuning
+export * from './contrastive';
+
+// Model downloader and registry
+export * from './models';
+
+// Benchmarks for Claude Code use cases
+export * from './benchmarks';
+
 // Native bindings utilities
 export { version, hasSimdSupport } from './native';
 
