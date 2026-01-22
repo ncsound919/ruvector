@@ -2020,13 +2020,56 @@ async fn main() -> anyhow::Result<()> {
 <details>
 <summary>🔧 Bindings & Tools</summary>
 
+**Native bindings and tools** for integrating RuVector into any environment — Node.js, browsers, CLI, or as an HTTP/gRPC server.
+
 | Crate | Description | crates.io |
 |-------|-------------|-----------|
-| [ruvector-node](./crates/ruvector-node) | Main Node.js bindings (napi-rs) | [![crates.io](https://img.shields.io/crates/v/ruvector-node.svg)](https://crates.io/crates/ruvector-node) |
-| [ruvector-wasm](./crates/ruvector-wasm) | Main WASM bindings for browsers | [![crates.io](https://img.shields.io/crates/v/ruvector-wasm.svg)](https://crates.io/crates/ruvector-wasm) |
-| [ruvllm-wasm](./crates/ruvllm-wasm) | LLM integration WASM bindings | [![crates.io](https://img.shields.io/crates/v/ruvllm-wasm.svg)](https://crates.io/crates/ruvllm-wasm) |
+| [ruvector-node](./crates/ruvector-node) | Native Node.js bindings via napi-rs | [![crates.io](https://img.shields.io/crates/v/ruvector-node.svg)](https://crates.io/crates/ruvector-node) |
+| [ruvector-wasm](./crates/ruvector-wasm) | WASM bindings for browsers & edge | [![crates.io](https://img.shields.io/crates/v/ruvector-wasm.svg)](https://crates.io/crates/ruvector-wasm) |
+| [ruvllm-wasm](./crates/ruvllm-wasm) | Browser LLM inference with WebGPU | [![crates.io](https://img.shields.io/crates/v/ruvllm-wasm.svg)](https://crates.io/crates/ruvllm-wasm) |
 | [ruvector-cli](./crates/ruvector-cli) | Command-line interface | [![crates.io](https://img.shields.io/crates/v/ruvector-cli.svg)](https://crates.io/crates/ruvector-cli) |
 | [ruvector-server](./crates/ruvector-server) | HTTP/gRPC server | [![crates.io](https://img.shields.io/crates/v/ruvector-server.svg)](https://crates.io/crates/ruvector-server) |
+
+**Node.js (Native Performance)**
+```bash
+npm install @ruvector/node
+```
+```javascript
+const { RuVector } = require('@ruvector/node');
+const db = new RuVector({ dimensions: 1536 });
+db.insert('doc1', embedding, { title: 'Hello' });
+const results = db.search(queryEmbedding, 10);
+```
+
+**Browser (WASM)**
+```bash
+npm install @ruvector/wasm
+```
+```javascript
+import { RuVectorWasm } from '@ruvector/wasm';
+const db = await RuVectorWasm.create({ dimensions: 384 });
+await db.insert('doc1', embedding);
+const results = await db.search(query, 5);
+```
+
+**CLI**
+```bash
+cargo install ruvector-cli
+ruvector init mydb --dim 1536
+ruvector insert mydb --file embeddings.json
+ruvector search mydb --query "[0.1, 0.2, ...]" --limit 10
+```
+
+**HTTP Server**
+```bash
+cargo install ruvector-server
+ruvector-server --port 8080 --data ./vectors
+
+# REST API
+curl -X POST http://localhost:8080/search \
+  -H "Content-Type: application/json" \
+  -d '{"vector": [0.1, 0.2, ...], "limit": 10}'
+```
 
 </details>
 
