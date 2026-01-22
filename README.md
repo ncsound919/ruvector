@@ -670,6 +670,75 @@ ORDER BY embedding <-> query_vector
 LIMIT 10;
 ```
 
+### Dynamic Embedding Fine-Tuning
+
+| Use Case | Features Used | Example |
+|----------|---------------|---------|
+| **Real-Time Adaptation** | MicroLoRA (<1ms), Per-request learning | [docs/ruvllm/FINE_TUNING.md](./docs/ruvllm/FINE_TUNING.md) |
+| **Contrastive Training** | Triplet loss, Hard negatives, InfoNCE | [npm/packages/ruvllm](./npm/packages/ruvllm) |
+| **Task-Specific Adapters** | 5 pre-defined adapters (Coder, Researcher, Security, Architect, Reviewer) | [docs/training](./docs/training/) |
+| **Catastrophic Forgetting Prevention** | EWC++ (Elastic Weight Consolidation) | [crates/sona](./crates/sona) |
+| **Browser Fine-Tuning** | MicroLoRA WASM, <50KB adapters | [crates/ruvllm-wasm](./crates/ruvllm-wasm) |
+
+**Three-Tier Adaptation System:**
+
+| Tier | Technique | Latency | Use Case |
+|------|-----------|---------|----------|
+| **Instant** | MicroLoRA (rank 1-2) | <1ms | Per-request adaptation |
+| **Background** | Adapter Merge + EWC++ | ~100ms | Pattern consolidation |
+| **Deep** | Full Training Pipeline | Minutes | Periodic optimization |
+
+```javascript
+// Real-time embedding fine-tuning with contrastive learning
+import { ContrastiveTrainer, tripletLoss } from '@ruvector/ruvllm';
+
+const trainer = new ContrastiveTrainer({
+  epochs: 10,
+  batchSize: 16,
+  margin: 0.5,           // Triplet loss margin
+  hardNegativeRatio: 0.7 // 70% hard negatives for better learning
+});
+
+// Train with triplets: anchor (task) → positive (correct agent) → negative (wrong agent)
+trainer.addTriplet(taskEmb, correctAgentEmb, wrongAgentEmb, isHardNegative);
+const results = trainer.train();
+trainer.exportTrainingData('./fine-tuned-model');
+```
+
+```rust
+// Rust: MicroLoRA for per-request adaptation
+use ruvllm::lora::{MicroLoRA, MicroLoraConfig, AdaptFeedback};
+
+let lora = MicroLoRA::new(MicroLoraConfig::for_hidden_dim(4096));
+
+// During inference: apply LoRA delta
+let output = model.forward(&input)?;
+let delta = lora.forward(&input, &TargetModule::QProj);
+let enhanced = output.iter().zip(delta.iter()).map(|(o, d)| o + d).collect();
+
+// After response: adapt based on quality feedback
+lora.adapt(&input, AdaptFeedback::from_quality(0.85))?;
+lora.apply_updates(0.01); // Learning rate
+```
+
+```javascript
+// Browser: Real-time fine-tuning with MicroLoRA WASM
+import init, { MicroLoraWasm, MicroLoraConfigWasm } from 'ruvllm-wasm';
+
+await init();
+const config = new MicroLoraConfigWasm();
+config.rank = 2;           // Tiny rank for browser (<50KB)
+config.alpha = 4.0;
+config.inFeatures = 768;
+
+const lora = new MicroLoraWasm(config);
+const delta = lora.forward(hiddenStates);  // <1ms latency
+
+// Persist to localStorage/IndexedDB
+const json = lora.toJson();
+localStorage.setItem('user-adapter', json);
+```
+
 ### Agentic Workflows
 
 | Use Case | Features Used | Example |
