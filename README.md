@@ -554,6 +554,10 @@ RETURN related
 | **Rust (SONA)** | `cargo add ruvector-sona` |
 | **Rust (LLM)** | `cargo add ruvllm` |
 
+---
+
+## Package Reference
+
 <details>
 <summary>📖 Documentation</summary>
 
@@ -929,6 +933,10 @@ engine.endTrajectory(trajId, 0.95);
 ```
 
 </details>
+
+---
+
+## Platform Features
 
 <details>
 <summary><strong>🔀 Self-Learning DAG (Query Optimization)</strong></summary>
@@ -1445,6 +1453,10 @@ npm install @ruvector/edge-net
 > **Full Documentation**: [edge-net README](./examples/edge-net/README.md)
 
 </details>
+
+---
+
+## AI & Machine Learning
 
 <details>
 <summary><strong>🎲 Agentic-Synth - AI Synthetic Data Generation</strong></summary>
@@ -2277,6 +2289,10 @@ let distances = batch_distances(&query, &database);  // 8-54x speedup
 
 </details>
 
+---
+
+## Database Extensions
+
 <details>
 <summary><strong>🐘 PostgreSQL Extension</strong></summary>
 
@@ -2538,6 +2554,10 @@ See [ruvector-postgres README](./crates/ruvector-postgres/README.md) for full SQ
 
 </details>
 
+---
+
+## Developer Tools
+
 <details>
 <summary>🛠️ Tools & Utilities</summary>
 
@@ -2570,6 +2590,10 @@ let results = db.search(&query, 5);
 ```
 
 </details>
+
+---
+
+## Browser & Edge (WASM)
 
 <details>
 <summary>🌐 WASM Packages (Browser & Edge)</summary>
@@ -3037,6 +3061,10 @@ console.log(available_mechanisms());
 
 </details>
 
+---
+
+## Self-Learning Systems
+
 <details>
 <summary>🧠 Self-Learning Intelligence Hooks</summary>
 
@@ -3338,6 +3366,10 @@ The PostgreSQL backend provides:
 
 </details>
 
+---
+
+## Additional Modules
+
 <details>
 <summary>🔬 Scientific OCR (SciPix)</summary>
 
@@ -3494,6 +3526,10 @@ curl -X POST http://localhost:8080/search \
 ```
 
 </details>
+
+---
+
+## Examples & Tutorials
 
 <details>
 <summary>📚 Production Examples</summary>
@@ -3981,6 +4017,10 @@ cargo run --example generate_claude_dataset --release
 ```
 
 </details>
+
+---
+
+## Project
 
 <details>
 <summary>📁 Project Structure</summary>
