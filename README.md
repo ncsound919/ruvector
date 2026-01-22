@@ -522,23 +522,175 @@ Think of it like your computer's memory hierarchy—frequently accessed data liv
 <details>
 <summary>💡 Use Cases</summary>
 
-**RAG (Retrieval-Augmented Generation)**
+### AI & LLM Applications
+
+| Use Case | Features Used | Example |
+|----------|---------------|---------|
+| **RAG Pipelines** | Vector search, Local embeddings, ruvllm | [examples/ruvLLM](./examples/ruvLLM) |
+| **AI Agent Routing** | Tiny Dancer, Semantic router, SONA | [Claude-Flow](https://github.com/ruvnet/claude-flow) |
+| **Multi-Agent Orchestration** | GNN, HNSW memory, Consensus | [Agentic-Flow](https://github.com/ruvnet/agentic-flow) |
+| **Self-Learning Chatbots** | ReasoningBank, EWC++, Neural patterns | [examples/meta-cognition](./examples/meta-cognition-spiking-neural-network) |
+
 ```javascript
-const context = ruvector.search(questionEmbedding, 5);
-const prompt = `Context: ${context.join('\n')}\n\nQuestion: ${question}`;
+// RAG with local LLM (zero cloud costs)
+import { RuVector } from 'ruvector';
+import { RuvLLM } from '@ruvector/ruvllm';
+
+const db = new RuVector({ dimensions: 384 });
+const llm = new RuvLLM({ model: 'ruvltra-small-0.5b-q4_k_m.gguf' });
+
+// Search learns from usage via GNN layers
+const context = await db.search(questionEmbedding, { k: 5 });
+const response = await llm.generate(`Context: ${context}\n\nQ: ${question}`);
 ```
 
-**Recommendation Systems**
+### Search & Discovery
+
+| Use Case | Features Used | Example |
+|----------|---------------|---------|
+| **Semantic Search** | HNSW, Metadata filtering, SIMD | Core feature |
+| **Hybrid Search** | BM25 + embeddings, Sparse vectors | [docs/api](./docs/api/) |
+| **Image Similarity** | CLIP embeddings, Hyperbolic HNSW | [examples/wasm-react](./examples/wasm-react) |
+| **Code Search** | Local ONNX embeddings, Graph queries | [examples/nodejs](./examples/nodejs) |
+
+```javascript
+// Hybrid search: keyword + semantic
+const results = await db.search(query, {
+  k: 10,
+  filter: { category: 'electronics', price: { $lt: 500 } },
+  hybridAlpha: 0.7,  // 70% semantic, 30% keyword
+  rerank: true       // GNN-enhanced reranking
+});
+```
+
+### Recommendations & Personalization
+
+| Use Case | Features Used | Example |
+|----------|---------------|---------|
+| **Product Recommendations** | Graph queries, Cypher, GNN | [examples/graph](./examples/graph) |
+| **Content Personalization** | User embeddings, Collaborative filtering | Real-time adaptation |
+| **Similar Items** | Cosine similarity, Hyperbolic space | Hierarchical taxonomies |
+
 ```cypher
-MATCH (user:User)-[:VIEWED]->(item:Product)
+// Neo4j-style recommendations with learning
+MATCH (user:User {id: $userId})-[:VIEWED]->(item:Product)
 MATCH (item)-[:SIMILAR_TO]->(rec:Product)
-RETURN rec ORDER BY rec.score DESC LIMIT 10
+WHERE NOT (user)-[:PURCHASED]->(rec)
+RETURN rec ORDER BY rec.gnn_score DESC LIMIT 10
 ```
 
-**Knowledge Graphs**
+### Knowledge Management
+
+| Use Case | Features Used | Example |
+|----------|---------------|---------|
+| **Knowledge Graphs** | Hypergraph, Cypher, SPARQL | [docs/api/CYPHER_REFERENCE.md](./docs/api/CYPHER_REFERENCE.md) |
+| **Document Q&A** | Chunking, Embeddings, RAG | [examples/refrag-pipeline](./examples/refrag-pipeline) |
+| **Scientific Papers** | SciPix OCR, LaTeX extraction | [examples/scipix](./examples/scipix) |
+| **Research Discovery** | Citation graphs, Concept linking | Hyperedge relationships |
+
 ```cypher
-MATCH (concept:Concept)-[:RELATES_TO*1..3]->(related)
-RETURN related
+// Multi-hop knowledge graph traversal
+MATCH (paper:Paper)-[:CITES*1..3]->(cited:Paper)
+WHERE paper.topic = 'machine learning'
+MATCH (cited)-[:AUTHORED_BY]->(author:Researcher)
+RETURN author, count(cited) as influence
+ORDER BY influence DESC LIMIT 20
+```
+
+### Real-Time & Edge Computing
+
+| Use Case | Features Used | Example |
+|----------|---------------|---------|
+| **Browser AI** | WASM, WebGPU, ruvllm-wasm | [examples/wasm-vanilla](./examples/wasm-vanilla) |
+| **IoT Sensors** | rvLite, Edge DB, no_std | [examples/edge](./examples/edge) |
+| **Mobile Apps** | 2MB footprint, Offline-first | [examples/edge-net](./examples/edge-net) |
+| **Streaming Data** | Real-time indexing, Dynamic min-cut | [examples/neural-trader](./examples/neural-trader) |
+
+```javascript
+// Browser-based AI (no server required)
+import init, { RuvLLMWasm } from '@ruvector/ruvllm-wasm';
+
+await init();
+const llm = await RuvLLMWasm.new(true); // WebGPU enabled
+await llm.load_model_from_url('https://cdn.example.com/model.gguf');
+
+// Runs entirely in browser
+const response = await llm.generate('Explain quantum computing', {
+  max_tokens: 200,
+  temperature: 0.7
+});
+```
+
+### Scientific & Research
+
+| Use Case | Features Used | Example |
+|----------|---------------|---------|
+| **Neural Network Analysis** | Spiking NN, Meta-cognition | [examples/meta-cognition](./examples/meta-cognition-spiking-neural-network) |
+| **Algorithmic Trading** | Neural Trader, Time-series | [examples/neural-trader](./examples/neural-trader) |
+| **Quantum Computing** | ruQu, Min-cut coherence | [crates/ruQu](./crates/ruQu) |
+| **Brain Connectivity** | Dynamic min-cut, Network analysis | [examples/mincut](./examples/mincut) |
+
+```rust
+// Neuromorphic computing with spiking networks
+use ruvector_nervous_system::{SpikingNetwork, LIFNeuron};
+
+let mut network = SpikingNetwork::new();
+network.add_layer(LIFNeuron::new(128));  // 128 spiking neurons
+network.enable_stdp();                    // Spike-timing plasticity
+
+// 10-50x more energy efficient than traditional ANNs
+let output = network.forward(&input_spikes);
+```
+
+### Distributed & Enterprise
+
+| Use Case | Features Used | Example |
+|----------|---------------|---------|
+| **Multi-Region Deployment** | Raft consensus, Replication | [docs/cloud-architecture](./docs/cloud-architecture/) |
+| **High Availability** | Auto-sharding, Failover | 99.99% SLA capable |
+| **PostgreSQL Integration** | 230+ SQL functions, pgvector replacement | [crates/ruvector-postgres](./crates/ruvector-postgres) |
+| **Burst Traffic** | 10-50x scaling, Load balancing | [examples/google-cloud](./examples/google-cloud) |
+
+```sql
+-- PostgreSQL with RuVector extension
+CREATE EXTENSION ruvector;
+
+-- Create vector column with GNN-enhanced index
+CREATE TABLE documents (
+  id SERIAL PRIMARY KEY,
+  content TEXT,
+  embedding VECTOR(384)
+);
+
+CREATE INDEX ON documents USING hnsw_gnn (embedding);
+
+-- Self-improving search
+SELECT * FROM documents
+ORDER BY embedding <-> query_vector
+LIMIT 10;
+```
+
+### Agentic Workflows
+
+| Use Case | Features Used | Example |
+|----------|---------------|---------|
+| **Version Control for AI** | Agentic Jujutsu, Branching | [examples/agentic-jujutsu](./examples/agentic-jujutsu) |
+| **Data Pipelines** | DAG workflows, Self-learning | [crates/ruvector-dag](./crates/ruvector-dag) |
+| **Web Scraping** | Apify integration, Embeddings | [examples/apify](./examples/apify) |
+| **Synthetic Data** | Agentic synthesis, Generation | [Agentic-Flow](https://github.com/ruvnet/agentic-flow) |
+
+```javascript
+// Self-learning DAG workflow
+import { QueryDag, AttentionSelector } from '@ruvector/dag';
+
+const dag = new QueryDag();
+dag.addNode({ type: 'fetch', source: 'api' });
+dag.addNode({ type: 'embed', model: 'local-onnx' });
+dag.addNode({ type: 'index', engine: 'hnsw' });
+
+// DAG learns optimal execution paths over time
+dag.enableSonaLearning();
+await dag.execute();
 ```
 
 </details>
