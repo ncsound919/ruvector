@@ -54,7 +54,7 @@
 //! let mut jtree = JTreeHierarchy::build(graph, config).unwrap();
 //!
 //! // Query approximate min-cut (Tier 1)
-//! let approx = jtree.approximate_min_cut();
+//! let approx = jtree.approximate_min_cut().unwrap();
 //! println!("Approximate min-cut: {} (factor: {})", approx.value, approx.approximation_factor);
 //!
 //! // Handle dynamic updates

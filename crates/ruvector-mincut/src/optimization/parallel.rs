@@ -201,7 +201,7 @@ impl ParallelLevelUpdater {
         Self {
             scheduler: Arc::new(WorkStealingScheduler::with_config(config.clone())),
             config,
-            global_min: AtomicU64::new(u64::MAX),
+            global_min: AtomicU64::new(f64::INFINITY.to_bits()),
             best_level: AtomicUsize::new(usize::MAX),
         }
     }
@@ -249,7 +249,7 @@ impl ParallelLevelUpdater {
 
     /// Reset global minimum
     pub fn reset_min(&self) {
-        self.global_min.store(u64::MAX, Ordering::Release);
+        self.global_min.store(f64::INFINITY.to_bits(), Ordering::Release);
         self.best_level.store(usize::MAX, Ordering::Release);
     }
 

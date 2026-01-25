@@ -165,9 +165,19 @@ impl BenchmarkSuite {
         }
 
         // Estimate combined speedup (conservative: product of square roots)
+        // Skip results with zero or negative speedup to avoid NaN
         let mut combined = 1.0;
+        let mut count = 0;
         for result in &self.results {
-            combined *= result.summary.avg_speedup.sqrt();
+            let speedup = result.summary.avg_speedup;
+            if speedup > 0.0 && speedup.is_finite() {
+                combined *= speedup.sqrt();
+                count += 1;
+            }
+        }
+
+        if count == 0 {
+            return 1.0;
         }
 
         combined
@@ -703,7 +713,10 @@ mod tests {
         suite.run_all();
         let combined = suite.combined_speedup();
 
-        assert!(combined > 0.0);
+        // For very small inputs, overhead may exceed benefit
+        // Just verify we get a valid positive result
+        assert!(combined > 0.0 && combined.is_finite(),
+            "Combined speedup {} should be positive and finite", combined);
     }
 
     #[test]
