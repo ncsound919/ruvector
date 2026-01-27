@@ -371,15 +371,38 @@ export class AIDefenceGuard {
     const threats: ThreatInfo[] = [];
     const startTime = performance.now();
 
-    // Check for echoed injection attempts
-    const injectionPatterns = INJECTION_PATTERNS.slice(0, 5); // Key patterns
-    for (const pattern of injectionPatterns) {
+    // Check for echoed injection attempts using all patterns
+    for (const pattern of INJECTION_PATTERNS) {
+      // Reset lastIndex for patterns with global flag
+      pattern.lastIndex = 0;
       if (pattern.test(response)) {
         threats.push({
           type: 'prompt_injection',
           severity: 'high',
           confidence: 0.9,
           description: 'Response contains injection-like content',
+        });
+        break;
+      }
+    }
+
+    // Additional patterns for detecting injection compliance in responses
+    const responseInjectionPatterns = [
+      /\b(will|shall|going to)\s+(ignore|disregard|forget)\s+.*instructions/i,
+      /\b(ignoring|disregarding|forgetting)\s+.*instructions/i,
+      /\b(ignored|disregarded|forgot)\s+.*instructions/i,
+      /as\s+(you\s+)?(asked|requested|instructed)/i,
+      /complying\s+with\s+your\s+(request|instruction)/i,
+      /following\s+your\s+(new\s+)?instructions/i,
+    ];
+
+    for (const pattern of responseInjectionPatterns) {
+      if (pattern.test(response)) {
+        threats.push({
+          type: 'prompt_injection',
+          severity: 'high',
+          confidence: 0.85,
+          description: 'Response indicates compliance with injection attempt',
         });
         break;
       }
