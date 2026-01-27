@@ -1,0 +1,161 @@
+{
+  "name": "@ruvector/ruvbot",
+  "version": "0.1.0",
+  "description": "Self-learning AI assistant bot with WASM embeddings, vector memory, and multi-platform integrations",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "bin": {
+    "ruvbot": "./bin/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "import": "./dist/core/index.mjs",
+      "require": "./dist/core/index.js"
+    },
+    "./learning": {
+      "types": "./dist/learning/index.d.ts",
+      "import": "./dist/learning/index.mjs",
+      "require": "./dist/learning/index.js"
+    },
+    "./skills": {
+      "types": "./dist/skills/index.d.ts",
+      "import": "./dist/skills/index.mjs",
+      "require": "./dist/skills/index.js"
+    },
+    "./integrations": {
+      "types": "./dist/integrations/index.d.ts",
+      "import": "./dist/integrations/index.mjs",
+      "require": "./dist/integrations/index.js"
+    },
+    "./api": {
+      "types": "./dist/api/index.d.ts",
+      "import": "./dist/api/index.mjs",
+      "require": "./dist/api/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "bin",
+    "scripts",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "build:watch": "tsup --watch",
+    "dev": "tsx watch src/cli/index.ts",
+    "start": "node dist/cli/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:e2e": "vitest run tests/e2e",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src tests --ext .ts",
+    "lint:fix": "eslint src tests --ext .ts --fix",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "benchmark": "vitest bench",
+    "prepublishOnly": "npm run build",
+    "postinstall": "node scripts/postinstall.js || true"
+  },
+  "dependencies": {
+    "@ruvector/wasm-unified": "^1.0.0",
+    "@ruvector/ruvllm": "^2.3.0",
+    "commander": "^12.0.0",
+    "chalk": "^4.1.2",
+    "ora": "^5.4.1",
+    "inquirer": "^9.2.12",
+    "dotenv": "^16.3.1",
+    "zod": "^3.22.4",
+    "fastify": "^4.24.3",
+    "@fastify/cors": "^8.4.2",
+    "@fastify/rate-limit": "^9.0.1",
+    "pino": "^8.17.2",
+    "pino-pretty": "^10.3.1"
+  },
+  "optionalDependencies": {
+    "@slack/bolt": "^3.16.0",
+    "@slack/web-api": "^6.11.0",
+    "discord.js": "^14.14.1",
+    "better-sqlite3": "^9.2.2",
+    "ioredis": "^5.3.2",
+    "pg": "^8.11.3",
+    "mercurius": "^13.3.3",
+    "graphql": "^16.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.5",
+    "@types/better-sqlite3": "^7.6.8",
+    "@types/pg": "^8.10.9",
+    "@types/inquirer": "^9.0.7",
+    "@typescript-eslint/eslint-plugin": "^6.15.0",
+    "@typescript-eslint/parser": "^6.15.0",
+    "@vitest/coverage-v8": "^1.1.0",
+    "eslint": "^8.56.0",
+    "prettier": "^3.1.1",
+    "tsup": "^8.0.1",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3",
+    "vitest": "^1.1.0"
+  },
+  "peerDependencies": {
+    "@ruvector/postgres-cli": "^0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@ruvector/postgres-cli": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "ruvbot",
+    "ruvector",
+    "ai-assistant",
+    "chatbot",
+    "slack-bot",
+    "discord-bot",
+    "vector-memory",
+    "wasm-embeddings",
+    "self-learning",
+    "llm",
+    "conversational-ai",
+    "rag",
+    "semantic-search",
+    "skills",
+    "agent",
+    "ai",
+    "machine-learning"
+  ],
+  "author": {
+    "name": "rUv",
+    "url": "https://github.com/ruvnet"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ruvnet/ruvector.git",
+    "directory": "npm/packages/ruvbot"
+  },
+  "homepage": "https://github.com/ruvnet/ruvector/tree/main/npm/packages/ruvbot#readme",
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/ruvnet"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
