@@ -73,3 +73,20 @@ export interface EmbeddingProvider {
   dimensions(): number;
   model(): string;
 }
+
+// Provider implementations
+export {
+  AnthropicProvider,
+  createAnthropicProvider,
+  type AnthropicConfig,
+  type AnthropicModel,
+} from './AnthropicProvider.js';
+
+export {
+  OpenRouterProvider,
+  createOpenRouterProvider,
+  createQwQProvider,
+  createDeepSeekR1Provider,
+  type OpenRouterConfig,
+  type OpenRouterModel,
+} from './OpenRouterProvider.js';
