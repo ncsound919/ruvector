@@ -5,6 +5,9 @@
   "main": "dist/index.js",
   "module": "dist/esm/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "ruvbot": "./bin/ruvbot.js"
+  },
   "exports": {
     ".": {
       "import": {
@@ -117,6 +120,8 @@
   },
   "files": [
     "dist",
+    "bin",
+    ".env.example",
     "README.md"
   ]
 }
