@@ -132,6 +132,49 @@ Forward Pass:
 - **MicroLoRA**: Rank 1-2 adapters with <1ms adaptation (compatible with BitNet)
 - **SONA**: Three-tier learning (instant/background/deep) — can drive ternary adapter training
 
+### RuvLLM RLM Training Stack (Reusable for Distillation)
+
+RuvLLM contains a mature reinforcement-learning-from-model-feedback (RLM) training stack that directly accelerates Craftsman Ultra distillation. These components are production-tested and reduce net-new code by ~70%.
+
+**GRPO — Group Relative Policy Optimization** (`training/grpo.rs`, 897 lines)
+- Critic-free RL: computes relative advantages within sample groups
+- Adaptive KL divergence penalty (`kl_target`, `clip_range`) controls teacher-student divergence
+- PPO-style clipping prevents catastrophic updates
+- Preset configs: `GrpoConfig::stable()` (safe distillation), `GrpoConfig::for_tool_use()` (expert routing)
+- Thread-safe batch processing via `RwLock<VecDeque<SampleGroup>>`
+
+**RealContrastiveTrainer** (`training/real_trainer.rs`, 1000 lines)
+- Candle-based training loop with GGUF model loading and GGUF weight export
+- Combined loss: Triplet (margin) + InfoNCE (contrastive) + GRPO reward scaling
+- AdamW optimizer with gradient clipping, LR warmup, checkpointing
+- `GrpoEvaluator` computes per-prediction rewards (1.0 correct, -0.5 wrong)
+- Metal/CUDA acceleration via Candle device dispatch
+
+**MicroLoRA + EWC++ Training Pipeline** (`lora/training.rs`, 798 lines)
+- Single-example gradient computation (batch_size=1 for real-time)
+- EWC++ regularizer: `λ/2 * Σ F_i * (w_i - w*_i)²` prevents catastrophic forgetting
+- Fisher diagonal tracking with exponential decay (`fisher_decay: 0.999`)
+- 7 learning rate schedules (Cosine, OneCycle, Step, etc.)
+- Async adaptation with buffered gradient accumulation
+
+**Memory Distillation** (`reasoning_bank/distillation.rs`, 856 lines)
+- Compresses trajectories to `KeyLesson` objects with semantic embeddings
+- Smart extraction: explicit lessons, implicit patterns, error patterns, recovery patterns
+- Semantic deduplication (Jaccard + cosine similarity, threshold 0.85)
+- Quality-gated: only trajectories above `min_quality_threshold` are preserved
+
+**Policy Store** (`policy_store.rs`, 474 lines)
+- Ruvector-backed semantic policy persistence with HNSW indexing
+- Policy types: `Quantization`, `Router`, `Ewc`, `Pattern`
+- Per-layer `QuantizationPolicy` with precision, activation thresholds, quality-latency tradeoff
+- Policy source tracking: `InstantLoop`, `BackgroundLoop`, `DeepLoop`, `Federated`
+
+**Contrastive Training** (`training/contrastive.rs`, 634 lines)
+- Two-stage: Triplet Loss (margin=0.5) + InfoNCE (temperature=0.07)
+- 13 agent types with 1,078 training triplets (578 base + 500 hard negatives)
+- Hard negative mining at 48.4% ratio (Claude-generated confusing pairs)
+- Proven 100% routing accuracy with hybrid keyword-first + embedding fallback
+
 ---
 
 ## Considered Options
@@ -183,43 +226,63 @@ Train Craftsman Ultra 30b 1bit from scratch using BitNet b1.58 methodology on th
 
 **Verdict: Recommended long-term** — Highest quality but requires significant investment.
 
-### Option C: Hybrid Approach — BitNet Distillation from GLM-4.7-Flash
+### Option C: Hybrid Approach — BitNet Distillation from GLM-4.7-Flash (RLM-Accelerated)
 
-Use knowledge distillation to transfer GLM-4.7-Flash capabilities into a BitNet architecture, reducing training cost by 5-10x.
+Use knowledge distillation to transfer GLM-4.7-Flash capabilities into a BitNet architecture, reducing training cost by 5-10x. **Leverages the existing RLM training stack** to eliminate ~70% of net-new training code.
 
 **Approach:**
 1. Initialize Craftsman Ultra with GLM-4.7-Flash architecture (30B-A3B MoE)
 2. Replace all expert linear layers with BitLinear (ternary {-1, 0, +1})
 3. Keep router, embeddings, LM head in FP16
-4. Distill from GLM-4.7-Flash teacher for 500B-1T tokens
-5. Fine-tune with BitNet-specific straight-through estimator
-6. Export to GGUF with ternary tensor metadata and TL1/TL2 kernel hints
+4. **Extend `RealContrastiveTrainer`** with KD loss (KL div + hard-label CE) replacing triplet+InfoNCE
+5. **Use `GrpoOptimizer`** for per-expert quality rewards during distillation — each `SampleGroup` maps to one expert's teacher vs student outputs
+6. **Apply `EwcRegularizer`** across distillation phases to prevent early-trained experts from being overwritten
+7. **Log distillation trajectories** to `MemoryDistiller` for quality tracking and `KeyLesson` extraction
+8. **Persist per-layer ternary policies** via `PolicyStore` (quantization thresholds, scale distributions)
+9. Export to GGUF with ternary tensor metadata and TL1/TL2 kernel hints via existing `GgufExportResult`
+
+**RLM Component Reuse:**
+
+| Existing Component | Reuse | Adaptation Needed |
+|-------------------|-------|-------------------|
+| `RealContrastiveTrainer` | Training loop, GGUF export, checkpointing | Replace triplet+InfoNCE with KD loss |
+| `GrpoOptimizer` | Reward scaling, adaptive KL, PPO clipping | Map `SampleGroup` to per-expert outputs |
+| `EwcRegularizer` | Fisher diagonal, forgetting prevention | Apply across expert distillation phases |
+| `MemoryDistiller` | Trajectory compression, lesson extraction | Map `Verdict` to teacher-student quality delta |
+| `PolicyStore` | Semantic policy persistence | Add `PolicyType::TernaryScale` for per-block absmean tracking |
+| `ContrastiveTrainer` | Hard negative mining framework | Reuse for expert-routing contrastive pre-training |
 
 **Pros:**
 - 5-10x less compute than training from scratch (~800-1,600 A100-hours)
+- **~70% existing code reuse** — only BitLinear forward/backward and MoE data loading are net-new
 - Leverages GLM-4.7-Flash's proven architecture and routing
+- GRPO's adaptive KL prevents ternary student from diverging too far from teacher
+- EWC++ ensures sequential expert distillation doesn't corrupt earlier experts
 - Teacher model provides strong supervision signal for ternary convergence
 - Can incrementally improve with more distillation tokens
-- Compatible with RuvLLM's existing MoE routing infrastructure
+- `PolicyStore` enables learned per-layer quantization decisions
+- Distillation quality tracked end-to-end via `MemoryDistiller` trajectory logging
 
 **Cons:**
 - Slight quality gap vs native training (estimated 2-5% on benchmarks)
-- Still requires custom BitLinear + MoE distillation framework
+- `RealContrastiveTrainer` embedding_dim (896) must scale to GLM-4.7-Flash hidden_size
 - Teacher inference cost during distillation
 - Distillation may not perfectly transfer MoE routing behavior
 
-**Verdict: Recommended near-term** — Best balance of quality, cost, and timeline.
+**Verdict: Recommended near-term** — Best balance of quality, cost, and timeline. RLM reuse eliminates the "custom framework" risk.
 
-### Option D: BitNet Expert Replacement (Incremental)
+### Option D: BitNet Expert Replacement (Incremental, RLM-Accelerated)
 
-Keep GLM-4.7-Flash structure but replace only the expert MLP layers with BitLinear, leaving attention in FP16.
+Keep GLM-4.7-Flash structure but replace only the expert MLP layers with BitLinear, leaving attention in FP16. **Reuses existing RLM stack for the entire distillation loop.**
 
 **Approach:**
 1. Load GLM-4.7-Flash architecture
 2. Replace expert FFN layers (gate_proj, up_proj, down_proj) with BitLinear
 3. Keep attention (Q/K/V/O projections) in FP16
-4. Distill expert weights from teacher (shorter schedule, ~200B tokens)
-5. Attention weights loaded directly from GLM-4.7-Flash (no distillation needed)
+4. **Use `RealContrastiveTrainer` + `GrpoOptimizer`** for expert-only distillation (~200B tokens)
+5. **Apply `EwcRegularizer`** to prevent expert N+1 distillation from corrupting expert N
+6. Attention weights loaded directly from GLM-4.7-Flash (no distillation needed)
+7. **Use contrastive pre-training** to validate MoE routing still selects correct experts after ternary conversion
 
 **Pros:**
 - Fastest path to working model
@@ -227,13 +290,14 @@ Keep GLM-4.7-Flash structure but replace only the expert MLP layers with BitLine
 - Expert FFN is 60-70% of active parameters — gets most BitNet benefits
 - Simpler distillation (only FFN layers)
 - Lower memory: ~5.5 GB for ternary experts + FP16 attention
+- **Minimal net-new code**: BitLinear layer + GGUF ternary type only; training loop is 100% reused
 
 **Cons:**
 - Attention layers still require FP multiply (not fully multiplication-free)
 - Mixed-precision inference path complexity
 - ~40% of compute still in FP16 attention
 
-**Verdict: Recommended as Phase 1** — Enables rapid prototyping and validation.
+**Verdict: Recommended as Phase 1** — Enables rapid prototyping and validation. RLM reuse makes this achievable with only ~30% new code.
 
 ---
 
@@ -459,6 +523,204 @@ pub fn select_kernel(caps: &HardwareCaps) -> BitNetKernel {
 
 **Integration**: Leverages RuvLLM's existing `autodetect.rs` hardware capability detection module.
 
+### AD-11: GRPO-Guided Distillation Loss
+
+**Decision**: Use `GrpoOptimizer` to compute per-expert reward scaling during knowledge distillation, replacing a traditional fixed-weight KD loss.
+
+**Rationale**: Standard KD uses a static `alpha` to blend KL divergence and hard-label cross-entropy. GRPO adds a dynamic reward signal that upweights expert-student pairs where ternary output closely matches the teacher, and downweights divergent pairs. This is achieved by mapping each expert's teacher-vs-student output comparison to a `SampleGroup`:
+
+```
+Combined Loss = KD_base + GRPO_scale
+Where:
+  KD_base  = α * KL(teacher_logits/T, student_logits/T)
+           + (1-α) * CE(labels, student_logits)
+  GRPO_scale = (1 + reward * 0.1)
+
+  reward = GrpoEvaluator.evaluate(student_expert_output, teacher_expert_output)
+         → 1.0 when cosine_sim > 0.95
+         → -0.5 when cosine_sim < 0.7
+```
+
+**Key configuration** (extending `GrpoConfig::stable()`):
+```rust
+GrpoConfig {
+    group_size: num_experts,        // One group per MoE layer
+    learning_rate: 1e-6,            // Conservative for distillation
+    kl_coefficient: 0.1,            // Tight teacher adherence
+    kl_target: 0.02,                // Low divergence target
+    clip_range: 0.1,                // Narrow clipping for stability
+    normalize_advantages: true,     // Normalize across experts in group
+    adaptive_kl: true,              // Auto-adjust KL penalty
+    ..GrpoConfig::stable()
+}
+```
+
+**Reused**: `GrpoOptimizer`, `GrpoConfig`, `SampleGroup`, `GrpoEvaluator` from `training/grpo.rs`.
+**New**: `BitNetGrpoAdapter` that maps expert forward pass outputs to `GrpoSample` structs.
+
+### AD-12: Contrastive Pre-Training for Expert Routing Validation
+
+**Decision**: After ternary conversion of expert weights, use the existing `ContrastiveTrainer` to verify that MoE routing still selects the correct experts.
+
+**Rationale**: Replacing expert FFN weights with ternary approximations changes the output distribution of each expert. If expert N's ternary output becomes more similar to expert M's output, the router may misroute tokens. Contrastive pre-training on expert embeddings detects and corrects this.
+
+**Approach**:
+1. For each token in a calibration set, record which expert the teacher model's router selects
+2. Generate `TrainingTriplet`s: anchor = hidden state, positive = correct expert output, negative = wrong expert output
+3. Use existing hard negative mining to find expert pairs that become confusable after ternary conversion
+4. Fine-tune the FP16 router gating weights using contrastive loss to restore correct expert selection
+
+**Reused**: `ContrastiveTrainer`, `ContrastiveConfig`, `TrainingTriplet` from `training/contrastive.rs`.
+**New**: `ExpertTripletGenerator` that produces triplets from MoE routing decisions.
+
+### AD-13: EWC++ Cross-Expert Stability During Sequential Distillation
+
+**Decision**: Apply `EwcRegularizer` from `lora/training.rs` during sequential expert distillation to prevent catastrophic forgetting across experts.
+
+**Rationale**: Distilling 30B MoE experts sequentially (expert 0, then 1, ..., then N) risks overwriting shared representations. EWC++ computes Fisher information diagonals for each expert's contribution to the shared attention layers, then regularizes subsequent expert distillation to not deviate from previously-learned important weights.
+
+**Configuration**:
+```rust
+TrainingConfig {
+    ewc_lambda: 5000.0,           // Higher than default (2000) for cross-expert stability
+    fisher_decay: 0.995,           // Slower decay to preserve Fisher across expert phases
+    quality_threshold: 0.5,        // Only learn from high-quality distillation samples
+    lr_schedule: LearningRateSchedule::Cosine,
+    warmup_steps: 500,             // Longer warmup for 30B scale
+    ..Default::default()
+}
+```
+
+**Concrete protection**:
+- After distilling expert 0: compute Fisher diagonal `F_0` over validation set
+- When distilling expert 1: add penalty `ewc_lambda/2 * Σ F_0_i * (w_i - w*_0_i)²`
+- Accumulate: `F_cumulative = fisher_decay * F_prev + (1-fisher_decay) * F_new`
+
+**Reused**: `EwcRegularizer`, `TrainingPipeline`, `TrainingConfig`, `FisherDiagonal` from `lora/training.rs`.
+**New**: `SequentialExpertDistiller` that wraps `EwcRegularizer` across expert phases.
+
+### AD-14: Policy Store for Per-Layer Ternary Scale Tracking
+
+**Decision**: Extend `PolicyStore` with a new `PolicyType::TernaryScale` to persist per-block absmean scale distributions and learned quantization decisions.
+
+**Rationale**: Not all layers quantize equally well to ternary. Attention layers may need different scale clipping than FFN layers. The policy store enables the distillation pipeline to learn and persist per-layer quantization strategies that can be retrieved and applied in future distillation runs or model updates.
+
+**New policy type**:
+```rust
+pub enum PolicyType {
+    Quantization,
+    Router,
+    Ewc,
+    Pattern,
+    TernaryScale,      // NEW: Per-layer ternary quantization metadata
+}
+
+pub struct TernaryScalePolicy {
+    pub layer_idx: usize,
+    pub module: String,              // "gate_proj", "up_proj", "down_proj", "q_proj", etc.
+    pub mean_absmean: f32,           // Average scale factor across blocks
+    pub std_absmean: f32,            // Variance in scale factors
+    pub sparsity: f32,               // Fraction of zero weights
+    pub quality_vs_teacher: f32,     // Cosine similarity to teacher output
+    pub distillation_loss: f32,      // Final loss for this layer
+    pub recommended_block_size: usize, // 256 default, may vary
+}
+```
+
+**Reused**: `PolicyStore`, `PolicyEntry`, `PolicySource` from `policy_store.rs`.
+**New**: `TernaryScalePolicy` struct and `PolicyType::TernaryScale` variant.
+
+### AD-15: Memory Distillation for Training Quality Tracking
+
+**Decision**: Log all distillation teacher-student comparisons as `Trajectory` objects in the `ReasoningBank`, enabling `MemoryDistiller` to extract `KeyLesson`s about which layers, experts, and configurations produce the best ternary quality.
+
+**Rationale**: Distillation is iterative — understanding which experts converge quickly, which resist ternary conversion, and what scale distributions correlate with quality enables intelligent scheduling of future distillation runs.
+
+**Mapping**:
+
+| ReasoningBank Concept | Distillation Mapping |
+|----------------------|---------------------|
+| `Trajectory` | One expert's distillation run (N steps) |
+| `Verdict` | `Success` if cosine_sim > 0.9, `Failure` if < 0.7 |
+| `PatternCategory` | Expert index + layer type (e.g., "expert_3_gate_proj") |
+| `KeyLesson` | "Expert 7 gate_proj converges fastest with lr=2e-6 and block_size=128" |
+| `CompressedTrajectory` | Summary of entire expert distillation phase |
+
+**Reused**: `MemoryDistiller`, `DistillationConfig`, `CompressedTrajectory`, `KeyLesson` from `reasoning_bank/distillation.rs`.
+**New**: `DistillationTrajectoryRecorder` that adapts expert training steps to `Trajectory` format.
+
+### AD-16: Distillation Pipeline Composition
+
+**Decision**: Compose the full Craftsman Ultra distillation pipeline from existing RLM components wired through a new `CraftsmanDistiller` orchestrator.
+
+**Pipeline architecture**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  CraftsmanDistiller (NEW orchestrator)           │
+│                                                                 │
+│  ┌───────────────┐    ┌──────────────────┐    ┌──────────────┐ │
+│  │ TeacherModel  │───▶│BitLinearTrainer   │───▶│ GGUFExporter │ │
+│  │(GLM-4.7-Flash)│    │(NEW: STE+shadow)  │    │(REUSED)      │ │
+│  └───────┬───────┘    └────────┬─────────┘    └──────────────┘ │
+│          │                     │                                │
+│          │   ┌─────────────────┼─────────────────┐              │
+│          │   │                 │                  │              │
+│          ▼   ▼                 ▼                  ▼              │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────┐    │
+│  │GrpoOptimizer │   │EwcRegularizer│   │ContrastiveTrainer│    │
+│  │(REUSED)      │   │(REUSED)      │   │(REUSED)          │    │
+│  │Per-expert    │   │Cross-expert  │   │Router validation │    │
+│  │reward scaling│   │stability     │   │post-ternary      │    │
+│  └──────┬───────┘   └──────┬───────┘   └────────┬─────────┘    │
+│         │                  │                     │              │
+│         ▼                  ▼                     ▼              │
+│  ┌──────────────────────────────────────────────────────┐      │
+│  │              Quality Feedback Loop                    │      │
+│  │                                                       │      │
+│  │  MemoryDistiller ──▶ KeyLesson extraction             │      │
+│  │  PolicyStore    ──▶ TernaryScale persistence          │      │
+│  │  (BOTH REUSED)                                        │      │
+│  └──────────────────────────────────────────────────────┘      │
+└─────────────────────────────────────────────────────────────────┘
+
+Net-new code:  BitLinearTrainer (STE + shadow weights), CraftsmanDistiller (orchestrator)
+Reused code:   GrpoOptimizer, EwcRegularizer, ContrastiveTrainer, MemoryDistiller,
+               PolicyStore, GGUFExporter, TrainingConfig, LR schedules
+Reuse ratio:   ~70% existing / ~30% new
+```
+
+**Optimization: Expert-Parallel Distillation**
+
+Experts are independent during forward pass. Distill multiple experts concurrently across CPU cores:
+
+```rust
+// Distill experts in parallel (independent FFN weights)
+let expert_results: Vec<DistillResult> = experts
+    .par_iter()                          // rayon parallel iterator
+    .enumerate()
+    .map(|(idx, expert)| {
+        let mut trainer = BitLinearTrainer::new(expert, &teacher_expert[idx]);
+        let mut ewc = EwcRegularizer::new_with_fisher(cumulative_fisher[idx]);
+        let mut grpo = GrpoOptimizer::new(GrpoConfig::stable());
+
+        for batch in dataset.batches() {
+            let student_out = trainer.forward_ternary(batch);
+            let teacher_out = teacher.forward_expert(idx, batch);
+
+            let reward = grpo.evaluate(&student_out, &teacher_out);
+            let kd_loss = kd_loss_fn(&student_out, &teacher_out, alpha, temperature);
+            let ewc_penalty = ewc.penalty(&trainer.shadow_weights());
+            let total_loss = kd_loss * reward.scale() + ewc_penalty;
+
+            trainer.backward_ste(total_loss);
+        }
+
+        ewc.update_fisher(&trainer);      // Update Fisher for next expert
+        DistillResult { idx, weights: trainer.export_ternary(), fisher: ewc.fisher() }
+    })
+    .collect();
+```
+
 ---
 
 ## Consequences
@@ -472,6 +734,11 @@ pub fn select_kernel(caps: &HardwareCaps) -> BitNetKernel {
 5. **SONA compatibility**: MicroLoRA adaptation preserves per-session learning
 6. **GGUF ecosystem**: Compatible with existing model distribution infrastructure
 7. **Incremental path**: Phase 1 delivers value quickly; Phases 2-3 improve quality
+8. **~70% RLM code reuse**: GRPO, EWC++, ContrastiveTrainer, MemoryDistiller, PolicyStore are production-tested — only BitLinear layer and orchestrator are net-new
+9. **Adaptive distillation**: GRPO reward scaling dynamically focuses compute on hard-to-distill experts
+10. **Cross-expert stability**: EWC++ Fisher diagonal prevents catastrophic forgetting during sequential expert distillation
+11. **Learned quantization policies**: PolicyStore persists per-layer ternary scale distributions for reproducible future distillation runs
+12. **Expert-parallel distillation**: Independent expert FFNs enable rayon-parallel distillation across CPU cores
 
 ### Negative
 
@@ -481,16 +748,20 @@ pub fn select_kernel(caps: &HardwareCaps) -> BitNetKernel {
 4. **No GPU acceleration**: BitNet kernels are CPU-specific; GPU path requires separate optimization
 5. **Mixed-precision complexity**: Router (FP16) + experts (ternary) + attention (FP16/ternary) adds dispatch complexity
 6. **WASM limitation**: Ternary lookup table kernels may not translate efficiently to WASM SIMD
+7. **RLM scale gap**: Existing `RealContrastiveTrainer` targets 0.5B models (embedding_dim=896); scaling to 30B requires distributed data loading and increased batch sizes
 
 ### Risks
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| MoE routing degrades with ternary experts | Medium | High | Phase 1 validates routing; router stays FP16 |
+| MoE routing degrades with ternary experts | Medium | High | Phase 1 validates routing; router stays FP16; AD-12 contrastive validation |
 | bitnet.cpp kernel translation to Rust introduces bugs | Medium | Medium | Extensive kernel unit tests; validate against reference impl |
-| Distillation fails to converge for MoE | Low | High | Fall back to per-expert distillation; ablation studies |
+| Distillation fails to converge for MoE | Low | High | GRPO reward scaling + per-expert distillation fallback; EWC++ stability (AD-13) |
 | GLM-4.7-Flash architecture changes break compatibility | Low | Medium | Pin to specific HF revision; architecture abstraction layer |
 | IQ1_S GGUF format insufficient for absmean metadata | Medium | Low | Register custom GGUF type; backward-compatible extension |
+| EWC++ Fisher accumulation OOM at 30B scale | Medium | Medium | Sparse Fisher (top-k diagonal entries); per-expert rather than global Fisher |
+| GRPO reward signal too noisy for distillation | Low | Low | Fall back to static KD loss; GRPO reward as optional multiplier |
+| `RealContrastiveTrainer` doesn't scale to 30B | Medium | Medium | Extract training loop; replace Candle Linear with BitLinear; keep optimizer/scheduler |
 
 ---
 
@@ -502,17 +773,24 @@ pub fn select_kernel(caps: &HardwareCaps) -> BitNetKernel {
 - [ ] Decode speed >= 5 tok/s on x86_64 AVX2 (AMD Ryzen 7 / Intel i7 class)
 - [ ] HumanEval pass@1 >= 50% (GLM-4.7-Flash baseline: ~65%)
 - [ ] Memory usage < 10GB for 4K context inference
+- [ ] GRPO-guided expert distillation converges (loss < 0.5 for all experts)
+- [ ] EWC++ prevents cross-expert interference (Fisher-regularized loss delta < 5%)
+- [ ] Contrastive router validation: >= 95% expert routing accuracy vs teacher
+- [ ] PolicyStore contains TernaryScale entries for all distilled expert layers
 
 ### Phase 2 Exit Criteria
 - [ ] Full ternary model (attention + experts) running on CPU
 - [ ] Decode speed >= 8 tok/s on x86_64 AVX2
 - [ ] SWE-bench Verified >= 52% (90%+ of GLM-4.7-Flash's 59.2%)
 - [ ] SONA MicroLoRA adaptation functional on ternary base
+- [ ] MemoryDistiller has extracted >= 50 KeyLessons from distillation trajectories
+- [ ] GRPO adaptive KL stabilizes below kl_target (0.02) for all experts
 
 ### Phase 3 Exit Criteria
 - [ ] Native-trained model matches or exceeds GLM-4.7-Flash benchmarks
 - [ ] Published on HuggingFace (ruv/craftsman-ultra-30b-1bit)
 - [ ] GGUF + bitnet kernel distributed via npm/packages/ruvllm
+- [ ] Full distillation pipeline reproducible from PolicyStore policies (no manual tuning)
 
 ---
 
@@ -527,3 +805,9 @@ pub fn select_kernel(caps: &HardwareCaps) -> BitNetKernel {
 7. RuvLLM ADR-002: RuvLLM Integration with Ruvector
 8. RuvLLM GGUF Quantization Module: `crates/ruvllm/src/gguf/quantization.rs`
 9. Microsoft, bitnet-b1.58-2B-4T-gguf — https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf
+10. RuvLLM GRPO Implementation: `crates/ruvllm/src/training/grpo.rs`
+11. RuvLLM RealContrastiveTrainer: `crates/ruvllm/src/training/real_trainer.rs`
+12. RuvLLM EWC++ Training Pipeline: `crates/ruvllm/src/lora/training.rs`
+13. RuvLLM Memory Distillation: `crates/ruvllm/src/reasoning_bank/distillation.rs`
+14. RuvLLM Policy Store: `crates/ruvllm/src/policy_store.rs`
+15. RuvLLM Contrastive Training: `crates/ruvllm/src/training/contrastive.rs`

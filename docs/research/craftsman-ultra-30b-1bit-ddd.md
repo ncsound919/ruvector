@@ -1,6 +1,6 @@
 # Domain-Driven Design: Craftsman Ultra 30b 1bit
 
-**Version:** 1.0
+**Version:** 2.0
 **Date:** 2026-02-03
 **Relates to:** ADR-017-craftsman-ultra-30b-1bit-bitnet-integration
 **Status:** Research / Pre-Implementation
@@ -33,6 +33,7 @@ The domain encompasses:
 | Quantization Pipeline | Supporting | BitLinear training/distillation, ternary conversion |
 | Kernel Dispatch | Supporting | Hardware detection, SIMD kernel selection |
 | Adaptation Layer | Supporting | SONA MicroLoRA on ternary base, EWC++ consolidation |
+| **RLM Training Orchestration** | **Supporting** | **GRPO rewards, contrastive validation, EWC++ stability, distillation quality tracking** |
 | Serving Integration | Generic | Backend trait, NAPI bindings, session management |
 
 ---
@@ -63,6 +64,17 @@ The following terms have precise meaning within the Craftsman Ultra domain. All 
 | **Mixed-Precision Forward** | A forward pass where different components use different precisions (FP16 router, ternary experts, Q8 activations). |
 | **Capacity Factor** | MoE parameter controlling maximum tokens per expert to prevent routing collapse. |
 | **Expert Parallelism** | Distributing different experts across different CPU cores for concurrent execution. |
+| **GRPO** | Group Relative Policy Optimization. Critic-free RL algorithm that computes advantages within sample groups, used to scale distillation loss per-expert. |
+| **SampleGroup** | A batch of teacher-vs-student comparisons for one expert, used by GRPO to compute relative advantages. |
+| **Relative Advantage** | Per-sample reward normalized against group mean: `(reward - mean) / std`. Drives GRPO update direction. |
+| **Adaptive KL** | Dynamic KL divergence penalty that increases when student diverges too far from teacher, decreases when converging. |
+| **EWC++ (Elastic Weight Consolidation)** | Continual learning regularizer: `lambda/2 * Sigma F_i * (w_i - w*_i)^2`. Prevents catastrophic forgetting during sequential expert distillation. |
+| **Fisher Diagonal** | Per-parameter importance weights computed from gradient magnitudes. Higher Fisher = more important to preserve. |
+| **KeyLesson** | Extracted insight from distillation trajectories (e.g., "Expert 7 gate_proj converges fastest with lr=2e-6"). Persisted in ReasoningBank. |
+| **TernaryScalePolicy** | Per-layer metadata (mean scale, sparsity, quality) persisted in PolicyStore to guide future distillation. |
+| **Contrastive Router Validation** | Post-ternary-conversion check that MoE routing still selects correct experts, using triplet loss on expert embeddings. |
+| **Knowledge Distillation Loss** | `alpha * KL(teacher/T, student/T) + (1-alpha) * CE(labels, student)`. Core training objective for ternary student. |
+| **Distillation Trajectory** | Sequence of training steps for one expert, recorded as ReasoningBank `Trajectory` for quality analysis. |
 
 ---
 
@@ -229,28 +241,35 @@ The following terms have precise meaning within the Craftsman Ultra domain. All 
 
 ### 3.4 Quantization Pipeline Context (Supporting)
 
-**Responsibility**: Convert full-precision weights to ternary format during training/distillation.
+**Responsibility**: Convert full-precision weights to ternary format during training/distillation. **Delegates training orchestration to the RLM Training Orchestration Context** (3.8), which provides GRPO rewards, EWC++ stability, and quality tracking.
 
 **Owns:**
 - Absmean quantization implementation
 - Straight-through estimator for backpropagation
 - Shadow weight management (FP16 ↔ ternary)
-- Distillation loss computation (teacher vs student)
 - GGUF export with ternary tensor metadata
 - Calibration dataset management
 
+**Delegates to RLM Training (3.8):**
+- Distillation loss computation with GRPO reward scaling
+- Cross-expert stability via EWC++ regularization
+- Router validation via contrastive training
+- Distillation quality tracking via MemoryDistiller
+- Per-layer policy persistence via PolicyStore
+
 **Key Entities:**
-- `DistillationPipeline` — End-to-end teacher→student training loop
-- `BitLinearTrainer` — BitLinear layer with shadow weights and STE
-- `AbsmeanQuantizer` — Converts FP16 block → ternary + scale
-- `TeacherModel` — FP16 GLM-4.7-Flash reference model
-- `CalibrationDataset` — Token sequences for quantization calibration
+- `BitLinearTrainer` — BitLinear layer with shadow weights and STE (NEW)
+- `AbsmeanQuantizer` — Converts FP16 block → ternary + scale (NEW)
+- `TeacherModel` — FP16 GLM-4.7-Flash reference model (NEW)
+- `CalibrationDataset` — Token sequences for quantization calibration (NEW)
+- `GrpoOptimizer` — Per-expert reward scaling (REUSED from `training/grpo.rs`)
+- `EwcRegularizer` — Cross-expert forgetting prevention (REUSED from `lora/training.rs`)
 
 **Invariants:**
 - Shadow weights are FP16 throughout training (never accumulated in ternary)
 - Quantization is deterministic: same FP16 input → same ternary output
 - Teacher model is frozen during distillation (no gradient updates)
-- Distillation loss includes both KL divergence and hard-label cross-entropy
+- Distillation loss = KD_base * GRPO_scale + EWC_penalty (see ADR-017 AD-11, AD-13)
 
 **Interfaces:**
 - **Inbound**: Teacher model weights + training dataset
@@ -398,6 +417,95 @@ The following terms have precise meaning within the Craftsman Ultra domain. All 
 - **Inbound**: RuvLLM backend dispatcher, NAPI calls from Node.js
 - **Outbound**: Generated tokens, embeddings, model metadata
 - **Downstream**: Orchestrates all other contexts for end-to-end inference
+
+---
+
+### 3.8 RLM Training Orchestration Context (Supporting — Reused)
+
+**Responsibility**: Orchestrate GRPO-guided distillation, contrastive router validation, EWC++ cross-expert stability, and distillation quality tracking using the existing RuvLLM RLM stack.
+
+**This context is ~70% composed of existing production-tested code.** Only the `CraftsmanDistiller` orchestrator and `BitLinearTrainer` are net-new.
+
+**Owns:**
+- GRPO per-expert reward computation during distillation
+- Contrastive router validation after ternary expert conversion
+- EWC++ Fisher diagonal management across sequential expert phases
+- Distillation trajectory recording in ReasoningBank
+- Per-layer TernaryScale policy persistence in PolicyStore
+- Expert-parallel distillation scheduling
+
+**Key Entities (REUSED from existing crates):**
+
+| Entity | Source File | Role in Craftsman Ultra |
+|--------|-----------|------------------------|
+| `GrpoOptimizer` | `training/grpo.rs` | Compute per-expert reward scaling during KD |
+| `GrpoConfig` | `training/grpo.rs` | Configure adaptive KL, clip range, group size |
+| `SampleGroup` | `training/grpo.rs` | Map one expert's teacher-vs-student outputs |
+| `GrpoEvaluator` | `training/real_trainer.rs` | Score ternary student against FP16 teacher |
+| `EwcRegularizer` | `lora/training.rs` | Prevent cross-expert weight interference |
+| `TrainingPipeline` | `lora/training.rs` | LR scheduling, gradient accumulation |
+| `ContrastiveTrainer` | `training/contrastive.rs` | Validate MoE routing post-ternary conversion |
+| `TrainingTriplet` | `training/contrastive.rs` | Expert routing triplets (anchor/pos/neg) |
+| `MemoryDistiller` | `reasoning_bank/distillation.rs` | Extract KeyLessons from distillation runs |
+| `KeyLesson` | `reasoning_bank/distillation.rs` | Persist distillation insights |
+| `PolicyStore` | `policy_store.rs` | Persist TernaryScale policies per layer |
+| `RealTrainingConfig` | `training/real_trainer.rs` | Training hyperparameters + GGUF export config |
+
+**Key Entities (NEW):**
+
+| Entity | Role |
+|--------|------|
+| `CraftsmanDistiller` | Top-level orchestrator wiring GRPO + EWC + Contrastive + KD |
+| `BitLinearTrainer` | BitLinear layer with shadow weights + straight-through estimator |
+| `ExpertTripletGenerator` | Produces contrastive triplets from MoE routing decisions |
+| `DistillationTrajectoryRecorder` | Adapts training steps to ReasoningBank `Trajectory` format |
+| `TernaryScalePolicy` | Per-layer ternary metadata for PolicyStore |
+| `SequentialExpertDistiller` | EWC-regularized sequential expert distillation loop |
+
+**Invariants:**
+- GRPO reward never overrides KD loss — it scales the loss multiplicatively (1 + reward * 0.1)
+- EWC Fisher diagonals are accumulated, not replaced, across expert phases
+- Contrastive router validation runs after each expert batch, not after each step
+- PolicyStore entries are immutable once written (append-only per distillation run)
+- Teacher model weights are frozen throughout (no gradient updates to teacher)
+
+**Interfaces:**
+- **Inbound**: Teacher model (GLM-4.7-Flash), training dataset, target architecture config
+- **Outbound**: Trained ternary GGUF weights, TernaryScale policies, KeyLessons
+- **Upstream**: Consumes from Quantization Pipeline (BitLinear training) and feeds Model Lifecycle (GGUF export)
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│          RLM Training Orchestration Context                  │
+│                                                              │
+│  ┌───────────────────────────────────────────────────┐       │
+│  │         CraftsmanDistiller (NEW orchestrator)     │       │
+│  └───────────┬────────────┬──────────────┬───────────┘       │
+│              │            │              │                    │
+│    ┌─────────▼───┐  ┌────▼────────┐  ┌──▼─────────────┐     │
+│    │GrpoOptimizer│  │EwcRegularizer│  │ContrastiveTrainer│    │
+│    │(REUSED)     │  │(REUSED)     │  │(REUSED)        │     │
+│    │Per-expert   │  │Cross-expert │  │Router          │     │
+│    │rewards      │  │stability    │  │validation      │     │
+│    └──────┬──────┘  └──────┬──────┘  └────────┬───────┘     │
+│           │                │                   │             │
+│    ┌──────▼────────────────▼───────────────────▼──────┐      │
+│    │         BitLinearTrainer (NEW)                    │      │
+│    │    Shadow weights + STE + KD loss + GRPO scale   │      │
+│    └──────────────────────┬───────────────────────────┘      │
+│                           │                                  │
+│    ┌──────────────┐  ┌────▼──────────┐  ┌──────────────┐    │
+│    │MemoryDistiller│  │ PolicyStore  │  │ GGUFExporter │    │
+│    │(REUSED)      │  │(REUSED)      │  │(REUSED)      │    │
+│    │KeyLessons    │  │TernaryScale  │  │Ternary GGUF  │    │
+│    └──────────────┘  └──────────────┘  └──────────────┘    │
+│                                                              │
+│  Legend:  (REUSED) = existing production code, no changes    │
+│           (NEW)    = net-new code for Craftsman Ultra        │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Reuse ratio**: ~70% existing / ~30% new
 
 ---
 
@@ -558,38 +666,45 @@ Since w ∈ {-1, 0, +1}, this becomes addition/subtraction only.
 ## 5. Context Map (Inter-Context Relationships)
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                                                         │
-│    ┌──────────────┐         ┌──────────────────┐        │
-│    │   Kernel     │────────▶│    Ternary       │        │
-│    │   Dispatch   │ kernel  │    Inference      │        │
-│    │   Context    │ config  │    Engine         │        │
-│    └──────────────┘         └────────┬─────────┘        │
-│                                      │                   │
-│    ┌──────────────┐         ┌───────▼──────────┐        │
-│    │  Model       │────────▶│     MoE          │        │
-│    │  Lifecycle   │ tensors │     Routing       │        │
-│    │  Context     │         │     Context       │        │
-│    └──────┬───────┘         └────────┬─────────┘        │
-│           │                          │                   │
-│    ┌──────▼───────┐         ┌───────▼──────────┐        │
-│    │Quantization  │         │   Adaptation     │        │
-│    │  Pipeline    │────────▶│     Layer         │        │
-│    │  Context     │ weights │   (SONA)          │        │
-│    └──────────────┘         └────────┬─────────┘        │
-│                                      │                   │
-│                             ┌───────▼──────────┐        │
-│                             │    Serving        │        │
-│                             │    Integration    │        │
-│                             │    Context        │        │
-│                             └──────────────────┘        │
-│                                                         │
-│  ──── Relationship Types ────                           │
-│  ────▶  Conformist (downstream conforms to upstream)    │
-│  ─ ─ ▶  Anti-Corruption Layer (translates at boundary)  │
-│  ══════  Shared Kernel (common types/interfaces)        │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                                                              │
+│    ┌──────────────┐         ┌──────────────────┐             │
+│    │   Kernel     │────────▶│    Ternary       │             │
+│    │   Dispatch   │ kernel  │    Inference      │             │
+│    │   Context    │ config  │    Engine         │             │
+│    └──────────────┘         └────────┬─────────┘             │
+│                                      │                        │
+│    ┌──────────────┐         ┌───────▼──────────┐             │
+│    │  Model       │────────▶│     MoE          │             │
+│    │  Lifecycle   │ tensors │     Routing       │             │
+│    │  Context     │         │     Context       │             │
+│    └──────┬───────┘         └────────┬─────────┘             │
+│           │                          │                        │
+│    ┌──────▼───────┐         ┌───────▼──────────┐             │
+│    │Quantization  │         │   Adaptation     │             │
+│    │  Pipeline    │────────▶│     Layer         │             │
+│    │  Context     │ weights │   (SONA)          │             │
+│    └──────┬───────┘         └────────┬─────────┘             │
+│           │                          │                        │
+│    ┌──────▼───────────────┐ ┌───────▼──────────┐             │
+│    │  RLM Training        │ │    Serving        │             │
+│    │  Orchestration       │ │    Integration    │             │
+│    │  Context             │ │    Context        │             │
+│    │                      │ └──────────────────┘             │
+│    │ ┌──────────────────┐ │                                  │
+│    │ │ GRPO    EWC++    │ │  ─── Reuse Boundary ───          │
+│    │ │ Contrastive      │ │  Components above the line       │
+│    │ │ MemoryDistiller  │ │  are ~70% REUSED from existing   │
+│    │ │ PolicyStore      │ │  RuvLLM RLM training stack       │
+│    │ └──────────────────┘ │                                  │
+│    └──────────────────────┘                                  │
+│                                                              │
+│  ──── Relationship Types ────                                │
+│  ────▶  Conformist (downstream conforms to upstream)         │
+│  ─ ─ ▶  Anti-Corruption Layer (translates at boundary)       │
+│  ══════  Shared Kernel (common types/interfaces)             │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### Relationship Details
@@ -603,6 +718,10 @@ Since w ∈ {-1, 0, +1}, this becomes addition/subtraction only.
 | MoE Routing | Serving Integration | Conformist | Forward pass API |
 | Adaptation Layer | Ternary Inference | ACL | FP16 deltas translated to output corrections |
 | Quantization Pipeline | Model Lifecycle | Conformist | GGUF export format |
+| **RLM Training** | **Quantization Pipeline** | **Shared Kernel** | **`BitLinearTrainer` drives `AbsmeanQuantizer`** |
+| **RLM Training** | **MoE Routing** | **ACL** | **`ContrastiveTrainer` validates router post-ternary** |
+| **RLM Training** | **Model Lifecycle** | **Conformist** | **GGUF export via `GgufExportResult`** |
+| **RLM Training** | **Adaptation Layer** | **Shared Kernel** | **`EwcRegularizer` shared for training + inference** |
 
 ### External System Integrations
 
@@ -610,10 +729,12 @@ Since w ∈ {-1, 0, +1}, this becomes addition/subtraction only.
 |----------------|-------------------|---------|
 | RuvLLM Backends | Serving Integration | `InferenceBackend` trait (published language) |
 | SONA Learning Loops | Adaptation Layer | Event-driven (quality feedback signals) |
-| Ruvector HNSW | Serving Integration | Pattern retrieval for routing optimization |
+| Ruvector HNSW | Serving Integration, RLM Training | Pattern retrieval for routing optimization + policy search |
 | HuggingFace Hub | Model Lifecycle | Model download/upload API |
 | Claude Flow | Serving Integration | Agent routing task delegation |
 | NAPI/Node.js | Serving Integration | FFI boundary (NAPI-RS bindings) |
+| **ReasoningBank** | **RLM Training** | **`Trajectory` recording + `KeyLesson` extraction** |
+| **PolicyStore** | **RLM Training** | **`TernaryScalePolicy` persistence + semantic retrieval** |
 
 ---
 
@@ -630,6 +751,13 @@ Events drive communication between bounded contexts without tight coupling.
 | `AdapterUpdated` | Adaptation Layer | Ternary Inference | layer_id, adapter_version |
 | `DistillationCheckpoint` | Quantization Pipeline | Model Lifecycle | epoch, loss, checkpoint_path |
 | `MemoryPressure` | Serving Integration | MoE Routing, Model Lifecycle | available_mb, action (evict/compact) |
+| `ExpertDistilled` | RLM Training | Model Lifecycle, PolicyStore | expert_idx, final_loss, fisher_diag, ternary_scale_stats |
+| `GrpoRewardComputed` | RLM Training | MemoryDistiller | sample_group_id, mean_reward, kl_divergence |
+| `RouterValidated` | RLM Training | MoE Routing | routing_accuracy, misrouted_expert_pairs[], triplet_loss |
+| `EwcFisherUpdated` | RLM Training | Adaptation Layer | expert_idx, fisher_top_k_indices, fisher_magnitude |
+| `KeyLessonExtracted` | RLM Training | PolicyStore | lesson_content, embedding, source_expert, quality_score |
+| `TernaryPolicyStored` | RLM Training | PolicyStore | layer_idx, module, mean_scale, sparsity, quality |
+| `DistillationPhaseComplete` | RLM Training | Model Lifecycle | phase (1/2/3), experts_distilled, total_loss, elapsed_hours |
 
 ---
 
@@ -678,10 +806,30 @@ crates/ruvllm/src/
 │
 ├── distillation/                    # NEW: Quantization Pipeline Context
 │   ├── mod.rs
-│   ├── pipeline.rs                  # DistillationPipeline
-│   ├── teacher.rs                   # TeacherModel wrapper
-│   ├── bit_linear_trainer.rs        # Shadow weights + STE
-│   └── gguf_export.rs              # GGUF ternary export
+│   ├── pipeline.rs                  # CraftsmanDistiller orchestrator (NEW)
+│   ├── teacher.rs                   # TeacherModel wrapper (NEW)
+│   ├── bit_linear_trainer.rs        # Shadow weights + STE (NEW)
+│   ├── expert_triplet_gen.rs        # Expert routing triplets (NEW)
+│   ├── trajectory_recorder.rs       # ReasoningBank adapter (NEW)
+│   ├── sequential_expert.rs         # EWC-regularized sequential loop (NEW)
+│   └── gguf_export.rs              # GGUF ternary export (extends REUSED GgufExportResult)
+│
+├── training/                        # EXISTING: RLM Training Stack (REUSED)
+│   ├── grpo.rs                      # REUSED: GrpoOptimizer, SampleGroup, GrpoConfig
+│   ├── contrastive.rs               # REUSED: ContrastiveTrainer, TrainingTriplet
+│   ├── real_trainer.rs              # REUSED: RealContrastiveTrainer, GrpoEvaluator
+│   ├── claude_dataset.rs            # REUSED: DatasetConfig, DatasetGenerator
+│   └── mod.rs                       # REUSED: module exports
+│
+├── lora/
+│   ├── training.rs                  # REUSED: EwcRegularizer, TrainingPipeline, LR schedules
+│   └── micro_lora.rs               # REUSED: MicroLoRA, AdaptFeedback
+│
+├── reasoning_bank/
+│   ├── distillation.rs              # REUSED: MemoryDistiller, KeyLesson, CompressedTrajectory
+│   └── ...
+│
+├── policy_store.rs                  # REUSED: PolicyStore + NEW PolicyType::TernaryScale
 │
 ├── gguf/
 │   ├── quantization.rs              # EXISTING: Add BITNET_T158 type
@@ -754,6 +902,12 @@ Assuming GLM-4.7-Flash architecture with ~3B active parameters per token:
 | Mixed-precision forward | Ternary + MoE + Serving | Output matches reference within tolerance |
 | Model load + inference | Lifecycle + Inference | Cold-start to first token <5s |
 | Adapter hot-swap | Adaptation + Inference | Zero downtime, correct output switch |
+| GRPO reward convergence | RLM Training + Quant Pipeline | Mean reward > 0.8 after 1000 steps per expert |
+| EWC cross-expert stability | RLM Training | Expert N+1 distillation doesn't increase expert N loss by > 5% |
+| Contrastive router validation | RLM Training + MoE Routing | Router accuracy >= 95% post-ternary conversion |
+| PolicyStore roundtrip | RLM Training + Model Lifecycle | TernaryScale policies stored and retrievable via semantic search |
+| KeyLesson extraction | RLM Training | >= 5 meaningful lessons extracted per distillation phase |
+| Full distillation pipeline | RLM Training + Quant + Lifecycle | End-to-end: teacher weights → ternary GGUF with policies |
 
 ### Benchmark Tests
 
@@ -792,25 +946,34 @@ All changes are additive. No existing backend, model, or API is modified. The `B
 
 ## 11. Open Questions
 
-| # | Question | Impact | Notes |
-|---|----------|--------|-------|
-| 1 | Exact expert count in GLM-4.7-Flash? | Architecture config | Need to inspect `config.json` from HF or wait for technical report |
-| 2 | MLA (Multi-head Latent Attention) compatibility with ternary? | Phase 2 design | MLA's compressed KV may conflict with ternary attention |
-| 3 | GLM-4.7-Flash tokenizer reuse or custom? | Model Lifecycle | Likely reuse GLM-4 tokenizer (151K vocab) |
-| 4 | Distillation compute budget approved? | Phase 1 timeline | 800-1600 A100-hours needed |
-| 5 | WASM target for ternary kernels? | Portability | LUT-based kernels may not map to WASM SIMD efficiently |
-| 6 | HuggingFace model name reservation? | Distribution | Reserve `ruv/craftsman-ultra-30b-1bit` |
-| 7 | BitNet patent/license status? | Legal | MIT license for bitnet.cpp; research papers are open |
-| 8 | Multi-Token Prediction (MTP) compat? | Speculative decoding | GLM-4.7-Flash uses MTP; unclear if ternary draft model works |
+| # | Question | Impact | Status | Notes |
+|---|----------|--------|--------|-------|
+| 1 | Exact expert count in GLM-4.7-Flash? | Architecture config | Open | Need to inspect `config.json` from HF or wait for technical report |
+| 2 | MLA (Multi-head Latent Attention) compatibility with ternary? | Phase 2 design | Open | MLA's compressed KV may conflict with ternary attention |
+| 3 | GLM-4.7-Flash tokenizer reuse or custom? | Model Lifecycle | Open | Likely reuse GLM-4 tokenizer (151K vocab) |
+| 4 | Distillation compute budget? | Phase 1 timeline | **Reduced** | RLM reuse reduces framework dev cost; compute still 800-1600 A100-hours but engineering effort ~70% less |
+| 5 | WASM target for ternary kernels? | Portability | Open | LUT-based kernels may not map to WASM SIMD efficiently |
+| 6 | HuggingFace model name reservation? | Distribution | Open | Reserve `ruv/craftsman-ultra-30b-1bit` |
+| 7 | BitNet patent/license status? | Legal | Open | MIT license for bitnet.cpp; research papers are open |
+| 8 | Multi-Token Prediction (MTP) compat? | Speculative decoding | Open | GLM-4.7-Flash uses MTP; unclear if ternary draft model works |
+| 9 | EWC++ Fisher OOM at 30B scale? | RLM Training | Open | May need sparse Fisher (top-k diagonal entries per expert) |
+| 10 | GRPO group_size = num_experts or per-layer? | RLM Training | Open | Per-layer groups provide finer reward signal but more compute |
+| 11 | Expert-parallel distillation rayon thread count? | RLM Training | Open | Balance CPU cores between rayon parallelism and ternary GEMM |
 
 ---
 
 ## 12. References
 
-- ADR-017: Craftsman Ultra 30b 1bit — BitNet Integration with RuvLLM
+- ADR-017: Craftsman Ultra 30b 1bit — BitNet Integration with RuvLLM (v2, with RLM integration)
 - ADR-002: RuvLLM Integration with Ruvector
 - Microsoft Research, "The Era of 1-bit LLMs" (arXiv:2402.17764)
 - Microsoft Research, "bitnet.cpp: Efficient Edge Inference for Ternary LLMs" (arXiv:2502.11880)
 - Zhipu AI, GLM-4.7-Flash (https://huggingface.co/zai-org/GLM-4.7-Flash)
 - Evans, Eric. "Domain-Driven Design: Tackling Complexity in the Heart of Software" (2003)
 - Vernon, Vaughn. "Implementing Domain-Driven Design" (2013)
+- RuvLLM GRPO Implementation: `crates/ruvllm/src/training/grpo.rs`
+- RuvLLM RealContrastiveTrainer: `crates/ruvllm/src/training/real_trainer.rs`
+- RuvLLM EWC++ Training Pipeline: `crates/ruvllm/src/lora/training.rs`
+- RuvLLM Memory Distillation: `crates/ruvllm/src/reasoning_bank/distillation.rs`
+- RuvLLM Policy Store: `crates/ruvllm/src/policy_store.rs`
+- RuvLLM Contrastive Training: `crates/ruvllm/src/training/contrastive.rs`
