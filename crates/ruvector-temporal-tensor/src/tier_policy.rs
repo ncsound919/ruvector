@@ -1,12 +1,12 @@
-/// Tier policy for access-pattern-driven bit-width selection.
-///
-/// Score = access_count * 1024 / (now_ts - last_access_ts + 1)
-///
-/// | Tier | Condition | Bits |
-/// |------|-----------|------|
-/// | Hot  | score >= hot_min_score | 8 |
-/// | Warm | score >= warm_min_score | warm_bits (7 or 5) |
-/// | Cold | otherwise | 3 |
+//! Tier policy for access-pattern-driven bit-width selection.
+//!
+//! Score = `access_count * 1024 / (now_ts - last_access_ts + 1)`
+//!
+//! | Tier | Condition | Bits |
+//! |------|-----------|------|
+//! | Hot  | score >= hot_min_score | 8 |
+//! | Warm | score >= warm_min_score | warm_bits (7 or 5) |
+//! | Cold | otherwise | 3 |
 
 #[derive(Clone, Copy, Debug)]
 pub struct TierPolicy {

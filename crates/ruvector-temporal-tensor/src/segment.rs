@@ -1,16 +1,22 @@
-/// Segment binary format: encode and decode.
-///
-/// Format:
-///   [magic:4][version:1][bits:1][group_len:4][tensor_len:4][frames:4]
-///   [scale_count:4][scales:2*S][data_len:4][data:D]
-///
-/// Magic: 0x43545154 ("TQTC" in LE)
+//! Segment binary format: encode and decode.
+//!
+//! Format (little-endian):
+//!
+//! ```text
+//! [magic:4][version:1][bits:1][group_len:4][tensor_len:4][frames:4]
+//! [scale_count:4][scales:2*S][data_len:4][data:D]
+//! ```
+//!
+//! Magic: `0x43545154` ("TQTC" in LE). Header is 26 bytes before scales.
 
 use crate::quantizer;
 
-pub const MAGIC: u32 = 0x4354_5154; // "TQTC"
+/// Segment magic number: `"TQTC"` in little-endian.
+pub const MAGIC: u32 = 0x4354_5154;
+/// Current segment format version.
 pub const VERSION: u8 = 1;
-pub const HEADER_SIZE: usize = 26; // Fixed header before scales
+/// Minimum valid segment size in bytes (header fields + data_len, no scales/data).
+pub const HEADER_SIZE: usize = 26;
 
 /// Encode a segment from metadata, scales, and packed data.
 pub fn encode(
@@ -40,6 +46,7 @@ pub fn encode(
     for &s in scales {
         out.extend_from_slice(&s.to_le_bytes());
     }
+
 
     // Data
     let data_len = data.len() as u32;
@@ -105,10 +112,11 @@ pub fn decode(segment: &[u8], out: &mut Vec<f32>) {
     }
     let data = &segment[off..off + data_len];
 
-    // Dequantize
-    quantizer::dequantize(
+    // Convert scales to f32 once, then dequantize via the optimized path
+    let scales_f32 = quantizer::scales_to_f32(&scales);
+    quantizer::dequantize_f32(
         data,
-        &scales,
+        &scales_f32,
         group_len as usize,
         bits,
         tensor_len as usize,
@@ -148,6 +156,80 @@ pub fn parse_header(segment: &[u8]) -> Option<SegmentHeader> {
     })
 }
 
+/// Compute the compression ratio for a segment: raw f32 bytes / segment bytes.
+///
+/// Returns `0.0` if the segment is empty or has no frames.
+pub fn compression_ratio(segment: &[u8]) -> f32 {
+    match parse_header(segment) {
+        Some(h) if h.frame_count > 0 => {
+            let raw = h.tensor_len as usize * h.frame_count as usize * 4;
+            raw as f32 / segment.len() as f32
+        }
+        _ => 0.0,
+    }
+}
+
+/// Decode a single frame by index from a segment.
+///
+/// Returns `None` if the segment is invalid or `frame_idx` is out of range.
+pub fn decode_single_frame(segment: &[u8], frame_idx: usize) -> Option<Vec<f32>> {
+    let header = parse_header(segment)?;
+    if frame_idx >= header.frame_count as usize {
+        return None;
+    }
+
+    // Skip past the fixed header fields (magic + version + bits + group_len +
+    // tensor_len + frame_count + scale_count = 4+1+1+4+4+4+4 = 22 bytes).
+    let mut off = 22usize;
+    let scale_count = header.scale_count as usize;
+
+    // Read scales
+    let scales_end = off + scale_count * 2;
+    if scales_end > segment.len() {
+        return None;
+    }
+    let mut scales_f16 = Vec::with_capacity(scale_count);
+    for _ in 0..scale_count {
+        scales_f16.push(read_u16_le(segment, &mut off));
+    }
+    let scales_f32 = quantizer::scales_to_f32(&scales_f16);
+
+    // Read data section
+    if off + 4 > segment.len() {
+        return None;
+    }
+    let data_len = read_u32_le(segment, &mut off) as usize;
+    if off + data_len > segment.len() {
+        return None;
+    }
+    let data = &segment[off..off + data_len];
+
+    // Compute byte offset for the requested frame
+    let tensor_len = header.tensor_len as usize;
+    let bits = header.bits;
+    let bits_per_frame = tensor_len * bits as usize;
+    let bytes_per_frame = bits_per_frame.div_ceil(8);
+
+    let frame_start = frame_idx * bytes_per_frame;
+    if frame_start + bytes_per_frame > data.len() {
+        return None;
+    }
+    let frame_data = &data[frame_start..frame_start + bytes_per_frame];
+
+    let mut out = Vec::new();
+    quantizer::dequantize_f32(
+        frame_data,
+        &scales_f32,
+        header.group_len as usize,
+        bits,
+        tensor_len,
+        1,
+        &mut out,
+    );
+    Some(out)
+}
+
+#[inline]
 fn read_u32_le(bytes: &[u8], offset: &mut usize) -> u32 {
     let o = *offset;
     let arr = [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];

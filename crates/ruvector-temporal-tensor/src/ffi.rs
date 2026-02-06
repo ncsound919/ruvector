@@ -1,10 +1,10 @@
-/// WASM/C FFI interface with handle-based resource management.
-///
-/// Exports extern "C" functions for:
-/// - Compressor lifecycle (create, free, touch, set_access)
-/// - Frame compression (push_frame, flush)
-/// - Segment decoding (decode_segment)
-/// - Memory management (alloc, dealloc)
+//! WASM/C FFI interface with handle-based resource management.
+//!
+//! Exports `extern "C"` functions for:
+//! - Compressor lifecycle (`ttc_create`, `ttc_free`, `ttc_touch`, `ttc_set_access`)
+//! - Frame compression (`ttc_push_frame`, `ttc_flush`)
+//! - Segment decoding (`ttc_decode_segment`)
+//! - Memory management (`ttc_alloc`, `ttc_dealloc`)
 
 use crate::compressor::TemporalTensorCompressor;
 use crate::segment;

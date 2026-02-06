@@ -1,7 +1,7 @@
-/// TemporalTensorCompressor: the main entry point.
-///
-/// Manages temporal segments, drift detection, and tier transitions.
-/// Caches f32-converted scales to avoid repeated f16 conversion in hot paths.
+//! TemporalTensorCompressor: the main entry point.
+//!
+//! Manages temporal segments, drift detection, and tier transitions.
+//! Caches f32-converted scales to avoid repeated f16 conversion in hot paths.
 
 use crate::quantizer;
 use crate::segment;
@@ -70,6 +70,11 @@ impl TemporalTensorCompressor {
     /// Tensor length.
     pub fn len(&self) -> u32 {
         self.len
+    }
+
+    /// Returns `true` if the tensor length is zero.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     /// Bytes currently buffered in the active segment data.

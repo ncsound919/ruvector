@@ -22,6 +22,55 @@
 //! # Zero Dependencies
 //!
 //! This crate has no external dependencies, making it fully WASM-compatible.
+//!
+//! # Quick Start
+//!
+//! ```rust
+//! use ruvector_temporal_tensor::{TemporalTensorCompressor, TierPolicy};
+//!
+//! // Create a compressor for 128-element tensors
+//! let mut comp = TemporalTensorCompressor::new(TierPolicy::default(), 128, 0);
+//! comp.set_access(100, 0); // hot tensor -> 8-bit quantization
+//!
+//! let frame = vec![1.0f32; 128];
+//! let mut segment = Vec::new();
+//!
+//! // Push frames; segment is populated when a boundary is crossed
+//! comp.push_frame(&frame, 1, &mut segment);
+//! comp.flush(&mut segment); // force-emit the current segment
+//!
+//! // Decode the segment back to f32
+//! let mut decoded = Vec::new();
+//! ruvector_temporal_tensor::segment::decode(&segment, &mut decoded);
+//! assert_eq!(decoded.len(), 128);
+//! ```
+//!
+//! # Random-Access Decode
+//!
+//! ```rust
+//! # use ruvector_temporal_tensor::{TemporalTensorCompressor, TierPolicy};
+//! # let mut comp = TemporalTensorCompressor::new(TierPolicy::default(), 64, 0);
+//! # let frame = vec![1.0f32; 64];
+//! # let mut seg = Vec::new();
+//! # comp.push_frame(&frame, 0, &mut seg);
+//! # comp.flush(&mut seg);
+//! // Decode only frame 0 without decoding the entire segment
+//! let single = ruvector_temporal_tensor::segment::decode_single_frame(&seg, 0);
+//! assert!(single.is_some());
+//! ```
+//!
+//! # Compression Ratio Inspection
+//!
+//! ```rust
+//! # use ruvector_temporal_tensor::{TemporalTensorCompressor, TierPolicy};
+//! # let mut comp = TemporalTensorCompressor::new(TierPolicy::default(), 64, 0);
+//! # let frame = vec![1.0f32; 64];
+//! # let mut seg = Vec::new();
+//! # comp.push_frame(&frame, 0, &mut seg);
+//! # comp.flush(&mut seg);
+//! let ratio = ruvector_temporal_tensor::segment::compression_ratio(&seg);
+//! assert!(ratio > 1.0);
+//! ```
 
 pub mod bitpack;
 pub mod compressor;

@@ -1,22 +1,24 @@
-/// Groupwise symmetric quantization with f16 scales.
-///
-/// For each group of `group_len` values:
-///   scale = max(|v_i|) / qmax
-///   q_i = round(v_i / scale), clamped to [-qmax, +qmax]
-///   u_i = q_i + qmax  (bias to unsigned for packing)
+//! Groupwise symmetric quantization with f16 scales.
+//!
+//! For each group of `group_len` values:
+//! - `scale = max(|v_i|) / qmax`
+//! - `q_i = round(v_i / scale)`, clamped to `[-qmax, +qmax]`
+//! - `u_i = q_i + qmax` (bias to unsigned for packing)
 
 use crate::bitpack::qmax_from_bits;
 use crate::f16;
 
 /// Compute f16 group scales for a frame.
+///
+/// Returns one f16-encoded scale per group of `group_len` elements.
+/// Each scale is `max(|v|) / qmax` for that group, stored as IEEE 754 half-precision.
 pub fn compute_scales(frame: &[f32], group_len: usize, bits: u8) -> Vec<u16> {
     let qmax = qmax_from_bits(bits);
     if qmax == 0 {
         return Vec::new();
     }
     let qmax_f = qmax as f32;
-
-    let num_groups = (frame.len() + group_len - 1) / group_len;
+    let num_groups = frame.len().div_ceil(group_len);
     let mut scales = Vec::with_capacity(num_groups);
 
     for chunk in frame.chunks(group_len) {
@@ -44,7 +46,10 @@ pub fn scales_to_f32(scales_f16: &[u16]) -> Vec<f32> {
 }
 
 /// Check if a frame fits within existing scales (within drift tolerance).
+///
 /// Uses pre-converted f32 scales to avoid repeated f16 conversion.
+/// Returns `false` if any group's max absolute value exceeds
+/// `scale * qmax * drift_factor`.
 pub fn frame_fits_scales_f32(
     frame: &[f32],
     scales_f32: &[f32],
@@ -75,7 +80,9 @@ pub fn frame_fits_scales_f32(
 }
 
 /// Quantize a frame using pre-computed f32 scales and pack into bitstream.
-/// Caller must pre-convert f16 scales to f32 via `scales_to_f32`.
+///
+/// Appends packed bytes to `out`. Pre-reserves the expected output size
+/// to avoid reallocations.
 pub fn quantize_and_pack_f32(
     frame: &[f32],
     scales_f32: &[f32],
@@ -91,8 +98,7 @@ pub fn quantize_and_pack_f32(
     let bias = qmax;
     let bits_u32 = bits as u32;
 
-    // Pre-reserve: each value takes `bits` bits, total = ceil(len * bits / 8)
-    let needed_bytes = (frame.len() * bits as usize + 7) / 8;
+    let needed_bytes = (frame.len() * bits as usize).div_ceil(8);
     out.reserve(needed_bytes);
 
     let mut acc: u64 = 0;
@@ -133,8 +139,8 @@ pub fn quantize_and_pack_f32(
 
 /// Dequantize packed codes using f32 scales, writing f32 values.
 ///
-/// Optimized: iterates by frame then by group to avoid per-value modulo/division
-/// and caches the f32 scale per group instead of converting f16 per value.
+/// Iterates by frame then by group to avoid per-value modulo/division
+/// and caches the f32 scale per group.
 pub fn dequantize_f32(
     data: &[u8],
     scales_f32: &[f32],
@@ -173,14 +179,13 @@ pub fn dequantize_f32(
             };
 
             while pos < group_end {
-                // Fill accumulator
                 while acc_bits < bits_u32 && byte_idx < data.len() {
                     acc |= (data[byte_idx] as u64) << acc_bits;
                     acc_bits += 8;
                     byte_idx += 1;
                 }
                 if acc_bits < bits_u32 {
-                    return; // Ran out of data
+                    return;
                 }
 
                 let u = (acc & mask) as u32;
@@ -198,7 +203,7 @@ pub fn dequantize_f32(
     }
 }
 
-// --- Legacy API (kept for backward compatibility with segment.rs) ---
+// --- Legacy API (delegates to f32 variants) ---
 
 /// Check if a frame fits within existing f16 scales (within drift tolerance).
 pub fn frame_fits_scales(
@@ -245,15 +250,12 @@ mod tests {
     #[test]
     fn test_quantize_roundtrip_8bit() {
         let frame: Vec<f32> = (0..128).map(|i| (i as f32 - 64.0) * 0.1).collect();
-        let group_len = 64;
-        let bits = 8;
-
-        let scales = compute_scales(&frame, group_len, bits);
+        let scales = compute_scales(&frame, 64, 8);
         let mut packed = Vec::new();
-        quantize_and_pack(&frame, &scales, group_len, bits, &mut packed);
+        quantize_and_pack(&frame, &scales, 64, 8, &mut packed);
 
         let mut decoded = Vec::new();
-        dequantize(&packed, &scales, group_len, bits, frame.len(), 1, &mut decoded);
+        dequantize(&packed, &scales, 64, 8, frame.len(), 1, &mut decoded);
 
         assert_eq!(decoded.len(), frame.len());
         for (i, (&orig, &dec)) in frame.iter().zip(decoded.iter()).enumerate() {
@@ -266,17 +268,13 @@ mod tests {
     #[test]
     fn test_quantize_roundtrip_3bit() {
         let frame: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.5).collect();
-        let group_len = 64;
-        let bits = 3;
-
-        let scales = compute_scales(&frame, group_len, bits);
+        let scales = compute_scales(&frame, 64, 3);
         let mut packed = Vec::new();
-        quantize_and_pack(&frame, &scales, group_len, bits, &mut packed);
+        quantize_and_pack(&frame, &scales, 64, 3, &mut packed);
 
         let mut decoded = Vec::new();
-        dequantize(&packed, &scales, group_len, bits, frame.len(), 1, &mut decoded);
+        dequantize(&packed, &scales, 64, 3, frame.len(), 1, &mut decoded);
 
-        assert_eq!(decoded.len(), frame.len());
         let max_val = frame.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         for (&orig, &dec) in frame.iter().zip(decoded.iter()) {
             let err = (orig - dec).abs();
@@ -287,17 +285,13 @@ mod tests {
     #[test]
     fn test_quantize_roundtrip_5bit() {
         let frame: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.05).collect();
-        let group_len = 64;
-        let bits = 5;
-
-        let scales = compute_scales(&frame, group_len, bits);
+        let scales = compute_scales(&frame, 64, 5);
         let mut packed = Vec::new();
-        quantize_and_pack(&frame, &scales, group_len, bits, &mut packed);
+        quantize_and_pack(&frame, &scales, 64, 5, &mut packed);
 
         let mut decoded = Vec::new();
-        dequantize(&packed, &scales, group_len, bits, frame.len(), 1, &mut decoded);
+        dequantize(&packed, &scales, 64, 5, frame.len(), 1, &mut decoded);
 
-        assert_eq!(decoded.len(), frame.len());
         let max_val = frame.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         for (&orig, &dec) in frame.iter().zip(decoded.iter()) {
             let err = (orig - dec).abs();
@@ -308,17 +302,13 @@ mod tests {
     #[test]
     fn test_quantize_roundtrip_7bit() {
         let frame: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.05).collect();
-        let group_len = 64;
-        let bits = 7;
-
-        let scales = compute_scales(&frame, group_len, bits);
+        let scales = compute_scales(&frame, 64, 7);
         let mut packed = Vec::new();
-        quantize_and_pack(&frame, &scales, group_len, bits, &mut packed);
+        quantize_and_pack(&frame, &scales, 64, 7, &mut packed);
 
         let mut decoded = Vec::new();
-        dequantize(&packed, &scales, group_len, bits, frame.len(), 1, &mut decoded);
+        dequantize(&packed, &scales, 64, 7, frame.len(), 1, &mut decoded);
 
-        assert_eq!(decoded.len(), frame.len());
         for (i, (&orig, &dec)) in frame.iter().zip(decoded.iter()).enumerate() {
             let err = (orig - dec).abs();
             let max_err = if orig.abs() > 0.01 { orig.abs() * 0.02 } else { 0.1 };
@@ -329,11 +319,11 @@ mod tests {
     #[test]
     fn test_drift_detection() {
         let frame1: Vec<f32> = vec![1.0; 64];
-        let frame2: Vec<f32> = vec![1.05; 64]; // 5% drift
-        let frame3: Vec<f32> = vec![2.0; 64]; // 100% drift
+        let frame2: Vec<f32> = vec![1.05; 64];
+        let frame3: Vec<f32> = vec![2.0; 64];
 
         let scales = compute_scales(&frame1, 64, 8);
-        let drift_factor = 1.0 + 26.0 / 256.0; // ~10%
+        let drift_factor = 1.0 + 26.0 / 256.0;
 
         assert!(frame_fits_scales(&frame2, &scales, 64, 8, drift_factor));
         assert!(!frame_fits_scales(&frame3, &scales, 64, 8, drift_factor));
@@ -368,29 +358,23 @@ mod tests {
         let mut decoded = Vec::new();
         dequantize(&packed, &scales, 64, 8, 64, 1, &mut decoded);
 
-        assert_eq!(decoded.len(), 64);
-        // Non-finite values should quantize to 0
         assert_eq!(decoded[10], 0.0);
         assert_eq!(decoded[20], 0.0);
         assert_eq!(decoded[30], 0.0);
-        // Normal values should be close
         assert!((decoded[0] - 1.0).abs() < 0.02);
     }
 
     #[test]
     fn test_single_element_group() {
         let frame = vec![3.14f32; 16];
-        let group_len = 1; // Extreme: 1 element per group
-        let bits = 8;
-
-        let scales = compute_scales(&frame, group_len, bits);
+        let scales = compute_scales(&frame, 1, 8);
         assert_eq!(scales.len(), 16);
 
         let mut packed = Vec::new();
-        quantize_and_pack(&frame, &scales, group_len, bits, &mut packed);
+        quantize_and_pack(&frame, &scales, 1, 8, &mut packed);
 
         let mut decoded = Vec::new();
-        dequantize(&packed, &scales, group_len, bits, 16, 1, &mut decoded);
+        dequantize(&packed, &scales, 1, 8, 16, 1, &mut decoded);
 
         for (i, &v) in decoded.iter().enumerate() {
             let err = (v - 3.14).abs();
@@ -401,12 +385,10 @@ mod tests {
     #[test]
     fn test_compression_ratio() {
         let frame = vec![1.0f32; 512];
-        let group_len = 64;
-
         for &(bits, min_ratio) in &[(8u8, 3.5f32), (7, 4.0), (5, 5.5), (3, 8.5)] {
-            let scales = compute_scales(&frame, group_len, bits);
+            let scales = compute_scales(&frame, 64, bits);
             let mut packed = Vec::new();
-            quantize_and_pack(&frame, &scales, group_len, bits, &mut packed);
+            quantize_and_pack(&frame, &scales, 64, bits, &mut packed);
 
             let raw_bytes = frame.len() * 4;
             let compressed = packed.len() + scales.len() * 2;

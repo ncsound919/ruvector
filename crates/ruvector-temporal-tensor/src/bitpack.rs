@@ -1,8 +1,11 @@
-/// Bitstream packer/unpacker for arbitrary bit widths (1-8).
-///
-/// Uses a 64-bit accumulator for sub-byte codes with no alignment padding.
+//! Bitstream packer/unpacker for arbitrary bit widths (1-8).
+//!
+//! Uses a 64-bit accumulator for sub-byte codes with no alignment padding.
 
 /// Pack unsigned codes of `bits` width into a byte stream.
+///
+/// Each code occupies exactly `bits` bits in the output with no alignment
+/// padding between codes. A trailing partial byte is emitted if needed.
 pub fn pack(codes: &[u32], bits: u32, out: &mut Vec<u8>) {
     let mut acc: u64 = 0;
     let mut acc_bits: u32 = 0;
@@ -23,6 +26,8 @@ pub fn pack(codes: &[u32], bits: u32, out: &mut Vec<u8>) {
 }
 
 /// Unpack `count` unsigned codes of `bits` width from a byte stream.
+///
+/// Stops early if the data is exhausted before `count` codes are extracted.
 pub fn unpack(data: &[u8], bits: u32, count: usize, out: &mut Vec<u32>) {
     let mask = (1u64 << bits) - 1;
     let mut acc: u64 = 0;
@@ -31,14 +36,13 @@ pub fn unpack(data: &[u8], bits: u32, count: usize, out: &mut Vec<u32>) {
     let mut decoded = 0usize;
 
     while decoded < count {
-        // Fill accumulator
         while acc_bits < bits && byte_idx < data.len() {
             acc |= (data[byte_idx] as u64) << acc_bits;
             acc_bits += 8;
             byte_idx += 1;
         }
         if acc_bits < bits {
-            break; // Insufficient data
+            break;
         }
 
         out.push((acc & mask) as u32);
@@ -48,7 +52,16 @@ pub fn unpack(data: &[u8], bits: u32, count: usize, out: &mut Vec<u32>) {
     }
 }
 
-/// Compute qmax for a given bit width: 2^(bits-1) - 1
+/// Compute qmax for a given bit width: `2^(bits-1) - 1`.
+///
+/// Returns 0 for invalid bit widths (0 or >8).
+///
+/// | bits | qmax |
+/// |------|------|
+/// | 8    | 127  |
+/// | 7    | 63   |
+/// | 5    | 15   |
+/// | 3    | 3    |
 #[inline]
 pub fn qmax_from_bits(bits: u8) -> i32 {
     if bits == 0 || bits > 8 {
@@ -66,7 +79,7 @@ mod tests {
         let codes: Vec<u32> = (0..256).collect();
         let mut packed = Vec::new();
         pack(&codes, 8, &mut packed);
-        assert_eq!(packed.len(), 256); // 8-bit = 1 byte each
+        assert_eq!(packed.len(), 256);
 
         let mut unpacked = Vec::new();
         unpack(&packed, 8, 256, &mut unpacked);
@@ -75,7 +88,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_3bit() {
-        let codes: Vec<u32> = (0..7).collect(); // 3-bit range: 0-6
+        let codes: Vec<u32> = (0..7).collect();
         let mut packed = Vec::new();
         pack(&codes, 3, &mut packed);
 
@@ -108,7 +121,6 @@ mod tests {
 
     #[test]
     fn test_packing_density() {
-        // 100 3-bit codes = 300 bits = 38 bytes (ceil(300/8))
         let codes = vec![5u32; 100];
         let mut packed = Vec::new();
         pack(&codes, 3, &mut packed);
