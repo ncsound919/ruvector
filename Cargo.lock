@@ -7438,6 +7438,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruqu-algorithms"
+version = "2.0.1"
+dependencies = [
+ "approx",
+ "criterion 0.5.1",
+ "proptest",
+ "rand 0.8.5",
+ "ruqu-core",
+ "serde",
+ "thiserror 2.0.17",
+ "tracing",
+]
+
+[[package]]
+name = "ruqu-core"
+version = "2.0.1"
+dependencies = [
+ "approx",
+ "criterion 0.5.1",
+ "proptest",
+ "rand 0.8.5",
+ "rayon",
+ "serde",
+ "thiserror 2.0.17",
+ "tracing",
+]
+
+[[package]]
+name = "ruqu-exotic"
+version = "2.0.1"
+dependencies = [
+ "approx",
+ "rand 0.8.5",
+ "ruqu-core",
+ "serde",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "ruqu-wasm"
+version = "2.0.1"
+dependencies = [
+ "getrandom 0.3.4",
+ "js-sys",
+ "ruqu-algorithms",
+ "ruqu-core",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -73,6 +73,10 @@ members = [
     "crates/ruvector-delta-consensus",
     "crates/ruvector-crv",
     "crates/ruvector-temporal-tensor",
+    "crates/ruqu-core",
+    "crates/ruqu-algorithms",
+    "crates/ruqu-wasm",
+    "crates/ruqu-exotic",
 ]
 resolver = "2"
 
