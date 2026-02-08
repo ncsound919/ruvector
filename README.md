@@ -1373,12 +1373,19 @@ See [Domain-Driven Design](./docs/architecture/temporal-tensor-store-ddd.md) for
 
 ### Quantum Simulation Engine (ruQu)
 
+[![npm](https://img.shields.io/npm/v/@ruvector/ruqu-wasm.svg)](https://www.npmjs.com/package/@ruvector/ruqu-wasm)
+
 | Crate | Description | crates.io |
 |-------|-------------|-----------|
-| [ruqu-core](./crates/ruqu-core) | State-vector simulator with gate operations, measurement, noise | [![crates.io](https://img.shields.io/crates/v/ruqu-core.svg)](https://crates.io/crates/ruqu-core) |
+| [ruqu-core](./crates/ruqu-core) | State-vector simulator with SIMD, noise models | [![crates.io](https://img.shields.io/crates/v/ruqu-core.svg)](https://crates.io/crates/ruqu-core) |
 | [ruqu-algorithms](./crates/ruqu-algorithms) | VQE, Grover's search, QAOA MaxCut, Surface Code QEC | [![crates.io](https://img.shields.io/crates/v/ruqu-algorithms.svg)](https://crates.io/crates/ruqu-algorithms) |
-| [ruqu-exotic](./crates/ruqu-exotic) | Quantum-classical hybrids: decay, interference, syndrome diagnosis | [![crates.io](https://img.shields.io/crates/v/ruqu-exotic.svg)](https://crates.io/crates/ruqu-exotic) |
-| [ruqu-wasm](./crates/ruqu-wasm) | WebAssembly bindings for browser quantum simulation | [![crates.io](https://img.shields.io/crates/v/ruqu-wasm.svg)](https://crates.io/crates/ruqu-wasm) |
+| [ruqu-exotic](./crates/ruqu-exotic) | Quantum-classical hybrids: decay, interference, syndrome | [![crates.io](https://img.shields.io/crates/v/ruqu-exotic.svg)](https://crates.io/crates/ruqu-exotic) |
+| [ruqu-wasm](./crates/ruqu-wasm) | WebAssembly bindings (npm: `@ruvector/ruqu-wasm`) | [![crates.io](https://img.shields.io/crates/v/ruqu-wasm.svg)](https://crates.io/crates/ruqu-wasm) |
+
+```bash
+npm install @ruvector/ruqu-wasm    # Browser/Node.js
+cargo add ruqu-core                # Rust
+```
 
 **Pure Rust quantum simulation** with 25-qubit WASM support:
 
