@@ -146,6 +146,31 @@ npm install agentic-flow
 
 </details>
 
+<details>
+<summary><strong>rvDNA</strong> — AI-native genomic diagnostics, instant and available to everyone</summary>
+
+**Using AI to make the world a healthier place.** rvDNA puts genomic diagnostics on any device — a phone, a laptop, a browser tab — in 12 milliseconds. No cloud, no GPU, no subscription. Private by default.
+
+```bash
+cargo add rvdna              # Rust
+npm install @ruvector/rvdna  # JavaScript / TypeScript
+```
+
+| What It Does | How |
+|---|---|
+| Find mutations (sickle cell, cancer) | Bayesian variant calling, 155 ns/SNP |
+| Translate DNA to protein | Full codon table + GNN contact graphs |
+| Predict biological age | Horvath clock, 353 CpG sites |
+| Recommend drug doses | CYP2D6 star alleles + CPIC guidelines |
+| Search genomes by similarity | HNSW k-mer vectors, O(log N) |
+| Store pre-computed AI features | `.rvdna` binary format — open and instant |
+
+- **Rust crate**: [crates.io/crates/rvdna](https://crates.io/crates/rvdna)
+- **npm package**: [@ruvector/rvdna](https://www.npmjs.com/package/@ruvector/rvdna) (NAPI-RS native + JS fallback)
+- **Source**: [examples/dna](./examples/dna)
+
+</details>
+
 ---
 
 ## How the GNN Works
