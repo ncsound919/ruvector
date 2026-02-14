@@ -103,7 +103,8 @@ export class RvLite {
     if (this.initialized) return;
 
     // Dynamic import to support both Node.js and browser
-    const wasmModule = await import('../dist/wasm/rvlite.js');
+    // Use 'as any' for WASM interop: generated types conflict with SDK types
+    const wasmModule = await import('../dist/wasm/rvlite.js') as any;
     await wasmModule.default();
 
     this.wasm = new wasmModule.RvLite({
@@ -280,8 +281,8 @@ export class RvLite {
     const instance = new RvLite(config);
     await instance.init();
 
-    // Dynamic import for WASM
-    const wasmModule = await import('../dist/wasm/rvlite.js');
+    // Dynamic import for WASM (cast to any: generated types conflict with SDK types)
+    const wasmModule = await import('../dist/wasm/rvlite.js') as any;
     instance.wasm = await wasmModule.RvLite.load(config);
 
     return instance;
@@ -291,7 +292,7 @@ export class RvLite {
    * Clear IndexedDB storage (browser only)
    */
   static async clearStorage(): Promise<void> {
-    const wasmModule = await import('../dist/wasm/rvlite.js');
+    const wasmModule = await import('../dist/wasm/rvlite.js') as any;
     return wasmModule.RvLite.clear_storage();
   }
 

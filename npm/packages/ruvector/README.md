@@ -60,7 +60,7 @@ RuVector includes an MCP server for Claude Code with 30+ tools:
 
 ```bash
 # Add to Claude Code
-claude mcp add ruvector-mcp -- npx ruvector mcp-server
+claude mcp add ruvector -- npx ruvector mcp start
 ```
 
 **Available MCP Tools:**
