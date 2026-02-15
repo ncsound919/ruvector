@@ -18,6 +18,7 @@ pub mod intelligence_metrics;
 pub mod logging;
 pub mod reasoning_bank;
 pub mod rvf_intelligence_bench;
+pub mod superintelligence;
 pub mod swarm_regret;
 pub mod temporal;
 pub mod timepuzzles;

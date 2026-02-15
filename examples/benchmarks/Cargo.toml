@@ -84,3 +84,7 @@ path = "src/bin/intelligence_assessment.rs"
 [[bin]]
 name = "rvf-intelligence-bench"
 path = "src/bin/rvf_intelligence_bench.rs"
+
+[[bin]]
+name = "superintelligence"
+path = "src/bin/superintelligence.rs"
