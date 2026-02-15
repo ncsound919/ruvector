@@ -382,13 +382,18 @@ impl PuzzleGenerator {
             // for aggressive skip modes.
         }
 
-        // Tags
+        // Count actual distractors injected (deterministic, observable)
+        let actual_distractor_count = crate::temporal::count_distractors(&puzzle);
+
+        // Tags: all features visible to policies for deterministic observability
         puzzle.tags = vec![
             format!("difficulty:{}", difficulty),
             format!("year:{}", year),
             format!("range_size:{}", dv.range_size),
             format!("distractor_rate:{:.2}", dv.distractor_rate),
+            format!("distractor_count:{}", actual_distractor_count),
             format!("ambiguity:{}", dv.ambiguity_count),
+            format!("has_dow:{}", use_day_of_week),
         ];
 
         Ok(puzzle)

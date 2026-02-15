@@ -57,6 +57,10 @@ pub struct SolutionAttempt {
     pub tool_calls: usize,
     /// Strategy used
     pub strategy: String,
+    /// Skip mode used (witness for policy audit: "none", "weekday", "hybrid")
+    pub skip_mode: String,
+    /// Context bucket key (witness for policy audit: "range:distractor")
+    pub context_bucket: String,
 }
 
 /// Trajectory tracking for a single puzzle
@@ -105,6 +109,30 @@ impl Trajectory {
             steps,
             tool_calls,
             strategy: strategy.to_string(),
+            skip_mode: String::new(),
+            context_bucket: String::new(),
+        });
+    }
+
+    /// Record attempt with full policy witness (skip_mode + context_bucket).
+    pub fn record_attempt_witnessed(
+        &mut self,
+        solution: String,
+        confidence: f64,
+        steps: usize,
+        tool_calls: usize,
+        strategy: &str,
+        skip_mode: &str,
+        context_bucket: &str,
+    ) {
+        self.attempts.push(SolutionAttempt {
+            solution,
+            confidence,
+            steps,
+            tool_calls,
+            strategy: strategy.to_string(),
+            skip_mode: skip_mode.to_string(),
+            context_bucket: context_bucket.to_string(),
         });
     }
 
