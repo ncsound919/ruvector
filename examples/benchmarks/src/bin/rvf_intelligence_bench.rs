@@ -1,10 +1,11 @@
 //! RVF Intelligence Benchmark Runner
 //!
-//! Runs head-to-head comparison: Baseline (no learning) vs. RVF-Learning
-//! (witness chains + coherence + authority + ReasoningBank).
+//! Runs head-to-head comparison across 6 intelligence verticals:
+//! Baseline (no learning) vs. RVF-Learning (full pipeline).
 //!
 //! Usage:
 //!   cargo run --bin rvf-intelligence-bench -- --episodes 15 --tasks 25 --verbose
+//!   cargo run --bin rvf-intelligence-bench -- --noise 0.4 --step-budget 300
 
 use anyhow::Result;
 use clap::Parser;
@@ -13,7 +14,7 @@ use ruvector_benchmarks::rvf_intelligence_bench::{run_comparison, BenchmarkConfi
 
 #[derive(Parser, Debug)]
 #[command(name = "rvf-intelligence-bench")]
-#[command(about = "Benchmark intelligence with and without RVF learning")]
+#[command(about = "Benchmark intelligence with and without RVF learning across 6 verticals")]
 struct Args {
     /// Number of episodes per mode
     #[arg(short, long, default_value = "10")]
@@ -35,6 +36,22 @@ struct Args {
     #[arg(long, default_value = "42")]
     seed: u64,
 
+    /// Noise probability (0.0-1.0)
+    #[arg(long, default_value = "0.25")]
+    noise: f64,
+
+    /// Step budget per episode
+    #[arg(long, default_value = "400")]
+    step_budget: usize,
+
+    /// Max retries for error recovery (RVF only)
+    #[arg(long, default_value = "2")]
+    max_retries: usize,
+
+    /// Retention fraction (0.0-1.0)
+    #[arg(long, default_value = "0.15")]
+    retention: f64,
+
     /// Token budget per episode (RVF mode)
     #[arg(long, default_value = "200000")]
     token_budget: u32,
@@ -53,8 +70,8 @@ fn main() -> Result<()> {
 
     println!();
     println!("================================================================");
-    println!("  RVF Intelligence Benchmark");
-    println!("  Measuring cognitive performance: Baseline vs. RVF-Learning");
+    println!("  RVF Intelligence Benchmark v2 — Six Verticals");
+    println!("  Baseline vs. RVF-Learning (noise + step limits + retry + transfer)");
     println!("================================================================");
     println!();
     println!("  Configuration:");
@@ -62,8 +79,10 @@ fn main() -> Result<()> {
     println!("    Tasks/episode:  {}", args.tasks);
     println!("    Difficulty:     {}-{}", args.min_diff, args.max_diff);
     println!("    Seed:           {}", args.seed);
-    println!("    Token budget:   {}", args.token_budget);
-    println!("    Tool budget:    {}", args.tool_budget);
+    println!("    Noise prob:     {:.0}%", args.noise * 100.0);
+    println!("    Step budget/ep: {}", args.step_budget);
+    println!("    Max retries:    {}", args.max_retries);
+    println!("    Retention:      {:.0}%", args.retention * 100.0);
     println!();
 
     let config = BenchmarkConfig {
@@ -75,25 +94,20 @@ fn main() -> Result<()> {
         token_budget: args.token_budget,
         tool_call_budget: args.tool_budget,
         verbose: args.verbose,
+        noise_probability: args.noise,
+        step_budget_per_episode: args.step_budget,
+        max_retries: args.max_retries,
+        retention_fraction: args.retention,
         ..Default::default()
     };
 
-    // Run both modes
-    println!("  Phase 1/3: Running baseline (no learning)...");
-    if !args.verbose {
-        print!("    ");
-    }
-
+    println!("  Phase 1/2: Running baseline (no learning)...");
     let report = run_comparison(&config)?;
-
-    if !args.verbose {
-        println!();
-    }
 
     // Print comparison report
     report.print();
 
-    // Also compute full IntelligenceAssessment for each mode
+    // Full IQ assessment
     let calculator = IntelligenceCalculator::default();
 
     println!("----------------------------------------------------------------");
@@ -109,34 +123,27 @@ fn main() -> Result<()> {
     let rvf_assessment = calculator.calculate(&report.rvf_learning.raw_metrics);
     print_compact_assessment(&rvf_assessment);
 
-    // Final intelligence score comparison
+    // Final IQ comparison
     println!();
     println!("================================================================");
     println!("  Intelligence Score Comparison");
     println!("================================================================");
-    println!(
-        "  Baseline IQ Score:     {:.1}/100",
-        base_assessment.overall_score
-    );
-    println!(
-        "  RVF-Learning IQ Score: {:.1}/100",
-        rvf_assessment.overall_score
-    );
-    println!(
-        "  Delta:                 {:+.1}",
-        rvf_assessment.overall_score - base_assessment.overall_score
-    );
+    println!("  Baseline IQ Score:     {:.1}/100", base_assessment.overall_score);
+    println!("  RVF-Learning IQ Score: {:.1}/100", rvf_assessment.overall_score);
+    let iq_delta = rvf_assessment.overall_score - base_assessment.overall_score;
+    println!("  Delta:                 {:+.1}", iq_delta);
     println!();
 
-    let iq_delta = rvf_assessment.overall_score - base_assessment.overall_score;
-    if iq_delta > 5.0 {
+    if iq_delta > 10.0 {
+        println!("  >> RVF learning loop provides a DRAMATIC intelligence boost.");
+    } else if iq_delta > 5.0 {
         println!("  >> RVF learning loop provides a SIGNIFICANT intelligence boost.");
     } else if iq_delta > 1.0 {
         println!("  >> RVF learning loop provides a MEASURABLE intelligence improvement.");
     } else if iq_delta > 0.0 {
         println!("  >> RVF learning loop provides a MARGINAL intelligence gain.");
     } else {
-        println!("  >> Performance is comparable. Increase episodes for stronger signal.");
+        println!("  >> Performance is comparable. Increase noise or reduce step budget.");
     }
     println!();
 
@@ -149,22 +156,16 @@ fn print_compact_assessment(
     println!("  Overall Score: {:.1}/100", a.overall_score);
     println!(
         "  Reasoning:     coherence={:.2}, efficiency={:.2}, error_rate={:.2}",
-        a.reasoning.logical_coherence,
-        a.reasoning.reasoning_efficiency,
-        a.reasoning.error_rate,
+        a.reasoning.logical_coherence, a.reasoning.reasoning_efficiency, a.reasoning.error_rate,
     );
     println!(
         "  Learning:      sample_eff={:.2}, regret_sub={:.2}, rate={:.2}, gen={:.2}",
-        a.learning.sample_efficiency,
-        a.learning.regret_sublinearity,
-        a.learning.learning_rate,
-        a.learning.generalization,
+        a.learning.sample_efficiency, a.learning.regret_sublinearity,
+        a.learning.learning_rate, a.learning.generalization,
     );
     println!(
         "  Capabilities:  pattern={:.1}, planning={:.1}, adaptation={:.1}",
-        a.capabilities.pattern_recognition,
-        a.capabilities.planning,
-        a.capabilities.adaptation,
+        a.capabilities.pattern_recognition, a.capabilities.planning, a.capabilities.adaptation,
     );
     println!(
         "  Meta-cog:      self_correct={:.2}, strategy_adapt={:.2}",

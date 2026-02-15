@@ -492,6 +492,8 @@ pub struct AdaptiveSolver {
     current_strategy: Strategy,
     /// Total episodes completed
     pub episodes: usize,
+    /// When set, solve() uses this step limit instead of the strategy's
+    pub external_step_limit: Option<usize>,
 }
 
 impl Default for AdaptiveSolver {
@@ -508,6 +510,7 @@ impl AdaptiveSolver {
             reasoning_bank: ReasoningBank::new(),
             current_strategy: Strategy::default(),
             episodes: 0,
+            external_step_limit: None,
         }
     }
 
@@ -518,7 +521,13 @@ impl AdaptiveSolver {
             reasoning_bank,
             current_strategy: Strategy::default(),
             episodes: 0,
+            external_step_limit: None,
         }
+    }
+
+    /// Get mutable reference to the internal solver for configuration.
+    pub fn solver_mut(&mut self) -> &mut TemporalSolver {
+        &mut self.solver
     }
 
     /// Solve a puzzle with adaptive learning
@@ -535,9 +544,10 @@ impl AdaptiveSolver {
             .reasoning_bank
             .get_strategy(puzzle.difficulty, &constraint_types);
 
-        // Configure solver based on strategy
+        // Configure solver based on strategy (external limit overrides strategy)
         self.solver.calendar_tool = self.current_strategy.use_rewriting;
-        self.solver.max_steps = self.current_strategy.max_steps;
+        self.solver.max_steps = self.external_step_limit
+            .unwrap_or(self.current_strategy.max_steps);
 
         // Create trajectory for this puzzle
         let mut trajectory = Trajectory::new(&puzzle.id, puzzle.difficulty);
