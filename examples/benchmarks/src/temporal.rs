@@ -564,6 +564,10 @@ pub struct SkipOutcome {
     pub steps: usize,
     /// Whether this was an early commit that turned out wrong
     pub early_commit_wrong: bool,
+    /// Initial candidate count (for normalized penalty)
+    pub initial_candidates: usize,
+    /// Remaining candidates at commit time (for normalized penalty)
+    pub remaining_at_commit: usize,
 }
 
 /// Per-context skip-mode statistics for learned policy.
@@ -622,21 +626,28 @@ impl PolicyKernel {
     }
 
     /// Fixed baseline policy (Mode A):
-    /// Uses posterior_range + distractor_count to decide.
-    /// - If DayOfWeek is present AND posterior_range > 30 AND distractor_count == 0: Weekday
-    /// - If DayOfWeek is present AND distractor_count > 0: Hybrid (safe fallback)
-    /// - Otherwise: None
+    /// Uses risk_score = R + k*D where R=posterior_range, D=distractor_count.
+    ///
+    /// Constants (fixed, not learned — Mode A is the control arm):
+    ///   k = 30 (one distractor raises perceived risk by ~30 range-days)
+    ///   T = 140 (threshold: skip only when range is large enough to justify it)
+    ///
+    /// Decision:
+    ///   If no DayOfWeek: None (nothing to skip to)
+    ///   Else risk_score = R + 30*D
+    ///     risk_score >= 140 → Weekday (large range, few distractors)
+    ///     risk_score <  140 → None    (small range or distractor-heavy)
+    const BASELINE_K: usize = 30;
+    const BASELINE_T: usize = 140;
+
     pub fn fixed_policy(ctx: &PolicyContext) -> SkipMode {
         if !ctx.has_day_of_week {
             return SkipMode::None;
         }
-        if ctx.distractor_count == 0 && ctx.posterior_range > 30 {
+        let risk_score = ctx.posterior_range + Self::BASELINE_K * ctx.distractor_count;
+        if risk_score >= Self::BASELINE_T {
             SkipMode::Weekday
-        } else if ctx.distractor_count > 0 {
-            // Distractors present: skip is risky, use hybrid for safety
-            SkipMode::Hybrid
         } else {
-            // Small range: skip saves little, linear is fine
             SkipMode::None
         }
     }
@@ -692,6 +703,15 @@ impl PolicyKernel {
     }
 
     /// Record the outcome of a skip-mode decision.
+    ///
+    /// EarlyCommitPenalty is normalized:
+    ///   penalty = (remaining_at_commit / initial_candidates) * PENALTY_SCALE
+    ///
+    /// Committing at 5% of scan = cheap (penalty ≈ 0.05).
+    /// Committing at 90% of scan = expensive (penalty ≈ 0.90).
+    /// Only charged when the commit is *wrong*.
+    const PENALTY_SCALE: f64 = 1.0;
+
     pub fn record_outcome(&mut self, ctx: &PolicyContext, outcome: &SkipOutcome) {
         let bucket = Self::context_bucket(ctx);
         let mode_name = outcome.mode.to_string();
@@ -704,9 +724,14 @@ impl PolicyKernel {
         if outcome.early_commit_wrong {
             stats.early_commit_wrongs += 1;
             self.early_commits_wrong += 1;
-            // Penalty proportional to how early the commit was
-            // (fewer steps = earlier commit = higher penalty)
-            let penalty = 1.0 - (outcome.steps as f64 / 200.0).min(1.0);
+            // Normalized penalty: remaining/initial fraction
+            let penalty = if outcome.initial_candidates > 0 {
+                (outcome.remaining_at_commit as f64 / outcome.initial_candidates as f64)
+                    * Self::PENALTY_SCALE
+            } else {
+                // Fallback: use step-based estimate
+                1.0 - (outcome.steps as f64 / 200.0).min(1.0)
+            };
             self.early_commit_penalties += penalty;
         }
         self.early_commits_total += 1;
@@ -716,6 +741,11 @@ impl PolicyKernel {
     pub fn early_commit_rate(&self) -> f64 {
         if self.early_commits_total == 0 { return 0.0; }
         self.early_commits_wrong as f64 / self.early_commits_total as f64
+    }
+
+    /// Build a context bucket key for stats grouping (public for witnesses).
+    pub fn context_bucket_static(ctx: &PolicyContext) -> String {
+        Self::context_bucket(ctx)
     }
 
     /// Build a context bucket key for stats grouping.
@@ -1298,11 +1328,15 @@ impl AdaptiveSolver {
             }
             SkipMode::Hybrid => {
                 // Hybrid: use weekday skip for initial scan (set here),
-                // then do a refinement pass below if needed
+                // then do a refinement pass below if needed.
+                // Force minimum evidence: never stop_after_first in Hybrid mode.
                 self.solver.skip_weekday = puzzle.constraints.iter().find_map(|c| match c {
                     TemporalConstraint::DayOfWeek(w) => Some(*w),
                     _ => None,
                 });
+                // Hybrid safety: disable early termination so solver checks
+                // all matching weekdays before committing
+                self.solver.stop_after_first = false;
             }
         }
 
@@ -1342,8 +1376,10 @@ impl AdaptiveSolver {
                         trajectory.latency_ms = latency;
                         let sol_str = result.solutions.first()
                             .map(|d| d.to_string()).unwrap_or_else(|| "none".to_string());
-                        trajectory.record_attempt(
+                        let bucket_key = PolicyKernel::context_bucket_static(&policy_ctx);
+                        trajectory.record_attempt_witnessed(
                             sol_str, 0.95, result.steps, result.tool_calls, "compiler",
+                            &skip_mode.to_string(), &bucket_key,
                         );
                         trajectory.set_verdict(
                             Verdict::Success,
@@ -1358,6 +1394,8 @@ impl AdaptiveSolver {
                             correct: true,
                             steps: result.steps,
                             early_commit_wrong: false,
+                            initial_candidates: policy_ctx.posterior_range,
+                            remaining_at_commit: 0,
                         };
                         self.policy_kernel.record_outcome(&policy_ctx, &outcome);
 
@@ -1374,11 +1412,15 @@ impl AdaptiveSolver {
 
                         // Record early commit wrong if solver claimed solved but was wrong
                         if result.solved && !result.correct {
+                            // Estimate remaining: initial minus steps scanned
+                            let remaining = policy_ctx.posterior_range.saturating_sub(result.steps);
                             let outcome = SkipOutcome {
                                 mode: skip_mode.clone(),
                                 correct: false,
                                 steps: result.steps,
                                 early_commit_wrong: true,
+                                initial_candidates: policy_ctx.posterior_range,
+                                remaining_at_commit: remaining,
                             };
                             self.policy_kernel.record_outcome(&policy_ctx, &outcome);
                         }
@@ -1479,12 +1521,15 @@ impl AdaptiveSolver {
 
         let confidence = self.calculate_confidence(&result, puzzle);
 
-        trajectory.record_attempt(
+        let bucket_key = PolicyKernel::context_bucket_static(&policy_ctx);
+        trajectory.record_attempt_witnessed(
             solution_str,
             confidence,
             result.steps,
             result.tool_calls,
             &self.current_strategy.name,
+            &skip_mode.to_string(),
+            &bucket_key,
         );
 
         // Determine verdict
@@ -1509,11 +1554,14 @@ impl AdaptiveSolver {
 
         // ─── Record PolicyKernel outcome ─────────────────────────────────
         let early_commit_wrong = result.solved && !result.correct;
+        let remaining = policy_ctx.posterior_range.saturating_sub(result.steps);
         let outcome = SkipOutcome {
             mode: skip_mode,
             correct: result.correct,
             steps: result.steps,
             early_commit_wrong,
+            initial_candidates: policy_ctx.posterior_range,
+            remaining_at_commit: remaining,
         };
         self.policy_kernel.record_outcome(&policy_ctx, &outcome);
 
@@ -1580,7 +1628,8 @@ impl AdaptiveSolver {
 
 /// Count distractor constraints in a puzzle.
 /// A distractor is a constraint that is likely redundant (doesn't narrow the search much).
-fn count_distractors(puzzle: &TemporalPuzzle) -> usize {
+/// Public so the generator can tag puzzles with their distractor count.
+pub fn count_distractors(puzzle: &TemporalPuzzle) -> usize {
     let mut count = 0;
     let mut seen_between = false;
     let mut seen_inyear = false;

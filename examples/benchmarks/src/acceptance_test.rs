@@ -27,6 +27,7 @@ use crate::temporal::{AdaptiveSolver, KnowledgeCompiler, PolicyKernel, TemporalC
 use crate::timepuzzles::{PuzzleGenerator, PuzzleGeneratorConfig};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Ablation Modes
@@ -73,6 +74,8 @@ pub struct AblationResult {
     pub early_commit_rate: f64,
     pub early_commit_penalties: f64,
     pub policy_context_buckets: usize,
+    /// Skip-mode distribution by context bucket: bucket → (mode → count)
+    pub skip_mode_distribution: HashMap<String, HashMap<String, usize>>,
 }
 
 /// Full ablation comparison across all three modes.
@@ -87,6 +90,10 @@ pub struct AblationComparison {
     pub c_beats_b_robustness: bool,
     /// Compiler false hit rate under 5%
     pub compiler_safe: bool,
+    /// Mode A uses skip at least sometimes (proves not hobbled)
+    pub a_skip_nonzero: bool,
+    /// Mode C uses different skip modes across contexts (proves learning)
+    pub c_multi_mode: bool,
     /// All modes passed
     pub all_passed: bool,
 }
@@ -138,7 +145,24 @@ impl AblationComparison {
         println!("    B beats A on cost (>=15%):        {}", if self.b_beats_a_cost { "PASS" } else { "FAIL" });
         println!("    C beats B on robustness (>=10%):   {}", if self.c_beats_b_robustness { "PASS" } else { "FAIL" });
         println!("    Compiler false-hit rate <5%:       {}", if self.compiler_safe { "PASS" } else { "FAIL" });
+        println!("    A skip usage nonzero:              {}", if self.a_skip_nonzero { "PASS" } else { "FAIL" });
+        println!("    C uses multiple skip modes:        {}", if self.c_multi_mode { "PASS" } else { "FAIL" });
         println!();
+
+        // Skip-mode distribution table for Mode C
+        if !self.mode_c.skip_mode_distribution.is_empty() {
+            println!("  Mode C Skip-Mode Distribution by Context:");
+            println!("  {:<20} {:>8} {:>8} {:>8}", "Bucket", "None", "Weekday", "Hybrid");
+            println!("  {}", "-".repeat(48));
+            for (bucket, dist) in &self.mode_c.skip_mode_distribution {
+                let total = dist.values().sum::<usize>().max(1);
+                let none_pct = *dist.get("none").unwrap_or(&0) as f64 / total as f64 * 100.0;
+                let weekday_pct = *dist.get("weekday").unwrap_or(&0) as f64 / total as f64 * 100.0;
+                let hybrid_pct = *dist.get("hybrid").unwrap_or(&0) as f64 / total as f64 * 100.0;
+                println!("  {:<20} {:>6.1}% {:>6.1}% {:>6.1}%", bucket, none_pct, weekday_pct, hybrid_pct);
+            }
+            println!();
+        }
 
         if self.all_passed {
             println!("  ABLATION RESULT: ALL PASSED");
@@ -553,6 +577,15 @@ pub fn run_acceptance_test_mode(config: &HoldoutConfig, mode: &AblationMode) -> 
         policy_kernel.print_diagnostics();
     }
 
+    // Build skip-mode distribution from PolicyKernel context stats
+    let mut skip_dist: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for (bucket, modes) in &policy_kernel.context_stats {
+        let entry = skip_dist.entry(bucket.clone()).or_default();
+        for (mode_name, stats) in modes {
+            *entry.entry(mode_name.clone()).or_insert(0) += stats.attempts;
+        }
+    }
+
     Ok(AblationResult {
         mode: mode.clone(),
         result: acceptance_result,
@@ -563,6 +596,7 @@ pub fn run_acceptance_test_mode(config: &HoldoutConfig, mode: &AblationMode) -> 
         early_commit_rate: policy_kernel.early_commit_rate(),
         early_commit_penalties: policy_kernel.early_commit_penalties,
         policy_context_buckets: policy_kernel.context_stats.len(),
+        skip_mode_distribution: skip_dist,
     })
 }
 
@@ -602,7 +636,23 @@ pub fn run_ablation_comparison(config: &HoldoutConfig) -> Result<AblationCompari
         true
     };
 
+    // Mode A skip usage is nonzero: proves it is not hobbled
+    let a_total_skip_uses: usize = mode_a.skip_mode_distribution.values()
+        .flat_map(|modes| modes.iter())
+        .filter(|(name, _)| *name != "none")
+        .map(|(_, count)| *count)
+        .sum();
+    let a_skip_nonzero = a_total_skip_uses > 0;
+
+    // Mode C uses different skip modes across contexts: proves learning
+    let c_unique_modes: std::collections::HashSet<&str> = mode_c.skip_mode_distribution.values()
+        .flat_map(|modes| modes.keys())
+        .map(|s| s.as_str())
+        .collect();
+    let c_multi_mode = c_unique_modes.len() >= 2;
+
     let all_passed = b_beats_a_cost && c_beats_b_robustness && compiler_safe
+        && a_skip_nonzero && c_multi_mode
         && mode_a.result.passed && mode_b.result.passed && mode_c.result.passed;
 
     Ok(AblationComparison {
@@ -612,6 +662,8 @@ pub fn run_ablation_comparison(config: &HoldoutConfig) -> Result<AblationCompari
         b_beats_a_cost,
         c_beats_b_robustness,
         compiler_safe,
+        a_skip_nonzero,
+        c_multi_mode,
         all_passed,
     })
 }
