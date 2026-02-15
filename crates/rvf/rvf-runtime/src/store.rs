@@ -355,10 +355,140 @@ impl RvfStore {
         // Drain the max-heap into sorted results (closest first).
         let mut results: Vec<SearchResult> = heap
             .into_iter()
-            .map(|(OrderedFloat(dist), id)| SearchResult { id, distance: dist })
+            .map(|(OrderedFloat(dist), id)| SearchResult {
+                id,
+                distance: dist,
+                retrieval_quality: rvf_types::quality::RetrievalQuality::Full,
+            })
             .collect();
         results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
         Ok(results)
+    }
+
+    /// Query the store and return a full QualityEnvelope (ADR-033 §2.4).
+    ///
+    /// This is the preferred query API. The QualityEnvelope is the mandatory
+    /// outer return type — consumers MUST inspect the `quality` field before
+    /// using results.
+    pub fn query_with_envelope(
+        &self,
+        vector: &[f32],
+        k: usize,
+        options: &QueryOptions,
+    ) -> Result<QualityEnvelope, RvfError> {
+        use rvf_types::quality::*;
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let dim = self.options.dimension as usize;
+        if vector.len() != dim {
+            return Err(err(ErrorCode::DimensionMismatch));
+        }
+
+        // Determine effective budget based on quality preference.
+        let budget = match options.quality_preference {
+            QualityPreference::PreferQuality => options.safety_net_budget.extended_4x(),
+            QualityPreference::PreferLatency => SafetyNetBudget::DISABLED,
+            _ => options.safety_net_budget,
+        };
+
+        // Execute the base query.
+        let results = self.query(vector, k, options)?;
+        let hnsw_candidate_count = results.len() as u32;
+
+        // Determine if safety net should activate.
+        let needs_safety_net = crate::safety_net::should_activate_safety_net(results.len(), k)
+            && !budget.is_disabled();
+
+        let mut all_results = results;
+        let mut safety_net_candidate_count = 0u32;
+        let mut budget_report = BudgetReport::default();
+        let mut degradation: Option<DegradationReport> = None;
+
+        if needs_safety_net && self.vectors.len() > 0 {
+            // Build vector refs for safety net scan.
+            let vec_refs: Vec<(u64, &[f32])> = self.vectors.ids()
+                .filter_map(|&id| {
+                    if self.deletion_bitmap.is_deleted(id) {
+                        return None;
+                    }
+                    self.vectors.get(id).map(|v| (id, v))
+                })
+                .collect();
+
+            let base_results: Vec<crate::options::SearchResult> = all_results.clone();
+            let scan_result = crate::safety_net::selective_safety_net_scan(
+                vector,
+                k,
+                &base_results,
+                &vec_refs,
+                &budget,
+                self.vectors.len() as u64,
+            );
+
+            safety_net_candidate_count = scan_result.candidates.len() as u32;
+            budget_report = scan_result.budget_report;
+            degradation = scan_result.degradation;
+
+            // Merge safety net candidates into results.
+            for candidate in scan_result.candidates {
+                all_results.push(SearchResult {
+                    id: candidate.id,
+                    distance: candidate.distance,
+                    retrieval_quality: RetrievalQuality::BruteForceBudgeted,
+                });
+            }
+
+            // Re-sort and take top-k.
+            all_results.sort_by(|a, b| {
+                a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            all_results.truncate(k);
+        }
+
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        budget_report.total_us = elapsed_us;
+
+        // Derive response quality from all candidate qualities.
+        let retrieval_qualities: Vec<RetrievalQuality> = all_results
+            .iter()
+            .map(|r| r.retrieval_quality)
+            .collect();
+        let quality = derive_response_quality(&retrieval_qualities);
+
+        let evidence = SearchEvidenceSummary {
+            layers_used: IndexLayersUsed {
+                layer_a: true,
+                layer_b: false,
+                layer_c: false,
+                hot_cache: needs_safety_net,
+            },
+            n_probe_effective: 0,
+            degenerate_detected: false,
+            centroid_distance_cv: 0.0,
+            hnsw_candidate_count,
+            safety_net_candidate_count,
+        };
+
+        let envelope = QualityEnvelope {
+            results: all_results,
+            quality,
+            evidence,
+            budgets: budget_report,
+            degradation,
+        };
+
+        // Enforce quality threshold policy.
+        if matches!(quality, ResponseQuality::Degraded | ResponseQuality::Unreliable)
+            && !matches!(options.quality_preference, QualityPreference::AcceptDegraded)
+        {
+            return Err(RvfError::QualityBelowThreshold {
+                quality,
+                reason: "result quality below threshold; set AcceptDegraded to use partial results",
+            });
+        }
+
+        Ok(envelope)
     }
 
     /// Query the store with optional audit witness.

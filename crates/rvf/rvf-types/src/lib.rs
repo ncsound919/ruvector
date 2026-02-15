@@ -32,6 +32,8 @@ pub mod segment_type;
 pub mod signature;
 pub mod attestation;
 pub mod lineage;
+pub mod quality;
+pub mod security;
 pub mod wasm_bootstrap;
 
 pub use attestation::{AttestationHeader, AttestationWitnessType, TeePlatform, KEY_TYPE_TEE_BOUND};
@@ -71,6 +73,12 @@ pub use quant_type::QuantType;
 pub use segment::SegmentHeader;
 pub use segment_type::SegmentType;
 pub use signature::{SignatureAlgo, SignatureFooter};
+pub use quality::{
+    BudgetReport, BudgetType, DegradationReason, DegradationReport, FallbackPath,
+    IndexLayersUsed, QualityPreference, ResponseQuality, RetrievalQuality,
+    SafetyNetBudget, SearchEvidenceSummary, derive_response_quality,
+};
+pub use security::{HardeningFields, SecurityError, SecurityPolicy};
 pub use wasm_bootstrap::{
     WasmHeader, WasmRole, WasmTarget, WASM_MAGIC,
     WASM_FEAT_SIMD, WASM_FEAT_BULK_MEMORY, WASM_FEAT_MULTI_VALUE,
