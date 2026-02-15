@@ -80,3 +80,7 @@ path = "src/bin/timepuzzle_runner.rs"
 [[bin]]
 name = "intelligence-assessment"
 path = "src/bin/intelligence_assessment.rs"
+
+[[bin]]
+name = "rvf-intelligence-bench"
+path = "src/bin/rvf_intelligence_bench.rs"
