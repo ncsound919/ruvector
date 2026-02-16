@@ -498,6 +498,7 @@ mod tests {
             manifest_present: false,
             orchestrator_present: true,
             world_model_present: true,
+            domain_expansion_present: false,
             total_size: 0,
         };
 

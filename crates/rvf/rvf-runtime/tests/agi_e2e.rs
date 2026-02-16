@@ -40,7 +40,7 @@ fn build_full_container() -> (Vec<u8>, AgiContainerHeader) {
             vec_segment_count: 4, index_segment_count: 2,
             witness_count: 100, crypto_present: false,
             manifest_present: true, orchestrator_present: true,
-            world_model_present: true, total_size: 0,
+            world_model_present: true, domain_expansion_present: false, total_size: 0,
         })
         .build()
         .unwrap()
