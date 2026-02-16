@@ -45,6 +45,7 @@
 
 pub mod cost_curve;
 pub mod domain;
+pub mod meta_learning;
 pub mod planning;
 pub mod policy_kernel;
 pub mod rust_synthesis;
@@ -67,6 +68,10 @@ pub use planning::PlanningDomain;
 pub use policy_kernel::{PolicyKernel, PolicyKnobs, PopulationSearch, PopulationStats};
 pub use rust_synthesis::RustSynthesisDomain;
 pub use tool_orchestration::ToolOrchestrationDomain;
+pub use meta_learning::{
+    CuriosityBonus, DecayingBeta, MetaLearningEngine, MetaLearningHealth, ParetoFront,
+    ParetoPoint, PlateauAction, PlateauDetector, RegretSummary, RegretTracker,
+};
 pub use transfer::{
     ArmId, BetaParams, ContextBucket, DualPathResult, MetaThompsonEngine, TransferPrior,
     TransferVerification,
@@ -78,6 +83,10 @@ use std::collections::HashMap;
 ///
 /// Manages multiple domains, transfer learning between them,
 /// population-based policy search, and the acceleration scoreboard.
+///
+/// The `meta` field provides five composable learning improvements:
+/// regret tracking, decaying priors, plateau detection, Pareto front
+/// optimization, and curiosity-driven exploration.
 pub struct DomainExpansionEngine {
     /// Registered domains.
     domains: HashMap<DomainId, Box<dyn Domain>>,
@@ -87,6 +96,8 @@ pub struct DomainExpansionEngine {
     pub population: PopulationSearch,
     /// Acceleration scoreboard tracking convergence across domains.
     pub scoreboard: AccelerationScoreboard,
+    /// Meta-learning engine: regret, plateau, Pareto, curiosity, decay.
+    pub meta: MetaLearningEngine,
     /// Holdout tasks per domain for verification.
     holdouts: HashMap<DomainId, Vec<Task>>,
     /// Counterexample set: failed solutions that inform future decisions.
@@ -110,6 +121,7 @@ impl DomainExpansionEngine {
             thompson: MetaThompsonEngine::new(arms),
             population: PopulationSearch::new(8),
             scoreboard: AccelerationScoreboard::new(),
+            meta: MetaLearningEngine::new(),
             holdouts: HashMap::new(),
             counterexamples: HashMap::new(),
         };
@@ -168,11 +180,14 @@ impl DomainExpansionEngine {
         // Record outcome in Thompson engine.
         self.thompson.record_outcome(
             domain_id,
-            bucket,
-            arm,
+            bucket.clone(),
+            arm.clone(),
             eval.score,
             1.0, // unit cost for now
         );
+
+        // Record in meta-learning engine (regret + curiosity + decaying beta).
+        self.meta.record_decision(&bucket, &arm, eval.score);
 
         // Store counterexamples for poor solutions.
         if eval.score < 0.3 {
@@ -258,8 +273,33 @@ impl DomainExpansionEngine {
         }
     }
 
-    /// Evolve the policy kernel population.
+    /// Evolve the policy kernel population and update Pareto front.
     pub fn evolve_population(&mut self) {
+        // Record current population into Pareto front before evolving.
+        let gen = self.population.generation();
+        for kernel in self.population.population() {
+            let accuracy = kernel.fitness();
+            let cost = if kernel.cycles > 0 {
+                kernel.total_cost / kernel.cycles as f32
+            } else {
+                0.0
+            };
+            // Robustness approximated by consistency across domains.
+            let robustness = if kernel.holdout_scores.len() > 1 {
+                let mean = accuracy;
+                let var: f32 = kernel
+                    .holdout_scores
+                    .values()
+                    .map(|s| (s - mean).powi(2))
+                    .sum::<f32>()
+                    / kernel.holdout_scores.len() as f32;
+                (1.0 - var.sqrt()).max(0.0)
+            } else {
+                accuracy
+            };
+            self.meta.record_kernel(&kernel.id, accuracy, cost, robustness, gen);
+        }
+
         self.population.evolve();
     }
 
@@ -311,6 +351,72 @@ impl DomainExpansionEngine {
         bucket: &ContextBucket,
     ) -> bool {
         self.thompson.is_uncertain(domain_id, bucket, 0.15)
+    }
+
+    /// Select arm with curiosity-boosted Thompson Sampling.
+    ///
+    /// Combines the standard Thompson sample with a UCB-style exploration
+    /// bonus that favors under-visited bucket/arm combinations.
+    pub fn select_arm_curious(
+        &self,
+        domain_id: &DomainId,
+        bucket: &ContextBucket,
+    ) -> Option<ArmId> {
+        let mut rng = rand::thread_rng();
+        // Get all arms and compute boosted scores
+        let prior = self.thompson.extract_prior(domain_id)?;
+        let arms: Vec<ArmId> = prior
+            .bucket_priors
+            .get(bucket)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+
+        if arms.is_empty() {
+            return self.thompson.select_arm(domain_id, bucket, &mut rng);
+        }
+
+        let mut best_arm = None;
+        let mut best_score = f32::NEG_INFINITY;
+
+        for arm in &arms {
+            let params = prior.get_prior(bucket, arm);
+            let sample = params.sample(&mut rng);
+            let boosted = self.meta.boosted_score(bucket, arm, sample);
+
+            if boosted > best_score {
+                best_score = boosted;
+                best_arm = Some(arm.clone());
+            }
+        }
+
+        best_arm.or_else(|| self.thompson.select_arm(domain_id, bucket, &mut rng))
+    }
+
+    /// Get meta-learning health diagnostics.
+    pub fn meta_health(&self) -> MetaLearningHealth {
+        self.meta.health_check()
+    }
+
+    /// Check cost curve for plateau and get recommended action.
+    pub fn check_plateau(
+        &mut self,
+        domain_id: &DomainId,
+    ) -> PlateauAction {
+        if let Some(curve) = self.scoreboard.curves.get(domain_id) {
+            self.meta.check_plateau(&curve.points)
+        } else {
+            PlateauAction::Continue
+        }
+    }
+
+    /// Get regret summary across all learning contexts.
+    pub fn regret_summary(&self) -> RegretSummary {
+        self.meta.regret.summary()
+    }
+
+    /// Get the Pareto front of non-dominated policy kernels.
+    pub fn pareto_front(&self) -> &ParetoFront {
+        &self.meta.pareto
     }
 }
 

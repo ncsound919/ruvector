@@ -1,8 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ruvector_domain_expansion::{
     ArmId, ContextBucket, CostCurve, CostCurvePoint, ConvergenceThresholds,
-    AccelerationScoreboard, DomainExpansionEngine, DomainId, MetaThompsonEngine,
-    PolicyKnobs, PopulationSearch, Solution, TransferPrior,
+    AccelerationScoreboard, CuriosityBonus, DecayingBeta, DomainExpansionEngine, DomainId,
+    MetaLearningEngine, MetaThompsonEngine, ParetoFront, ParetoPoint, PlateauDetector,
+    PolicyKnobs, PopulationSearch, RegretTracker, Solution, TransferPrior,
 };
 
 fn bench_task_generation(c: &mut Criterion) {
@@ -167,6 +168,181 @@ fn bench_transfer_prior_extract(c: &mut Criterion) {
     });
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Meta-Learning Benchmarks
+// ═══════════════════════════════════════════════════════════════════
+
+fn bench_regret_tracker(c: &mut Criterion) {
+    let bucket = ContextBucket {
+        difficulty_tier: "medium".into(),
+        category: "algo".into(),
+    };
+    let arms: Vec<ArmId> = (0..4).map(|i| ArmId(format!("arm_{}", i))).collect();
+
+    let mut group = c.benchmark_group("meta_learning");
+
+    group.bench_function("regret_record_1k", |b| {
+        b.iter(|| {
+            let mut tracker = RegretTracker::new(50);
+            for i in 0..1000 {
+                let arm = &arms[i % 4];
+                let reward = if i % 4 == 0 { 0.9 } else { 0.4 };
+                tracker.record(black_box(&bucket), black_box(arm), black_box(reward));
+            }
+            black_box(tracker.average_regret())
+        })
+    });
+
+    group.bench_function("regret_summary", |b| {
+        let mut tracker = RegretTracker::new(50);
+        for i in 0..1000 {
+            let arm = &arms[i % 4];
+            tracker.record(&bucket, arm, if i % 4 == 0 { 0.9 } else { 0.4 });
+        }
+        b.iter(|| black_box(tracker.summary()))
+    });
+
+    group.finish();
+}
+
+fn bench_decaying_beta(c: &mut Criterion) {
+    let mut group = c.benchmark_group("decaying_beta");
+
+    group.bench_function("update_1k", |b| {
+        b.iter(|| {
+            let mut db = DecayingBeta::new(0.995);
+            for i in 0..1000 {
+                let reward = if i % 3 == 0 { 0.9 } else { 0.4 };
+                db.update(black_box(reward));
+            }
+            black_box(db.mean())
+        })
+    });
+
+    group.bench_function("update_vs_standard", |b| {
+        b.iter(|| {
+            // Compare DecayingBeta vs standard BetaParams
+            let mut db = DecayingBeta::new(0.995);
+            let mut std_beta = ruvector_domain_expansion::BetaParams::uniform();
+            for i in 0..500 {
+                let reward = if i % 3 == 0 { 0.9 } else { 0.4 };
+                db.update(reward);
+                std_beta.update(reward);
+            }
+            black_box((db.mean(), std_beta.mean()))
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_plateau_detector(c: &mut Criterion) {
+    let points: Vec<CostCurvePoint> = (0..100)
+        .map(|i| CostCurvePoint {
+            cycle: i,
+            accuracy: 0.80 + (i as f32 * 0.001),
+            cost_per_solve: 0.1 / (i as f32 + 1.0),
+            robustness: 0.8,
+            policy_violations: 0,
+            timestamp: i as f64,
+        })
+        .collect();
+
+    c.bench_function("plateau_check_100pts", |b| {
+        b.iter(|| {
+            let mut detector = PlateauDetector::new(10, 0.005);
+            black_box(detector.check(black_box(&points)))
+        })
+    });
+}
+
+fn bench_pareto_front(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pareto_front");
+
+    group.bench_function("insert_100_points", |b| {
+        b.iter(|| {
+            let mut front = ParetoFront::new();
+            for i in 0..100 {
+                let acc = (i as f32) / 100.0;
+                let cost = -((100 - i) as f32) / 100.0;
+                let rob = ((i * 7 + 13) % 100) as f32 / 100.0;
+                front.insert(ParetoPoint {
+                    kernel_id: format!("k{}", i),
+                    objectives: vec![acc, cost, rob],
+                    generation: 0,
+                });
+            }
+            black_box(front.len())
+        })
+    });
+
+    group.bench_function("hypervolume_2d", |b| {
+        let mut front = ParetoFront::new();
+        for i in 0..20 {
+            let x = (i as f32 + 1.0) / 21.0;
+            front.insert(ParetoPoint {
+                kernel_id: format!("k{}", i),
+                objectives: vec![x, 1.0 - x],
+                generation: 0,
+            });
+        }
+        b.iter(|| black_box(front.hypervolume(&[0.0, 0.0])))
+    });
+
+    group.finish();
+}
+
+fn bench_curiosity_bonus(c: &mut Criterion) {
+    let arms: Vec<ArmId> = (0..4).map(|i| ArmId(format!("arm_{}", i))).collect();
+    let buckets: Vec<ContextBucket> = (0..18)
+        .map(|i| ContextBucket {
+            difficulty_tier: ["easy", "medium", "hard"][i / 6].into(),
+            category: format!("cat_{}", i % 6),
+        })
+        .collect();
+
+    c.bench_function("curiosity_bonus_18buckets", |b| {
+        let mut curiosity = CuriosityBonus::new(1.41);
+        for _ in 0..500 {
+            for bucket in &buckets {
+                for arm in &arms {
+                    curiosity.record_visit(bucket, arm);
+                }
+            }
+        }
+        b.iter(|| {
+            let mut total = 0.0f32;
+            for bucket in &buckets {
+                for arm in &arms {
+                    total += curiosity.bonus(black_box(bucket), black_box(arm));
+                }
+            }
+            black_box(total)
+        })
+    });
+}
+
+fn bench_meta_engine_full_cycle(c: &mut Criterion) {
+    c.bench_function("meta_engine_100_decisions", |b| {
+        b.iter(|| {
+            let mut engine = MetaLearningEngine::new();
+            let bucket = ContextBucket {
+                difficulty_tier: "medium".into(),
+                category: "algo".into(),
+            };
+            let arm = ArmId("greedy".into());
+
+            for i in 0..100 {
+                let reward = if i % 3 == 0 { 0.9 } else { 0.5 };
+                engine.record_decision(&bucket, &arm, reward);
+            }
+
+            engine.record_kernel("k1", 0.9, 0.2, 0.8, 1);
+            black_box(engine.health_check())
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_task_generation,
@@ -177,5 +353,11 @@ criterion_group!(
     bench_knobs_mutate,
     bench_cost_curve_auc,
     bench_transfer_prior_extract,
+    bench_regret_tracker,
+    bench_decaying_beta,
+    bench_plateau_detector,
+    bench_pareto_front,
+    bench_curiosity_bonus,
+    bench_meta_engine_full_cycle,
 );
 criterion_main!(benches);
