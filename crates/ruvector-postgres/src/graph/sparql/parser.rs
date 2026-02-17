@@ -71,6 +71,7 @@ impl<'a> SparqlParser<'a> {
 
     fn parse_query_body(&mut self) -> Result<QueryBody, SparqlError> {
         self.skip_whitespace();
+        let saved_pos = self.pos;
 
         if self.match_keyword("SELECT") {
             Ok(QueryBody::Select(self.parse_select_query()?))
@@ -87,7 +88,7 @@ impl<'a> SparqlParser<'a> {
             || self.match_keyword("CREATE")
             || self.match_keyword("DROP")
         {
-            self.pos = self.pos.saturating_sub(6); // Backtrack
+            self.pos = saved_pos; // Backtrack to before the matched keyword
             Ok(QueryBody::Update(self.parse_update()?))
         } else {
             Err(SparqlError::ParseError(format!(

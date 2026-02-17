@@ -21,7 +21,7 @@ static EMPTY_PREFIXES: Lazy<HashMap<String, Iri>> = Lazy::new(HashMap::new);
 /// Execution context for SPARQL queries
 pub struct SparqlContext<'a> {
     pub store: &'a TripleStore,
-    pub default_graph: Option<&'a str>,
+    pub default_graph: Option<String>,
     pub named_graphs: Vec<&'a str>,
     pub base: Option<&'a Iri>,
     pub prefixes: &'a HashMap<String, Iri>,
@@ -260,8 +260,8 @@ fn evaluate_graph_pattern(
 
             if let Some(graph) = graph_iri {
                 // Temporarily set the graph context
-                let old_default = ctx.default_graph;
-                ctx.default_graph = Some(Box::leak(graph.into_boxed_str()));
+                let old_default = ctx.default_graph.clone();
+                ctx.default_graph = Some(graph);
                 let result = evaluate_graph_pattern(ctx, inner);
                 ctx.default_graph = old_default;
                 result
@@ -269,14 +269,13 @@ fn evaluate_graph_pattern(
                 // Union over all named graphs
                 let mut all_solutions = Vec::new();
                 for graph in ctx.store.list_graphs() {
-                    let graph_str: &'static str = Box::leak(graph.into_boxed_str());
-                    ctx.default_graph = Some(graph_str);
+                    ctx.default_graph = Some(graph.clone());
                     let solutions = evaluate_graph_pattern(ctx, inner)?;
 
                     // Add graph variable binding
                     if let VarOrIri::Variable(var) = graph_name {
                         for mut sol in solutions {
-                            sol.insert(var.clone(), RdfTerm::Iri(Iri::new(graph_str)));
+                            sol.insert(var.clone(), RdfTerm::Iri(Iri::new(&graph)));
                             all_solutions.push(sol);
                         }
                     } else {
