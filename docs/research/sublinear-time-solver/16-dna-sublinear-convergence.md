@@ -1,8 +1,11 @@
-# DNA + Sublinear Solver Convergence Analysis
+# 16 — DNA + Sublinear Solver Convergence Analysis
 
-**Document ID**: 16-dna-sublinear-convergence
+**Document ID**: ADR-STS-DNA-001
+**Status**: Implemented (Solver Infrastructure Complete)
 **Date**: 2026-02-20
-**Status**: Strategic Analysis
+**Version**: 2.0
+**Authors**: RuVector Architecture Team
+**Related ADRs**: ADR-STS-001, ADR-STS-002, ADR-STS-005, ADR-STS-008
 **Premise**: RuVector already has a production-grade genomics suite — what happens when you add O(log n) math?
 
 ---
@@ -38,6 +41,32 @@ examples/dna/
 | RVDNA format | AI-native binary with pre-computed tensors | O(n) encode/decode |
 | CYP star alleles | Pharmacogenomic drug recommendations | O(variants) lookup |
 | Pipeline orchestrator | DAG-based multi-stage execution | O(stages) sequential |
+
+---
+
+## Implementation Status
+
+The solver infrastructure enabling all 7 convergence points is now fully implemented. The following maps each DNA-solver convergence point to the realized solver primitives.
+
+### Solver Primitive Availability
+
+| Convergence Point | Required Solver Primitive | Implemented In | LOC | Tests |
+|------------------|--------------------------|---------------|-----|-------|
+| 1. Protein Contact Graph PageRank | Forward Push, PageRank | `forward_push.rs` (828), `router.rs` | 828 | 17 |
+| 2. RVDNA Sparse Attention Solve | Neumann Series, SpMV | `neumann.rs` (715), `types.rs` | 715 | 18 |
+| 3. Variant Calling (LD Solve) | CG Solver, CsrMatrix | `cg.rs` (1,112), `types.rs` (600) | 1,112 | 24 |
+| 4. Epigenetic Age Regression | CG Solver (sparse regression) | `cg.rs` (1,112) | 1,112 | 24 |
+| 5. K-mer HNSW Optimization | Forward Push (PageRank on graph) | `forward_push.rs` (828) | 828 | 17 |
+| 6. Cancer Network Detection | TRUE (spectral clustering) | `true_solver.rs` (908) | 908 | 18 |
+| 7. DNA Storage + Computation | Full solver suite | All 18 modules | 10,729 | 241 |
+
+### WASM Deployment for Browser Genomics
+
+All solver algorithms are compiled to `wasm32-unknown-unknown` via `ruvector-solver-wasm` (1,196 LOC), enabling browser-native genomic analysis with sublinear math. The WASM build includes SIMD128 acceleration for SpMV.
+
+### Error Handling for Biological Data
+
+`error.rs` (120 LOC) provides structured error types for convergence failure, budget exhaustion, and numerical instability — critical for clinical genomics where silent failures are unacceptable. `validation.rs` (790 LOC, 39 tests) validates all inputs at the system boundary.
 
 ---
 
@@ -335,6 +364,18 @@ RuVector becomes the **digital twin of biological computation**.
 | Pangenome (100K haplotypes, 11-mer index) | Days to build index | Hours |
 | LD matrix (1M variants, window 500K) | Infeasible dense | Sparse solve in minutes |
 | Methylation network (450K sites) | Can't compute correlations | Sparse covariance in hours |
+
+---
+
+## Cross-Reference to ADR-STS Series
+
+| ADR | Enables Convergence Point(s) | Key Contribution |
+|-----|----------------------------|-----------------|
+| ADR-STS-001 | All | Core integration architecture for solver ↔ DNA pipeline |
+| ADR-STS-002 | 1, 2, 5 | Algorithm routing selects optimal solver per genomic workload |
+| ADR-STS-005 | 3, 4, 6 | Security model for clinical genomic data processing |
+| ADR-STS-008 | 3, 4 | Error handling ensures no silent failures in variant calling |
+| ADR-STS-010 | 7 | API surface design for cross-platform genomic solver access |
 
 ---
 

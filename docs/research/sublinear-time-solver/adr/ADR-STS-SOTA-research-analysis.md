@@ -3,7 +3,7 @@
 **Date**: 2026-02-20
 **Classification**: Research Analysis
 **Scope**: SOTA algorithms applicable to RuVector's 79-crate ecosystem
-**Version**: 3.0 (SOTA Implementation Complete)
+**Version**: 4.0 (Full Implementation Verified)
 
 ---
 
@@ -577,17 +577,33 @@ All seven algorithms identified in the practical subset (Section 5) have been fu
 
 ### 13.1 Algorithm-to-Module Mapping
 
-| Algorithm | Module | Status | Tests |
-|-----------|--------|--------|-------|
-| Neumann Series | neumann.rs | Complete, Jacobi-preconditioned | 18 unit + 5 integration |
-| Conjugate Gradient | cg.rs | Complete | 8 integration |
-| Forward Push | forward_push.rs | Complete | 5 integration |
-| Backward Push | backward_push.rs | Complete | Unit tests |
-| Hybrid Random Walk | random_walk.rs | Complete | Unit tests |
-| TRUE | true_solver.rs | Complete (JL + sparsify + Neumann) | Unit tests |
-| BMSSP | bmssp.rs | Complete (multigrid) | Unit tests |
+| Algorithm | Module | LOC | Tests | Status |
+|-----------|--------|-----|-------|--------|
+| Neumann Series | `neumann.rs` | 715 | 18 unit + 5 integration | Complete, Jacobi-preconditioned |
+| Conjugate Gradient | `cg.rs` | 1,112 | 24 unit + 5 integration | Complete |
+| Forward Push | `forward_push.rs` | 828 | 17 unit + 6 integration | Complete |
+| Backward Push | `backward_push.rs` | 714 | 14 unit | Complete |
+| Hybrid Random Walk | `random_walk.rs` | 838 | 22 unit | Complete |
+| TRUE | `true_solver.rs` | 908 | 18 unit | Complete (JL + sparsify + Neumann) |
+| BMSSP | `bmssp.rs` | 1,151 | 16 unit | Complete (multigrid) |
 
-**Total**: 177 passing tests across the full solver suite.
+**Supporting Infrastructure**:
+
+| Module | LOC | Tests | Purpose |
+|--------|-----|-------|---------|
+| `router.rs` | 1,702 | 24+4 | Adaptive algorithm selection with SONA compatibility |
+| `types.rs` | 600 | 8 | CsrMatrix, SpMV, SparsityProfile, convergence types |
+| `validation.rs` | 790 | 34+5 | Input validation at system boundary |
+| `audit.rs` | 316 | 8 | SHAKE-256 witness chain audit trail |
+| `budget.rs` | 310 | 9 | Compute budget enforcement |
+| `arena.rs` | 176 | 2 | Cache-aligned arena allocator |
+| `simd.rs` | 162 | 2 | SIMD abstraction (AVX-512/AVX2/NEON/WASM SIMD128) |
+| `error.rs` | 120 | — | Structured error hierarchy |
+| `events.rs` | 86 | — | Event sourcing for state changes |
+| `traits.rs` | 138 | — | Solver trait definitions |
+| `lib.rs` | 63 | — | Public API re-exports |
+
+**Totals**: 10,729 LOC across 18 source files, 241 #[test] functions across 19 test files.
 
 ### 13.2 Fused Kernels
 

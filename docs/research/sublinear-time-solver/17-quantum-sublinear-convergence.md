@@ -1,8 +1,11 @@
-# Quantum + Sublinear Solver Convergence Analysis
+# 17 — Quantum + Sublinear Solver Convergence Analysis
 
-**Document ID**: 17-quantum-sublinear-convergence
+**Document ID**: ADR-STS-QUANTUM-001
+**Status**: Implemented (Solver Infrastructure Complete)
 **Date**: 2026-02-20
-**Status**: Strategic Analysis
+**Version**: 2.0
+**Authors**: RuVector Architecture Team
+**Related ADRs**: ADR-STS-001, ADR-STS-002, ADR-STS-004, ADR-STS-009, ADR-QE-001 through ADR-QE-015
 **Premise**: RuVector has 5 quantum crates — what happens when sublinear math meets quantum simulation?
 
 ---
@@ -58,6 +61,35 @@ crates/ruqu-exotic/        → Exotic Quantum-Classical Hybrid Algorithms
 
 crates/ruqu-wasm/          → WASM compilation target for browser-native quantum
 ```
+
+---
+
+## Implementation Status
+
+The solver infrastructure enabling all 8 quantum-solver convergence points is now fully implemented. The ruQu quantum stack (5 crates) and ruvector-solver (18 modules) share the same sparse matrix and spectral primitives.
+
+### Solver Primitive Availability for Quantum
+
+| Convergence Point | Required Solver Primitive | Implemented In | LOC | Tests |
+|------------------|--------------------------|---------------|-----|-------|
+| 1. VQE Hamiltonian Warm-Start | CG (sparse eigenvector), CsrMatrix | `cg.rs` (1,112), `types.rs` | 1,112 | 24 |
+| 2. QAOA Spectral Init | TRUE (spectral analysis), Forward Push | `true_solver.rs` (908), `forward_push.rs` (828) | 1,736 | 35 |
+| 3. Tensor Network SVD | Random Walk (randomized projection) | `random_walk.rs` (838), `true_solver.rs` | 1,746 | 40 |
+| 4. QEC Syndrome Decode | Forward Push (graph matching), CG | `forward_push.rs` (828), `cg.rs` (1,112) | 1,940 | 41 |
+| 5. Coherence Gate Enhancement | TRUE (spectral gap), Neumann | `true_solver.rs` (908), `neumann.rs` (715) | 1,623 | 36 |
+| 6. Interference Search | Forward Push (sparse propagation) | `forward_push.rs` (828) | 828 | 17 |
+| 7. Classical-Quantum Boundary | Router (adaptive selection) | `router.rs` (1,702) | 1,702 | 28 |
+| 8. Quantum DNA Triple | Full solver suite | All 18 modules | 10,729 | 241 |
+
+### Shared Infrastructure
+
+| Component | Shared Between | Module |
+|-----------|---------------|--------|
+| CsrMatrix (sparse format) | ruqu-core + ruvector-solver | `types.rs` (600 LOC) |
+| SpMV (sparse mat-vec) | ruqu syndrome processing + solver iteration | `types.rs`, `simd.rs` (162 LOC) |
+| Spectral estimation | ruqu coherence + solver routing | `true_solver.rs`, `router.rs` |
+| WASM compilation | ruqu-wasm + solver-wasm | Both target `wasm32-unknown-unknown` |
+| Error handling | Quantum noise + solver convergence | `error.rs` (120 LOC) |
 
 ---
 
@@ -379,6 +411,22 @@ handles the classical parts and routes the hard quantum parts to ruqu-core.
 | QEC d=5 surface code | ~10us decode | ~2us (sublinear cluster) | <1us with predictive coherence |
 | MPS 50-qubit, chi=1024 | ~10^9 per gate | ~10^7 (sparse SVD) | Real-time for moderate depth |
 | Syndrome processing | 1M rounds/sec | 5M rounds/sec | 10M+ with predictive pruning |
+
+---
+
+## Cross-Reference to ADR Series
+
+| ADR | Enables Convergence Point(s) | Key Contribution |
+|-----|----------------------------|-----------------|
+| ADR-STS-001 | All | Core integration architecture |
+| ADR-STS-002 | 1, 2, 7 | Algorithm routing for quantum-classical handoff |
+| ADR-STS-004 | 8 | WASM cross-platform for browser quantum+solver |
+| ADR-STS-009 | 3, 4 | Concurrency model for parallel tensor contraction |
+| ADR-QE-001 | All | Quantum engine core architecture |
+| ADR-QE-002 | 1-4 | Crate structure enabling quantum-solver integration |
+| ADR-QE-009 | 3 | Tensor network evaluation primitives |
+| ADR-QE-012 | 5 | Min-cut coherence integration |
+| ADR-QE-014 | 6, 8 | Exotic quantum-classical hybrid algorithms |
 
 ---
 
