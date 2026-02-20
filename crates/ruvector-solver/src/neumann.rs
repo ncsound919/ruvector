@@ -378,6 +378,26 @@ impl SolverEngine for NeumannSolver {
     ) -> Result<SolverResult, SolverError> {
         let start = Instant::now();
 
+        // Validate that f64 values fit in f32 range.
+        for (i, &v) in matrix.values.iter().enumerate() {
+            if v.is_finite() && v.abs() > f32::MAX as f64 {
+                return Err(SolverError::InvalidInput(
+                    ValidationError::NonFiniteValue(format!(
+                        "matrix value at index {i} ({v:.6e}) overflows f32"
+                    )),
+                ));
+            }
+        }
+        for (i, &v) in rhs.iter().enumerate() {
+            if v.is_finite() && v.abs() > f32::MAX as f64 {
+                return Err(SolverError::InvalidInput(
+                    ValidationError::NonFiniteValue(format!(
+                        "rhs value at index {i} ({v:.6e}) overflows f32"
+                    )),
+                ));
+            }
+        }
+
         // Convert f64 matrix to f32 for the core solver.
         let f32_matrix = CsrMatrix {
             row_ptr: matrix.row_ptr.clone(),

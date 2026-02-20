@@ -347,13 +347,85 @@ impl HybridRandomWalkSolver {
     ) -> Result<Vec<(usize, f64)>, SolverError> {
         Self::validate_graph_node(graph, source, "source")?;
 
-        let mut rng = self.make_rng();
-        let mut counts = vec![0u64; graph.rows];
-
-        for _ in 0..num_walks {
-            let endpoint = Self::single_walk(graph, source, alpha, &mut rng);
-            counts[endpoint] += 1;
+        #[cfg(feature = "parallel")]
+        {
+            return self.ppr_from_source_parallel(graph, source, alpha, num_walks);
         }
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut rng = self.make_rng();
+            let mut counts = vec![0u64; graph.rows];
+
+            for _ in 0..num_walks {
+                let endpoint = Self::single_walk(graph, source, alpha, &mut rng);
+                counts[endpoint] += 1;
+            }
+
+            let inv = 1.0 / num_walks as f64;
+            let mut result: Vec<(usize, f64)> = counts
+                .into_iter()
+                .enumerate()
+                .filter(|(_, c)| *c > 0)
+                .map(|(v, c)| (v, c as f64 * inv))
+                .collect();
+            result.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            Ok(result)
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn ppr_from_source_parallel(
+        &self,
+        graph: &CsrMatrix<f64>,
+        source: usize,
+        alpha: f64,
+        num_walks: usize,
+    ) -> Result<Vec<(usize, f64)>, SolverError> {
+        use rayon::prelude::*;
+
+        let n = graph.rows;
+
+        // Split walks across threads, each with its own RNG derived from the base seed.
+        let num_chunks = rayon::current_num_threads().max(1);
+        let walks_per_chunk = num_walks / num_chunks;
+        let remainder = num_walks % num_chunks;
+
+        let counts: Vec<u64> = (0..num_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                // Derive a per-chunk seed from the base seed.
+                let chunk_seed = if self.seed == 0 {
+                    chunk_idx as u64 + 1
+                } else {
+                    self.seed.wrapping_add(chunk_idx as u64 * 1000003)
+                };
+                let mut rng = StdRng::seed_from_u64(chunk_seed);
+
+                let chunk_walks =
+                    walks_per_chunk + if chunk_idx < remainder { 1 } else { 0 };
+                let mut local_counts = vec![0u64; n];
+
+                for _ in 0..chunk_walks {
+                    let endpoint =
+                        Self::single_walk(graph, source, alpha, &mut rng);
+                    local_counts[endpoint] += 1;
+                }
+
+                local_counts
+            })
+            .reduce(
+                || vec![0u64; n],
+                |mut a, b| {
+                    for (i, &v) in b.iter().enumerate() {
+                        a[i] += v;
+                    }
+                    a
+                },
+            );
 
         let inv = 1.0 / num_walks as f64;
         let mut result: Vec<(usize, f64)> = counts
@@ -406,7 +478,6 @@ impl SolverEngine for HybridRandomWalkSolver {
         }
 
         let start_time = Instant::now();
-        let mut rng = self.make_rng();
 
         // Interpret rhs as a source distribution.
         let rhs_sum: f64 = rhs.iter().map(|v| v.abs()).sum();
@@ -430,22 +501,70 @@ impl SolverEngine for HybridRandomWalkSolver {
         }
 
         let walks = self.num_walks.min(budget.max_iterations.saturating_mul(10));
-        let mut counts = vec![0.0f64; n];
 
-        for _ in 0..walks {
-            if start_time.elapsed() > budget.max_time {
-                return Err(SolverError::BudgetExhausted {
-                    reason: "wall-clock time limit exceeded".into(),
-                    elapsed: start_time.elapsed(),
-                });
+        #[cfg(feature = "parallel")]
+        let counts = {
+            use rayon::prelude::*;
+
+            let num_chunks = rayon::current_num_threads().max(1);
+            let walks_per_chunk = walks / num_chunks;
+            let remainder = walks % num_chunks;
+
+            (0..num_chunks)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let chunk_seed = if self.seed == 0 {
+                        chunk_idx as u64 + 1
+                    } else {
+                        self.seed.wrapping_add(chunk_idx as u64 * 1000003)
+                    };
+                    let mut rng = StdRng::seed_from_u64(chunk_seed);
+                    let chunk_walks =
+                        walks_per_chunk + if chunk_idx < remainder { 1 } else { 0 };
+                    let mut local_counts = vec![0.0f64; n];
+
+                    for _ in 0..chunk_walks {
+                        let r: f64 = rng.gen();
+                        let start_node =
+                            cdf.partition_point(|&c| c < r).min(n - 1);
+                        let endpoint = Self::single_walk(
+                            matrix, start_node, self.alpha, &mut rng,
+                        );
+                        local_counts[endpoint] += 1.0;
+                    }
+                    local_counts
+                })
+                .reduce(
+                    || vec![0.0f64; n],
+                    |mut a, b| {
+                        for (i, &v) in b.iter().enumerate() {
+                            a[i] += v;
+                        }
+                        a
+                    },
+                )
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let counts = {
+            let mut rng = self.make_rng();
+            let mut counts = vec![0.0f64; n];
+            for _ in 0..walks {
+                if start_time.elapsed() > budget.max_time {
+                    return Err(SolverError::BudgetExhausted {
+                        reason: "wall-clock time limit exceeded".into(),
+                        elapsed: start_time.elapsed(),
+                    });
+                }
+
+                let r: f64 = rng.gen();
+                let start_node = cdf.partition_point(|&c| c < r).min(n - 1);
+                let endpoint =
+                    Self::single_walk(matrix, start_node, self.alpha, &mut rng);
+                counts[endpoint] += 1.0;
             }
-
-            let r: f64 = rng.gen();
-            let start_node = cdf.partition_point(|&c| c < r).min(n - 1);
-            let endpoint =
-                Self::single_walk(matrix, start_node, self.alpha, &mut rng);
-            counts[endpoint] += 1.0;
-        }
+            counts
+        };
 
         let scale = rhs_sum / (walks as f64);
         let solution: Vec<f32> =

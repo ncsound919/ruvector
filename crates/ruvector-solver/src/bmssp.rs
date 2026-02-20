@@ -55,6 +55,10 @@ const COARSEST_DIRECT_LIMIT: usize = 100;
 /// Target aggregate size during aggregation-based coarsening.
 const TARGET_AGGREGATE_SIZE: usize = 4;
 
+/// Threshold below which a scalar is treated as zero for division safety.
+/// Standardized across solver modules (matches neumann.rs and cg.rs).
+const NEAR_ZERO_F64: f64 = 1e-15;
+
 // ---------------------------------------------------------------------------
 // Public solver struct
 // ---------------------------------------------------------------------------
@@ -487,7 +491,7 @@ fn gauss_seidel_sweep(matrix: &CsrMatrix<f64>, x: &mut [f64], b: &[f64]) {
                 sigma += v * x[j];
             }
         }
-        if diag.abs() > 1e-30 {
+        if diag.abs() > NEAR_ZERO_F64 {
             x[i] = (b[i] - sigma) / diag;
         }
     }
@@ -546,7 +550,7 @@ fn dense_direct_solve(matrix: &CsrMatrix<f64>, b: &[f64]) -> Vec<f64> {
         }
 
         let pivot = aug[col * stride + col];
-        if pivot.abs() < 1e-30 {
+        if pivot.abs() < NEAR_ZERO_F64 {
             continue;
         }
 
@@ -567,7 +571,7 @@ fn dense_direct_solve(matrix: &CsrMatrix<f64>, b: &[f64]) -> Vec<f64> {
             sum -= aug[i * stride + j] * x[j];
         }
         let diag = aug[i * stride + i];
-        if diag.abs() > 1e-30 {
+        if diag.abs() > NEAR_ZERO_F64 {
             x[i] = sum / diag;
         }
     }

@@ -24,57 +24,6 @@ use crate::types::{
 };
 
 // ---------------------------------------------------------------------------
-// Kahan compensated accumulator
-// ---------------------------------------------------------------------------
-
-/// Kahan (compensated) summation accumulator.
-///
-/// Tracks a running compensation term to absorb floating-point rounding,
-/// giving roughly double the significant digits of naive summation. This is
-/// critical for the residual accumulation loop where many small increments
-/// are added to a running total.
-#[derive(Debug, Clone, Copy)]
-struct KahanAccumulator {
-    sum: f64,
-    compensation: f64,
-}
-
-impl KahanAccumulator {
-    /// Create a zero-initialised accumulator.
-    #[inline]
-    const fn new() -> Self {
-        Self {
-            sum: 0.0,
-            compensation: 0.0,
-        }
-    }
-
-    /// Create an accumulator pre-loaded with `value`.
-    #[inline]
-    const fn from_value(value: f64) -> Self {
-        Self {
-            sum: value,
-            compensation: 0.0,
-        }
-    }
-
-    /// Add `value` with Kahan compensation.
-    #[inline]
-    fn add(&mut self, value: f64) {
-        let y = value - self.compensation;
-        let t = self.sum + y;
-        self.compensation = (t - self.sum) - y;
-        self.sum = t;
-    }
-
-    /// Current compensated sum.
-    #[inline]
-    fn value(&self) -> f64 {
-        self.sum
-    }
-}
-
-// ---------------------------------------------------------------------------
 // ForwardPushSolver
 // ---------------------------------------------------------------------------
 
@@ -210,8 +159,8 @@ impl ForwardPushSolver {
             ));
         }
 
-        let mut estimate = vec![KahanAccumulator::new(); n];
-        let mut residual = vec![KahanAccumulator::new(); n];
+        let mut estimate = vec![0.0f64; n];
+        let mut residual = vec![0.0f64; n];
 
         // BFS-style work-queue with a membership bitvec.
         let mut in_queue = vec![false; n];
@@ -219,9 +168,9 @@ impl ForwardPushSolver {
 
         // Initialise residuals from seed distribution.
         for &(v, mass) in seeds {
-            residual[v].add(mass);
+            residual[v] += mass;
             if !in_queue[v]
-                && should_push(residual[v].value(), graph.row_degree(v), self.epsilon)
+                && should_push(residual[v], graph.row_degree(v), self.epsilon)
             {
                 queue.push_back(v);
                 in_queue[v] = true;
@@ -232,7 +181,7 @@ impl ForwardPushSolver {
         while let Some(u) = queue.pop_front() {
             in_queue[u] = false;
 
-            let r_u = residual[u].value();
+            let r_u = residual[u];
 
             // Re-check: the residual may have decayed since enqueue.
             if !should_push(r_u, graph.row_degree(u), self.epsilon) {
@@ -240,7 +189,7 @@ impl ForwardPushSolver {
             }
 
             // Absorb alpha fraction into the estimate.
-            estimate[u].add(self.alpha * r_u);
+            estimate[u] += self.alpha * r_u;
 
             let degree = graph.row_degree(u);
             if degree > 0 {
@@ -250,14 +199,14 @@ impl ForwardPushSolver {
                 // neighbours. This is critical for self-loops: if u has an
                 // edge to itself, the push_amount added via the self-loop
                 // must not be overwritten.
-                residual[u] = KahanAccumulator::new();
+                residual[u] = 0.0;
 
                 for (v, _weight) in graph.row_entries(u) {
-                    residual[v].add(push_amount);
+                    residual[v] += push_amount;
 
                     if !in_queue[v]
                         && should_push(
-                            residual[v].value(),
+                            residual[v],
                             graph.row_degree(v),
                             self.epsilon,
                         )
@@ -274,7 +223,7 @@ impl ForwardPushSolver {
                 // converge geometrically since each push multiplies the
                 // residual by (1-alpha).
                 let leftover = (1.0 - self.alpha) * r_u;
-                residual[u] = KahanAccumulator::from_value(leftover);
+                residual[u] = leftover;
 
                 if !in_queue[u] && should_push(leftover, 0, self.epsilon) {
                     queue.push_back(u);
@@ -292,8 +241,8 @@ impl ForwardPushSolver {
         let mut result: Vec<(usize, f64)> = estimate
             .iter()
             .enumerate()
-            .filter(|(_, acc)| acc.value() > 0.0)
-            .map(|(i, acc)| (i, acc.value()))
+            .filter(|(_, val)| **val > 0.0)
+            .map(|(i, val)| (i, *val))
             .collect();
 
         result.sort_by(|a, b| {
@@ -317,10 +266,10 @@ pub fn forward_push_with_residuals(
     validate_vertex(matrix, source, "source")?;
 
     let n = matrix.rows;
-    let mut estimate = vec![KahanAccumulator::new(); n];
-    let mut residual = vec![KahanAccumulator::new(); n];
+    let mut estimate = vec![0.0f64; n];
+    let mut residual = vec![0.0f64; n];
 
-    residual[source] = KahanAccumulator::from_value(1.0);
+    residual[source] = 1.0;
 
     let mut in_queue = vec![false; n];
     let mut queue: VecDeque<usize> = VecDeque::new();
@@ -332,23 +281,23 @@ pub fn forward_push_with_residuals(
 
     while let Some(u) = queue.pop_front() {
         in_queue[u] = false;
-        let r_u = residual[u].value();
+        let r_u = residual[u];
 
         if !should_push(r_u, matrix.row_degree(u), epsilon) {
             continue;
         }
 
-        estimate[u].add(alpha * r_u);
+        estimate[u] += alpha * r_u;
 
         let degree = matrix.row_degree(u);
         if degree > 0 {
             let push_amount = (1.0 - alpha) * r_u / degree as f64;
             // Zero before distributing (self-loop safety).
-            residual[u] = KahanAccumulator::new();
+            residual[u] = 0.0;
             for (v, _) in matrix.row_entries(u) {
-                residual[v].add(push_amount);
+                residual[v] += push_amount;
                 if !in_queue[v]
-                    && should_push(residual[v].value(), matrix.row_degree(v), epsilon)
+                    && should_push(residual[v], matrix.row_degree(v), epsilon)
                 {
                     queue.push_back(v);
                     in_queue[v] = true;
@@ -357,7 +306,7 @@ pub fn forward_push_with_residuals(
         } else {
             // Dangling vertex: keep (1-alpha) portion as residual.
             let leftover = (1.0 - alpha) * r_u;
-            residual[u] = KahanAccumulator::from_value(leftover);
+            residual[u] = leftover;
             if !in_queue[u] && should_push(leftover, 0, epsilon) {
                 queue.push_back(u);
                 in_queue[u] = true;
@@ -365,9 +314,7 @@ pub fn forward_push_with_residuals(
         }
     }
 
-    let p: Vec<f64> = estimate.iter().map(|a| a.value()).collect();
-    let r: Vec<f64> = residual.iter().map(|a| a.value()).collect();
-    Ok((p, r))
+    Ok((estimate, residual))
 }
 
 // ---------------------------------------------------------------------------
@@ -407,19 +354,11 @@ fn validate_vertex(
 
 /// Verify the mass invariant: `sum(estimate) + sum(residual) ~ expected`.
 fn check_mass_invariant(
-    estimate: &[KahanAccumulator],
-    residual: &[KahanAccumulator],
+    estimate: &[f64],
+    residual: &[f64],
     expected_mass: f64,
 ) -> Result<(), SolverError> {
-    let mut total = KahanAccumulator::new();
-    for acc in estimate {
-        total.add(acc.value());
-    }
-    for acc in residual {
-        total.add(acc.value());
-    }
-
-    let mass = total.value();
+    let mass: f64 = estimate.iter().sum::<f64>() + residual.iter().sum::<f64>();
     if (mass - expected_mass).abs() > 1e-6 {
         return Err(SolverError::NumericalInstability {
             iteration: 0,
@@ -528,6 +467,33 @@ impl SublinearPageRank for ForwardPushSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kahan (compensated) summation accumulator (test-only).
+    #[derive(Debug, Clone, Copy)]
+    struct KahanAccumulator {
+        sum: f64,
+        compensation: f64,
+    }
+
+    impl KahanAccumulator {
+        #[inline]
+        const fn new() -> Self {
+            Self { sum: 0.0, compensation: 0.0 }
+        }
+
+        #[inline]
+        fn add(&mut self, value: f64) {
+            let y = value - self.compensation;
+            let t = self.sum + y;
+            self.compensation = (t - self.sum) - y;
+            self.sum = t;
+        }
+
+        #[inline]
+        fn value(&self) -> f64 {
+            self.sum
+        }
+    }
 
     /// 4-vertex graph with bidirectional edges:
     ///   0 -- 1, 0 -- 2, 1 -- 2, 1 -- 3

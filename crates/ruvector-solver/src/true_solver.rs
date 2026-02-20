@@ -568,6 +568,26 @@ impl SolverEngine for TrueSolver {
         rhs: &[f64],
         _budget: &crate::types::ComputeBudget,
     ) -> Result<SolverResult, SolverError> {
+        // Validate that f64 values fit in f32 range.
+        for (i, &v) in matrix.values.iter().enumerate() {
+            if v.is_finite() && v.abs() > f32::MAX as f64 {
+                return Err(SolverError::InvalidInput(
+                    ValidationError::NonFiniteValue(format!(
+                        "matrix value at index {i} ({v:.6e}) overflows f32"
+                    )),
+                ));
+            }
+        }
+        for (i, &v) in rhs.iter().enumerate() {
+            if v.is_finite() && v.abs() > f32::MAX as f64 {
+                return Err(SolverError::InvalidInput(
+                    ValidationError::NonFiniteValue(format!(
+                        "rhs value at index {i} ({v:.6e}) overflows f32"
+                    )),
+                ));
+            }
+        }
+
         // Convert f64 input to f32 for internal computation.
         // NOTE: row_ptr and col_indices are cloned here because CsrMatrix owns
         // Vec<usize>, so we cannot borrow from the f64 matrix. A future
