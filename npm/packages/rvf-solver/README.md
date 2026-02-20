@@ -27,7 +27,7 @@ npm install @ruvector/rvf
 - **Three-loop adaptive solver** — fast: constraint propagation solve, medium: PolicyKernel skip-mode selection, slow: KnowledgeCompiler pattern distillation
 - **SHAKE-256 tamper-evident witness chain** — 73 bytes per entry, cryptographically linked proof of all operations
 - **Full acceptance test with A/B/C ablation modes** — validates learned policy outperforms fixed and compiler baselines
-- **~160 KB WASM binary, `no_std`** — runs anywhere WebAssembly does (browsers, Node.js, Deno, Cloudflare Workers, edge runtimes)
+- **~132 KB WASM binary, `no_std`** — runs anywhere WebAssembly does (browsers, Node.js, Deno, Cloudflare Workers, edge runtimes)
 
 ## Quick Start
 
@@ -44,9 +44,9 @@ console.log(`Patterns learned: ${result.patternsLearned}`);
 
 // Run full acceptance test (A/B/C ablation)
 const manifest = solver.acceptance({ cycles: 3 });
-console.log(`Mode A (fixed):    ${manifest.modeA.finalAccuracy.toFixed(3)}`);
-console.log(`Mode B (compiler): ${manifest.modeB.finalAccuracy.toFixed(3)}`);
-console.log(`Mode C (learned):  ${manifest.modeC.finalAccuracy.toFixed(3)}`);
+console.log(`Mode A passed: ${manifest.modeA.passed}`);
+console.log(`Mode B passed: ${manifest.modeB.passed}`);
+console.log(`Mode C passed: ${manifest.modeC.passed}`);
 console.log(`All passed: ${manifest.allPassed}`);
 
 // Inspect Thompson Sampling policy state
@@ -159,7 +159,11 @@ solver.destroy();
 | Field | Type | Description |
 |-------|------|-------------|
 | `passed` | `boolean` | Whether this mode met the accuracy threshold |
-| `finalAccuracy` | `number` | Accuracy on the final holdout cycle |
+| `accuracyMaintained` | `boolean` | Accuracy maintained across cycles |
+| `costImproved` | `boolean` | Cost per solve improved |
+| `robustnessImproved` | `boolean` | Noise robustness improved |
+| `zeroViolations` | `boolean` | No constraint violations |
+| `dimensionsImproved` | `number` | Number of dimensions that improved |
 | `cycles` | `CycleMetrics[]` | Per-cycle accuracy and cost metrics |
 
 ### PolicyState

@@ -9590,6 +9590,7 @@ dependencies = [
  "axum-test 16.4.1",
  "clap",
  "http-body-util",
+ "mime_guess",
  "rvf-runtime",
  "rvf-types",
  "serde",
@@ -9597,6 +9598,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower 0.5.2",
+ "tower-http 0.6.8",
 ]
 
 [[package]]
