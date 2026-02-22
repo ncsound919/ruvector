@@ -35,6 +35,7 @@ harness = false
 [features]
 default = ["std"]
 std = ["ruvector-mincut"]
+canonical-witness = []  # Canonical pseudo-deterministic witness fragments
 
 [profile.release]
 opt-level = "z"      # Optimize for size

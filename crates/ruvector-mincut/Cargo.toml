@@ -42,7 +42,7 @@ mockall = { workspace = true }
 
 [features]
 default = ["exact", "approximate"]
-full = ["exact", "approximate", "integration", "monitoring", "simd", "agentic", "jtree", "tiered"]
+full = ["exact", "approximate", "integration", "monitoring", "simd", "agentic", "jtree", "tiered", "canonical"]
 exact = []  # Exact minimum cut algorithm
 approximate = []  # (1+ε)-approximate algorithm
 integration = ["ruvector-graph"]  # GraphDB integration
@@ -52,6 +52,7 @@ wasm = []  # WASM compatibility mode
 agentic = []  # 256-core parallel agentic chip backend
 jtree = []  # j-Tree hierarchical decomposition (ADR-002)
 tiered = ["jtree", "exact"]  # Two-tier coordinator (j-tree + exact)
+canonical = []  # Pseudo-deterministic canonical min-cut via cactus representation
 all-cut-queries = ["jtree"]  # Sparsest cut, multiway, multicut queries
 
 [lib]
