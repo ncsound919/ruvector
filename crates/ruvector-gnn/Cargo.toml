@@ -49,6 +49,7 @@ simd = []
 wasm = []
 napi = ["dep:napi", "dep:napi-derive"]
 mmap = ["dep:memmap2", "dep:page_size"]
+cold-tier = ["mmap"]  # Hyperbatch training for graphs exceeding RAM
 
 [dev-dependencies]
 criterion = { workspace = true }

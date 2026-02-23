@@ -60,6 +60,9 @@ pub mod training;
 #[cfg(all(not(target_arch = "wasm32"), feature = "mmap"))]
 pub mod mmap;
 
+#[cfg(all(feature = "cold-tier", not(target_arch = "wasm32")))]
+pub mod cold_tier;
+
 // Re-export commonly used types
 pub use compress::{CompressedTensor, CompressionLevel, TensorCompress};
 pub use error::{GnnError, Result};
