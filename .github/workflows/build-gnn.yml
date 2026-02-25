@@ -103,7 +103,7 @@ jobs:
       - name: Build native module
         working-directory: crates/ruvector-gnn-node
         run: |
-          napi build --platform --release --target ${{ matrix.settings.target }} --cargo-flags="-p ruvector-gnn-node"
+          napi build --platform --release --target ${{ matrix.settings.target }} -p ruvector-gnn-node
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
