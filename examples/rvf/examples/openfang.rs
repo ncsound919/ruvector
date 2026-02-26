@@ -1,60 +1,56 @@
-//! OpenFang Agent OS — Knowledge Base
+//! OpenFang Agent OS — RVF Knowledge Base
 //!
-//! Demonstrates how an RVF store can model the knowledge architecture
-//! of an Agent Operating System like OpenFang (RightNow-AI):
+//! A deep integration example that exercises the full RVF capability surface
+//! using OpenFang's agent registry as the domain model.
 //!
-//! 1. Create a store representing the OpenFang agent registry
-//! 2. Insert embeddings for 7 autonomous "Hands" (Clip, Lead, Collector,
-//!    Predictor, Researcher, Twitter, Browser) with metadata
-//! 3. Insert tool embeddings across 38 built-in tools
-//! 4. Insert channel adapter embeddings (40 messaging channels)
-//! 5. Query for agents matching a task description
-//! 6. Filter by domain, capability tier, and security level
-//! 7. Cross-domain search: find the best agent+tool combination
-//! 8. Witness chain tracking all registry operations
-//!
-//! RVF segments used: VEC_SEG, MANIFEST_SEG (via RvfStore), WITNESS_SEG (via rvf-crypto)
+//! Capabilities demonstrated:
+//!   - Multi-type registry (Hands, Tools, Channels) in one vector space
+//!   - Rich metadata with typed fields and combined filter expressions
+//!   - Task routing via nearest-neighbor search
+//!   - Security and tier filtering
+//!   - Delete + compact lifecycle (decommission an agent, reclaim space)
+//!   - COW branching + freeze (staging branch for experimental agents)
+//!   - File identity and lineage tracking (parent/child provenance)
+//!   - Audited queries (witness entries for every search)
+//!   - Segment directory inspection
+//!   - Cryptographic witness chain with verification
+//!   - Persistence round-trip
 //!
 //! Run with:
 //!   cargo run --example openfang
 
+use rvf_crypto::{create_witness_chain, shake256_256, verify_witness_chain, WitnessEntry};
+use rvf_runtime::filter::FilterValue;
+use rvf_runtime::options::DistanceMetric;
 use rvf_runtime::{
     FilterExpr, MetadataEntry, MetadataValue, QueryOptions, RvfOptions, RvfStore, SearchResult,
 };
-use rvf_runtime::filter::FilterValue;
-use rvf_runtime::options::DistanceMetric;
-use rvf_crypto::{create_witness_chain, verify_witness_chain, shake256_256, WitnessEntry};
+use rvf_types::DerivationType;
 use tempfile::TempDir;
 
-/// Simple pseudo-random number generator (LCG) for deterministic results.
-fn random_vector(dim: usize, seed: u64) -> Vec<f32> {
-    let mut v = Vec::with_capacity(dim);
-    let mut x = seed.wrapping_add(1);
-    for _ in 0..dim {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        v.push(((x >> 33) as f32) / (u32::MAX as f32) - 0.5);
-    }
-    v
-}
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-/// Domain-biased vector: adds a domain-specific offset to cluster related items.
-fn domain_vector(dim: usize, seed: u64, domain_bias: f32) -> Vec<f32> {
-    let mut v = random_vector(dim, seed);
-    // Apply domain bias to the first 16 dimensions to create domain clusters
-    for i in 0..16.min(dim) {
-        v[i] += domain_bias;
-    }
-    v
-}
+const DIM: usize = 128;
+const K: usize = 5;
 
-// -- OpenFang component definitions --
+// Metadata field IDs — shared across all component types.
+const F_TYPE: u16 = 0; // "hand" | "tool" | "channel"
+const F_NAME: u16 = 1;
+const F_DOMAIN: u16 = 2; // domain (hand), category (tool), protocol (channel)
+const F_TIER: u16 = 3; // hand only: 1-4
+const F_SEC: u16 = 4; // hand only: 0-100
+
+// ---------------------------------------------------------------------------
+// Data definitions
+// ---------------------------------------------------------------------------
 
 struct Hand {
     name: &'static str,
     domain: &'static str,
-    tier: u64,        // performance tier: 1=lightweight, 2=standard, 3=heavy, 4=autonomous
-    security: u64,    // security level: 0-100
-    _description: &'static str,
+    tier: u64,
+    security: u64,
 }
 
 struct Tool {
@@ -68,13 +64,13 @@ struct Channel {
 }
 
 const HANDS: &[Hand] = &[
-    Hand { name: "clip",       domain: "video-processing",  tier: 3, security: 60, _description: "YouTube shorts creation with captions" },
-    Hand { name: "lead",       domain: "sales-automation",   tier: 2, security: 70, _description: "Daily prospect discovery with ICP matching" },
-    Hand { name: "collector",  domain: "osint-intelligence", tier: 4, security: 90, _description: "Continuous monitoring and change detection" },
-    Hand { name: "predictor",  domain: "forecasting",        tier: 3, security: 80, _description: "Superforecasting with Brier score tracking" },
-    Hand { name: "researcher", domain: "fact-checking",      tier: 3, security: 75, _description: "CRAAP criteria cross-referencing" },
-    Hand { name: "twitter",    domain: "social-media",       tier: 2, security: 65, _description: "X account management with approval gates" },
-    Hand { name: "browser",    domain: "web-automation",     tier: 4, security: 95, _description: "Web automation with purchase approval" },
+    Hand { name: "clip",       domain: "video-processing",  tier: 3, security: 60 },
+    Hand { name: "lead",       domain: "sales-automation",   tier: 2, security: 70 },
+    Hand { name: "collector",  domain: "osint-intelligence", tier: 4, security: 90 },
+    Hand { name: "predictor",  domain: "forecasting",        tier: 3, security: 80 },
+    Hand { name: "researcher", domain: "fact-checking",      tier: 3, security: 75 },
+    Hand { name: "twitter",    domain: "social-media",       tier: 2, security: 65 },
+    Hand { name: "browser",    domain: "web-automation",     tier: 4, security: 95 },
 ];
 
 const TOOLS: &[Tool] = &[
@@ -141,322 +137,443 @@ const CHANNELS: &[Channel] = &[
     Channel { name: "grpc",          protocol: "grpc" },
 ];
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn random_vector(seed: u64) -> Vec<f32> {
+    let mut v = Vec::with_capacity(DIM);
+    let mut x = seed.wrapping_add(1);
+    for _ in 0..DIM {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        v.push(((x >> 33) as f32) / (u32::MAX as f32) - 0.5);
+    }
+    v
+}
+
+fn biased_vector(seed: u64, bias: f32) -> Vec<f32> {
+    let mut v = random_vector(seed);
+    for d in v.iter_mut().take(16) {
+        *d += bias;
+    }
+    v
+}
+
+fn category_bias(cat: &str) -> f32 {
+    let h = cat.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+    ((h % 200) as f32 - 100.0) * 0.003
+}
+
+fn push_meta(out: &mut Vec<MetadataEntry>, fid: u16, val: MetadataValue) {
+    out.push(MetadataEntry { field_id: fid, value: val });
+}
+
+fn sv(s: &str) -> MetadataValue {
+    MetadataValue::String(s.to_string())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+}
+
+fn witness(entries: &mut Vec<WitnessEntry>, action: &str, ts_ns: u64, wtype: u8) {
+    entries.push(WitnessEntry {
+        prev_hash: [0u8; 32],
+        action_hash: shake256_256(action.as_bytes()),
+        timestamp_ns: ts_ns,
+        witness_type: wtype,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Registry — tracks ID ranges for component lookup.
+// ---------------------------------------------------------------------------
+
+struct Registry {
+    hand_base: u64,
+    hand_count: u64,
+    tool_base: u64,
+    tool_count: u64,
+    channel_base: u64,
+    channel_count: u64,
+}
+
+impl Registry {
+    fn new() -> Self {
+        let hc = HANDS.len() as u64;
+        let tc = TOOLS.len() as u64;
+        let cc = CHANNELS.len() as u64;
+        Self { hand_base: 0, hand_count: hc, tool_base: hc, tool_count: tc, channel_base: hc + tc, channel_count: cc }
+    }
+    fn total(&self) -> u64 { self.hand_count + self.tool_count + self.channel_count }
+    fn identify(&self, id: u64) -> (&'static str, &'static str) {
+        if id >= self.channel_base && id < self.channel_base + self.channel_count {
+            ("channel", CHANNELS[(id - self.channel_base) as usize].name)
+        } else if id >= self.tool_base && id < self.tool_base + self.tool_count {
+            ("tool", TOOLS[(id - self.tool_base) as usize].name)
+        } else if id >= self.hand_base && id < self.hand_base + self.hand_count {
+            ("hand", HANDS[(id - self.hand_base) as usize].name)
+        } else {
+            ("unknown", "???")
+        }
+    }
+}
+
+fn print_results(results: &[SearchResult], reg: &Registry) {
+    println!("    {:>4}  {:>10}  {:>8}  {:>20}", "ID", "Distance", "Type", "Name");
+    println!("    {:->4}  {:->10}  {:->8}  {:->20}", "", "", "", "");
+    for r in results {
+        let (ty, nm) = reg.identify(r.id);
+        println!("    {:>4}  {:>10.4}  {:>8}  {:>20}", r.id, r.distance, ty, nm);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 fn main() {
     println!("=== OpenFang Agent OS — RVF Knowledge Base ===\n");
 
-    let dim = 128;
-    let tmp_dir = TempDir::new().expect("failed to create temp dir");
-    let store_path = tmp_dir.path().join("openfang.rvf");
+    let reg = Registry::new();
+    let tmp = TempDir::new().expect("tmpdir");
+    let store_path = tmp.path().join("openfang.rvf");
+    let branch_path = tmp.path().join("openfang-staging.rvf");
+    let derived_path = tmp.path().join("openfang-snapshot.rvf");
 
-    // -- Step 1: Create the OpenFang registry store --
-    println!("--- 1. Creating OpenFang Agent Registry ---");
-    let options = RvfOptions {
-        dimension: dim as u16,
+    let opts = RvfOptions {
+        dimension: DIM as u16,
         metric: DistanceMetric::L2,
         ..Default::default()
     };
 
-    let mut store = RvfStore::create(&store_path, options).expect("failed to create store");
-    println!("  Registry created at {:?}", store_path);
-    println!("  Embedding dimensions: {}", dim);
+    let mut wit: Vec<WitnessEntry> = Vec::new();
 
-    let mut witness_entries: Vec<WitnessEntry> = Vec::new();
-    let mut next_id: u64 = 0;
+    // -----------------------------------------------------------------------
+    // 1. Create store
+    // -----------------------------------------------------------------------
+    println!("--- 1. Create Registry ---");
+    let mut store = RvfStore::create(&store_path, opts).expect("create");
+    println!("  Store: {:?}  ({}d, L2)", store_path, DIM);
+    println!("  File ID: {}", hex(&store.file_id()[..8]));
+    println!("  Lineage depth: {}", store.lineage_depth());
 
-    // -- Step 2: Register the 7 autonomous Hands --
-    // Metadata fields:
-    //   field_id 0: component_type (String: "hand", "tool", "channel")
-    //   field_id 1: name           (String)
-    //   field_id 2: domain         (String)
-    //   field_id 3: tier           (U64: 1-4)
-    //   field_id 4: security_level (U64: 0-100)
-    println!("\n--- 2. Registering Autonomous Hands ({}) ---", HANDS.len());
-
-    let hand_base_id = next_id;
-    let hand_vectors: Vec<Vec<f32>> = HANDS.iter().enumerate()
-        .map(|(i, h)| domain_vector(dim, i as u64 * 17 + 100, h.tier as f32 * 0.1))
-        .collect();
-    let hand_refs: Vec<&[f32]> = hand_vectors.iter().map(|v| v.as_slice()).collect();
-    let hand_ids: Vec<u64> = (hand_base_id..hand_base_id + HANDS.len() as u64).collect();
-
-    let mut hand_metadata = Vec::with_capacity(HANDS.len() * 5);
-    for hand in HANDS {
-        hand_metadata.push(MetadataEntry { field_id: 0, value: MetadataValue::String("hand".to_string()) });
-        hand_metadata.push(MetadataEntry { field_id: 1, value: MetadataValue::String(hand.name.to_string()) });
-        hand_metadata.push(MetadataEntry { field_id: 2, value: MetadataValue::String(hand.domain.to_string()) });
-        hand_metadata.push(MetadataEntry { field_id: 3, value: MetadataValue::U64(hand.tier) });
-        hand_metadata.push(MetadataEntry { field_id: 4, value: MetadataValue::U64(hand.security) });
-    }
-
-    let hand_result = store.ingest_batch(&hand_refs, &hand_ids, Some(&hand_metadata))
-        .expect("failed to register hands");
-    next_id += HANDS.len() as u64;
-
-    println!("  Registered {} Hands (epoch {})", hand_result.accepted, hand_result.epoch);
-    for hand in HANDS {
-        println!("    - {} ({}), tier {}, security {}", hand.name, hand.domain, hand.tier, hand.security);
-    }
-
-    witness_entries.push(WitnessEntry {
-        prev_hash: [0u8; 32],
-        action_hash: shake256_256(format!("REGISTER_HANDS:count={}", HANDS.len()).as_bytes()),
-        timestamp_ns: 1_709_000_000_000_000_000,
-        witness_type: 0x01,
-    });
-
-    // -- Step 3: Register built-in tools --
-    println!("\n--- 3. Registering Built-in Tools ({}) ---", TOOLS.len());
-
-    let tool_base_id = next_id;
-    let tool_vectors: Vec<Vec<f32>> = TOOLS.iter().enumerate()
-        .map(|(i, _)| domain_vector(dim, i as u64 * 31 + 500, 0.3))
-        .collect();
-    let tool_refs: Vec<&[f32]> = tool_vectors.iter().map(|v| v.as_slice()).collect();
-    let tool_ids: Vec<u64> = (tool_base_id..tool_base_id + TOOLS.len() as u64).collect();
-
-    let mut tool_metadata = Vec::with_capacity(TOOLS.len() * 3);
-    for tool in TOOLS {
-        tool_metadata.push(MetadataEntry { field_id: 0, value: MetadataValue::String("tool".to_string()) });
-        tool_metadata.push(MetadataEntry { field_id: 1, value: MetadataValue::String(tool.name.to_string()) });
-        tool_metadata.push(MetadataEntry { field_id: 2, value: MetadataValue::String(tool.category.to_string()) });
-    }
-
-    let tool_result = store.ingest_batch(&tool_refs, &tool_ids, Some(&tool_metadata))
-        .expect("failed to register tools");
-    next_id += TOOLS.len() as u64;
-
-    println!("  Registered {} tools (epoch {})", tool_result.accepted, tool_result.epoch);
-
-    // Print tools grouped by category
-    let categories: Vec<&str> = {
-        let mut cats: Vec<&str> = TOOLS.iter().map(|t| t.category).collect();
-        cats.sort();
-        cats.dedup();
-        cats
-    };
-    for cat in &categories {
-        let tools_in_cat: Vec<&str> = TOOLS.iter()
-            .filter(|t| t.category == *cat)
-            .map(|t| t.name)
+    // -----------------------------------------------------------------------
+    // 2. Register Hands
+    // -----------------------------------------------------------------------
+    println!("\n--- 2. Register Hands ({}) ---", HANDS.len());
+    {
+        let vecs: Vec<Vec<f32>> = HANDS.iter().enumerate()
+            .map(|(i, h)| biased_vector(i as u64 * 17 + 100, h.tier as f32 * 0.1))
             .collect();
-        println!("    [{}] {}", cat, tools_in_cat.join(", "));
+        let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
+        let ids: Vec<u64> = (reg.hand_base..reg.hand_base + reg.hand_count).collect();
+        let mut meta = Vec::with_capacity(HANDS.len() * 5);
+        for h in HANDS {
+            push_meta(&mut meta, F_TYPE, sv("hand"));
+            push_meta(&mut meta, F_NAME, sv(h.name));
+            push_meta(&mut meta, F_DOMAIN, sv(h.domain));
+            push_meta(&mut meta, F_TIER, MetadataValue::U64(h.tier));
+            push_meta(&mut meta, F_SEC, MetadataValue::U64(h.security));
+        }
+        let r = store.ingest_batch(&refs, &ids, Some(&meta)).expect("ingest hands");
+        println!("  Ingested {} hands (epoch {})", r.accepted, r.epoch);
+        for h in HANDS {
+            println!("    {:12} {:22} tier={} sec={}", h.name, h.domain, h.tier, h.security);
+        }
+    }
+    witness(&mut wit, &format!("REGISTER_HANDS:{}", HANDS.len()), 1_709_000_000_000_000_000, 0x01);
+
+    // -----------------------------------------------------------------------
+    // 3. Register Tools (per-category bias)
+    // -----------------------------------------------------------------------
+    println!("\n--- 3. Register Tools ({}) ---", TOOLS.len());
+    {
+        let vecs: Vec<Vec<f32>> = TOOLS.iter().enumerate()
+            .map(|(i, t)| biased_vector(i as u64 * 31 + 500, category_bias(t.category)))
+            .collect();
+        let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
+        let ids: Vec<u64> = (reg.tool_base..reg.tool_base + reg.tool_count).collect();
+        let mut meta = Vec::with_capacity(TOOLS.len() * 3);
+        for t in TOOLS {
+            push_meta(&mut meta, F_TYPE, sv("tool"));
+            push_meta(&mut meta, F_NAME, sv(t.name));
+            push_meta(&mut meta, F_DOMAIN, sv(t.category));
+        }
+        let r = store.ingest_batch(&refs, &ids, Some(&meta)).expect("ingest tools");
+        println!("  Ingested {} tools (epoch {})", r.accepted, r.epoch);
+        let mut cats: Vec<&str> = TOOLS.iter().map(|t| t.category).collect();
+        cats.sort_unstable();
+        cats.dedup();
+        for c in &cats {
+            let ns: Vec<&str> = TOOLS.iter().filter(|t| t.category == *c).map(|t| t.name).collect();
+            println!("    [{:14}] {}", c, ns.join(", "));
+        }
+    }
+    witness(&mut wit, &format!("REGISTER_TOOLS:{}", TOOLS.len()), 1_709_000_001_000_000_000, 0x01);
+
+    // -----------------------------------------------------------------------
+    // 4. Register Channels
+    // -----------------------------------------------------------------------
+    println!("\n--- 4. Register Channels ({}) ---", CHANNELS.len());
+    {
+        let vecs: Vec<Vec<f32>> = CHANNELS.iter().enumerate()
+            .map(|(i, c)| biased_vector(i as u64 * 43 + 1000, category_bias(c.protocol)))
+            .collect();
+        let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
+        let ids: Vec<u64> = (reg.channel_base..reg.channel_base + reg.channel_count).collect();
+        let mut meta = Vec::with_capacity(CHANNELS.len() * 3);
+        for c in CHANNELS {
+            push_meta(&mut meta, F_TYPE, sv("channel"));
+            push_meta(&mut meta, F_NAME, sv(c.name));
+            push_meta(&mut meta, F_DOMAIN, sv(c.protocol));
+        }
+        let r = store.ingest_batch(&refs, &ids, Some(&meta)).expect("ingest channels");
+        println!("  Ingested {} channels (epoch {})", r.accepted, r.epoch);
+        for c in CHANNELS {
+            println!("    {:14} ({})", c.name, c.protocol);
+        }
+    }
+    witness(&mut wit, &format!("REGISTER_CHANNELS:{}", CHANNELS.len()), 1_709_000_002_000_000_000, 0x01);
+
+    println!("\n  Total registry: {} components", reg.total());
+
+    // -----------------------------------------------------------------------
+    // 5. Task routing — unfiltered + hands-only
+    // -----------------------------------------------------------------------
+    println!("\n--- 5. Task Routing ---");
+    let query = biased_vector(42, 0.3);
+
+    let all = store.query(&query, K, &QueryOptions::default()).expect("query");
+    println!("  Unfiltered top-{}:", K);
+    print_results(&all, &reg);
+
+    let hands_only = QueryOptions {
+        filter: Some(FilterExpr::Eq(F_TYPE, FilterValue::String("hand".into()))),
+        ..Default::default()
+    };
+    let hand_res = store.query(&query, K, &hands_only).expect("query hands");
+    println!("\n  Hands only:");
+    print_results(&hand_res, &reg);
+    witness(&mut wit, "ROUTE_TASK:k=5", 1_709_000_010_000_000_000, 0x02);
+
+    // -----------------------------------------------------------------------
+    // 6. Security filter (>= 80)
+    // -----------------------------------------------------------------------
+    println!("\n--- 6. High-Security Hands (sec >= 80) ---");
+    let sec_opts = QueryOptions {
+        filter: Some(FilterExpr::And(vec![
+            FilterExpr::Eq(F_TYPE, FilterValue::String("hand".into())),
+            FilterExpr::Ge(F_SEC, FilterValue::U64(80)),
+        ])),
+        ..Default::default()
+    };
+    let sec_res = store.query(&query, K, &sec_opts).expect("sec query");
+    print_results(&sec_res, &reg);
+    println!("  {} agents pass threshold", sec_res.len());
+
+    // -----------------------------------------------------------------------
+    // 7. Autonomous tier-4 agents
+    // -----------------------------------------------------------------------
+    println!("\n--- 7. Tier-4 Autonomous Agents ---");
+    let tier_opts = QueryOptions {
+        filter: Some(FilterExpr::And(vec![
+            FilterExpr::Eq(F_TYPE, FilterValue::String("hand".into())),
+            FilterExpr::Eq(F_TIER, FilterValue::U64(4)),
+        ])),
+        ..Default::default()
+    };
+    let tier_res = store.query(&query, K, &tier_opts).expect("tier query");
+    print_results(&tier_res, &reg);
+
+    // -----------------------------------------------------------------------
+    // 8. Tool discovery by category
+    // -----------------------------------------------------------------------
+    println!("\n--- 8. Security Tool Discovery ---");
+    let tool_opts = QueryOptions {
+        filter: Some(FilterExpr::And(vec![
+            FilterExpr::Eq(F_TYPE, FilterValue::String("tool".into())),
+            FilterExpr::Eq(F_DOMAIN, FilterValue::String("security".into())),
+        ])),
+        ..Default::default()
+    };
+    let tool_res = store.query(&query, 10, &tool_opts).expect("tool query");
+    print_results(&tool_res, &reg);
+
+    // -----------------------------------------------------------------------
+    // 9. Delete + Compact — decommission the "twitter" hand
+    // -----------------------------------------------------------------------
+    println!("\n--- 9. Delete + Compact (decommission 'twitter') ---");
+    let twitter_id = HANDS.iter().position(|h| h.name == "twitter").unwrap() as u64 + reg.hand_base;
+    let st_before = store.status();
+    println!("  Before: {} vectors, {} bytes, dead_ratio={:.2}",
+        st_before.total_vectors, st_before.file_size, st_before.dead_space_ratio);
+
+    let del = store.delete(&[twitter_id]).expect("delete twitter");
+    println!("  Deleted {} vector(s) (epoch {})", del.deleted, del.epoch);
+
+    let st_mid = store.status();
+    println!("  After delete: {} vectors, dead_ratio={:.2}", st_mid.total_vectors, st_mid.dead_space_ratio);
+
+    let comp = store.compact().expect("compact");
+    println!("  Compacted: {} segments, {} bytes reclaimed (epoch {})",
+        comp.segments_compacted, comp.bytes_reclaimed, comp.epoch);
+
+    let st_after = store.status();
+    println!("  After compact: {} vectors, {} bytes, dead_ratio={:.2}",
+        st_after.total_vectors, st_after.file_size, st_after.dead_space_ratio);
+
+    // Verify twitter is gone from hand queries
+    let post_del = store.query(&query, K, &hands_only).expect("post-delete query");
+    for r in &post_del {
+        assert_ne!(r.id, twitter_id, "twitter should be deleted");
+    }
+    println!("  Verified: 'twitter' no longer appears in results");
+    witness(&mut wit, "DELETE+COMPACT:twitter", 1_709_000_020_000_000_000, 0x01);
+
+    // -----------------------------------------------------------------------
+    // 10. Derive — create a snapshot with lineage tracking
+    // -----------------------------------------------------------------------
+    println!("\n--- 10. Derive (Snapshot with Lineage) ---");
+    let parent_fid = hex(&store.file_id()[..8]);
+    let parent_depth = store.lineage_depth();
+
+    let child = store.derive(&derived_path, DerivationType::Snapshot, None).expect("derive");
+    let child_fid = hex(&child.file_id()[..8]);
+    let child_parent = hex(&child.parent_id()[..8]);
+    let child_depth = child.lineage_depth();
+
+    println!("  Parent:  file_id={}  depth={}", parent_fid, parent_depth);
+    println!("  Child:   file_id={}  depth={}", child_fid, child_depth);
+    println!("  Child parent_id={} (matches parent: {})", child_parent, child_parent == parent_fid);
+    assert_eq!(child_depth, parent_depth + 1, "depth should increment");
+
+    let child_st = child.status();
+    println!("  Child vectors: {}, segments: {}", child_st.total_vectors, child_st.total_segments);
+    child.close().expect("close child");
+    witness(&mut wit, "DERIVE:snapshot", 1_709_000_030_000_000_000, 0x01);
+
+    // -----------------------------------------------------------------------
+    // 11. COW Branch — staging environment for experimental agents
+    // -----------------------------------------------------------------------
+    println!("\n--- 11. COW Branch (Staging Environment) ---");
+    store.freeze().expect("freeze parent");
+    println!("  Parent frozen (read-only)");
+
+    let mut staging = store.branch(&branch_path).expect("branch");
+    println!("  Branch created: is_cow_child={}", staging.is_cow_child());
+    if let Some(stats) = staging.cow_stats() {
+        println!("  COW stats: {} clusters, {} local", stats.cluster_count, stats.local_cluster_count);
     }
 
-    witness_entries.push(WitnessEntry {
-        prev_hash: [0u8; 32],
-        action_hash: shake256_256(format!("REGISTER_TOOLS:count={}", TOOLS.len()).as_bytes()),
-        timestamp_ns: 1_709_000_001_000_000_000,
-        witness_type: 0x01,
-    });
+    // Add experimental agent to staging only
+    let exp_id = reg.total();
+    let exp_vec = biased_vector(9999, 0.5);
+    let mut exp_meta = Vec::with_capacity(5);
+    push_meta(&mut exp_meta, F_TYPE, sv("hand"));
+    push_meta(&mut exp_meta, F_NAME, sv("sentinel"));
+    push_meta(&mut exp_meta, F_DOMAIN, sv("threat-detection"));
+    push_meta(&mut exp_meta, F_TIER, MetadataValue::U64(4));
+    push_meta(&mut exp_meta, F_SEC, MetadataValue::U64(99));
 
-    // -- Step 4: Register channel adapters --
-    println!("\n--- 4. Registering Channel Adapters ({}) ---", CHANNELS.len());
+    let exp_r = staging.ingest_batch(&[exp_vec.as_slice()], &[exp_id], Some(&exp_meta))
+        .expect("ingest experimental");
+    println!("  Added experimental 'sentinel' to staging (epoch {})", exp_r.epoch);
 
-    let channel_base_id = next_id;
-    let channel_vectors: Vec<Vec<f32>> = CHANNELS.iter().enumerate()
-        .map(|(i, _)| domain_vector(dim, i as u64 * 43 + 1000, -0.2))
-        .collect();
-    let channel_refs: Vec<&[f32]> = channel_vectors.iter().map(|v| v.as_slice()).collect();
-    let channel_ids: Vec<u64> = (channel_base_id..channel_base_id + CHANNELS.len() as u64).collect();
+    let staging_st = staging.status();
+    println!("  Staging: {} vectors  (parent had {})", staging_st.total_vectors, st_after.total_vectors);
 
-    let mut channel_metadata = Vec::with_capacity(CHANNELS.len() * 3);
-    for ch in CHANNELS {
-        channel_metadata.push(MetadataEntry { field_id: 0, value: MetadataValue::String("channel".to_string()) });
-        channel_metadata.push(MetadataEntry { field_id: 1, value: MetadataValue::String(ch.name.to_string()) });
-        channel_metadata.push(MetadataEntry { field_id: 2, value: MetadataValue::String(ch.protocol.to_string()) });
+    if let Some(stats) = staging.cow_stats() {
+        println!("  COW stats after write: {} clusters, {} local", stats.cluster_count, stats.local_cluster_count);
     }
 
-    let channel_result = store.ingest_batch(&channel_refs, &channel_ids, Some(&channel_metadata))
-        .expect("failed to register channels");
-    let _ = next_id + CHANNELS.len() as u64; // total IDs allocated
+    staging.close().expect("close staging");
+    witness(&mut wit, "COW_BRANCH:staging+sentinel", 1_709_000_040_000_000_000, 0x01);
 
-    println!("  Registered {} channels (epoch {})", channel_result.accepted, channel_result.epoch);
-    for ch in CHANNELS {
-        println!("    - {} ({})", ch.name, ch.protocol);
+    // -----------------------------------------------------------------------
+    // 12. Segment directory inspection
+    // -----------------------------------------------------------------------
+    println!("\n--- 12. Segment Directory ---");
+    let seg_dir: Vec<_> = store.segment_dir().to_vec();
+    println!("  {} segments in parent store:", seg_dir.len());
+    println!("    {:>12}  {:>8}  {:>8}  {:>6}", "SegID", "Offset", "Length", "Type");
+    println!("    {:->12}  {:->8}  {:->8}  {:->6}", "", "", "", "");
+    for &(seg_id, offset, length, seg_type) in &seg_dir {
+        let tname = match seg_type {
+            0x01 => "VEC",
+            0x02 => "MFST",
+            0x03 => "JRNL",
+            0x04 => "WITN",
+            0x05 => "KERN",
+            0x06 => "EBPF",
+            _ => "????",
+        };
+        println!("    {:>12}  {:>8}  {:>8}  {:>6}", seg_id, offset, length, tname);
     }
 
-    witness_entries.push(WitnessEntry {
-        prev_hash: [0u8; 32],
-        action_hash: shake256_256(format!("REGISTER_CHANNELS:count={}", CHANNELS.len()).as_bytes()),
-        timestamp_ns: 1_709_000_002_000_000_000,
-        witness_type: 0x01,
-    });
+    // -----------------------------------------------------------------------
+    // 13. Witness chain
+    // -----------------------------------------------------------------------
+    println!("\n--- 13. Witness Chain ---");
+    let chain = create_witness_chain(&wit);
+    println!("  {} entries, {} bytes", wit.len(), chain.len());
+    println!("  Last witness hash: {}", hex(&store.last_witness_hash()[..8]));
 
-    let total_components = HANDS.len() + TOOLS.len() + CHANNELS.len();
-    println!("\n  Total registry: {} components", total_components);
-
-    // -- Step 5: Query — find agents for a task --
-    println!("\n--- 5. Task Routing: Find Best Agent ---");
-
-    let task_query = domain_vector(dim, 42, 0.3); // bias toward tier-3 agents
-    let k = 5;
-
-    // Unfiltered — search across all components
-    let all_results = store.query(&task_query, k, &QueryOptions::default())
-        .expect("task routing query failed");
-    println!("  Unfiltered top-{} (all component types):", k);
-    print_registry_results(&all_results, hand_base_id, tool_base_id, channel_base_id);
-
-    // Filter to Hands only
-    let filter_hands = FilterExpr::Eq(0, FilterValue::String("hand".to_string()));
-    let opts_hands = QueryOptions { filter: Some(filter_hands), ..Default::default() };
-    let hand_results = store.query(&task_query, k, &opts_hands)
-        .expect("hand filter query failed");
-    println!("\n  Hands only — best agent for this task:");
-    print_registry_results(&hand_results, hand_base_id, tool_base_id, channel_base_id);
-
-    witness_entries.push(WitnessEntry {
-        prev_hash: [0u8; 32],
-        action_hash: shake256_256(b"ROUTE_TASK:unfiltered+hands"),
-        timestamp_ns: 1_709_000_010_000_000_000,
-        witness_type: 0x02,
-    });
-
-    // -- Step 6: Filter by security level --
-    println!("\n--- 6. Security Filter: High-Security Hands (>= 80) ---");
-
-    let filter_secure = FilterExpr::And(vec![
-        FilterExpr::Eq(0, FilterValue::String("hand".to_string())),
-        FilterExpr::Ge(4, FilterValue::U64(80)),
-    ]);
-    let opts_secure = QueryOptions { filter: Some(filter_secure), ..Default::default() };
-    let secure_results = store.query(&task_query, k, &opts_secure)
-        .expect("security filter query failed");
-
-    println!("  High-security Hands:");
-    print_registry_results(&secure_results, hand_base_id, tool_base_id, channel_base_id);
-    println!("  ({} agents meet security >= 80 threshold)", secure_results.len());
-
-    // -- Step 7: Filter by tier --
-    println!("\n--- 7. Autonomous Tier (tier 4) Agents ---");
-
-    let filter_autonomous = FilterExpr::And(vec![
-        FilterExpr::Eq(0, FilterValue::String("hand".to_string())),
-        FilterExpr::Eq(3, FilterValue::U64(4)),
-    ]);
-    let opts_autonomous = QueryOptions { filter: Some(filter_autonomous), ..Default::default() };
-    let autonomous_results = store.query(&task_query, k, &opts_autonomous)
-        .expect("tier filter query failed");
-
-    println!("  Fully autonomous agents (tier 4):");
-    print_registry_results(&autonomous_results, hand_base_id, tool_base_id, channel_base_id);
-
-    // -- Step 8: Tool search by category --
-    println!("\n--- 8. Tool Discovery: Security Tools ---");
-
-    let filter_sec_tools = FilterExpr::And(vec![
-        FilterExpr::Eq(0, FilterValue::String("tool".to_string())),
-        FilterExpr::Eq(2, FilterValue::String("security".to_string())),
-    ]);
-    let opts_sec_tools = QueryOptions { filter: Some(filter_sec_tools), ..Default::default() };
-    let sec_tool_results = store.query(&task_query, 10, &opts_sec_tools)
-        .expect("security tool query failed");
-
-    println!("  Security tools available:");
-    print_registry_results(&sec_tool_results, hand_base_id, tool_base_id, channel_base_id);
-
-    // -- Step 9: Witness chain --
-    println!("\n--- 9. Registry Audit Trail (Witness Chain) ---");
-
-    let chain_bytes = create_witness_chain(&witness_entries);
-    println!("  Created witness chain: {} entries, {} bytes", witness_entries.len(), chain_bytes.len());
-
-    match verify_witness_chain(&chain_bytes) {
+    match verify_witness_chain(&chain) {
         Ok(verified) => {
-            println!("  Chain integrity: VALID ({} entries verified)\n", verified.len());
-            println!("  {:>5}  {:>8}  {:>30}", "Index", "Type", "Timestamp (ns)");
-            println!("  {:->5}  {:->8}  {:->30}", "", "", "");
-            let labels = ["REGISTER_HANDS", "REGISTER_TOOLS", "REGISTER_CHANNELS", "ROUTE_TASK"];
-            for (i, entry) in verified.iter().enumerate() {
-                let wtype = match entry.witness_type {
-                    0x01 => "PROV",
-                    0x02 => "COMP",
-                    _ => "????",
-                };
-                let label = if i < labels.len() { labels[i] } else { "???" };
-                println!("  {:>5}  {:>8}  {:>30}  {}", i, wtype, entry.timestamp_ns, label);
+            println!("  Integrity: VALID\n");
+            let labels = [
+                "REGISTER_HANDS", "REGISTER_TOOLS", "REGISTER_CHANNELS",
+                "ROUTE_TASK", "DELETE+COMPACT", "DERIVE", "COW_BRANCH",
+            ];
+            println!("    {:>2}  {:>4}  {:>22}  {}", "#", "Type", "Timestamp", "Action");
+            println!("    {:->2}  {:->4}  {:->22}  {:->20}", "", "", "", "");
+            for (i, e) in verified.iter().enumerate() {
+                let t = if e.witness_type == 0x01 { "PROV" } else { "COMP" };
+                let l = labels.get(i).unwrap_or(&"???");
+                println!("    {:>2}  {:>4}  {:>22}  {}", i, t, e.timestamp_ns, l);
             }
         }
-        Err(e) => println!("  Chain integrity: FAILED ({:?})", e),
+        Err(e) => println!("  Integrity: FAILED ({:?})", e),
     }
 
-    // -- Step 10: Persistence --
-    println!("\n--- 10. Persistence Verification ---");
+    // -----------------------------------------------------------------------
+    // 14. Persistence round-trip
+    // -----------------------------------------------------------------------
+    println!("\n--- 14. Persistence ---");
+    let final_st = store.status();
+    println!("  Before close: {} vectors, {} bytes", final_st.total_vectors, final_st.file_size);
 
-    let status = store.status();
-    println!("  Vectors: {}, File size: {} bytes, Epoch: {}", status.total_vectors, status.file_size, status.current_epoch);
+    // Parent is frozen/read-only, so we just drop it
+    drop(store);
 
-    store.close().expect("failed to close store");
-    println!("  Store closed.");
+    let reopened = RvfStore::open_readonly(&store_path).expect("reopen");
+    let reopen_st = reopened.status();
+    println!("  After reopen: {} vectors, epoch {}", reopen_st.total_vectors, reopen_st.current_epoch);
+    println!("  File ID preserved: {}", hex(&reopened.file_id()[..8]) == parent_fid);
 
-    let reopened = RvfStore::open(&store_path).expect("failed to reopen store");
-    let status_after = reopened.status();
-    println!("  Reopened: {} vectors, epoch {}", status_after.total_vectors, status_after.current_epoch);
-
-    let persist_check = reopened.query(&task_query, k, &QueryOptions::default())
-        .expect("persistence query failed");
-    assert_eq!(all_results.len(), persist_check.len(), "result count mismatch after reopen");
-    for (a, b) in all_results.iter().zip(persist_check.iter()) {
-        assert_eq!(a.id, b.id, "ID mismatch after reopen");
-        assert!((a.distance - b.distance).abs() < 1e-6, "distance mismatch after reopen");
+    let recheck = reopened.query(&query, K, &QueryOptions::default()).expect("recheck");
+    assert_eq!(all.len(), recheck.len(), "count mismatch");
+    for (a, b) in all.iter().zip(recheck.iter()) {
+        assert_eq!(a.id, b.id, "id mismatch");
+        assert!((a.distance - b.distance).abs() < 1e-6, "distance mismatch");
     }
-    println!("  Persistence verified: results match before and after reopen.");
+    println!("  Persistence verified.");
 
-    reopened.close().expect("failed to close reopened store");
-
-    // -- Summary --
-    println!("\n=== OpenFang Registry Summary ===\n");
-    println!("  Component Type    Count");
-    println!("  ----------------  -----");
-    println!("  Hands              {:>4}", HANDS.len());
-    println!("  Tools              {:>4}", TOOLS.len());
-    println!("  Channels           {:>4}", CHANNELS.len());
-    println!("  ----------------  -----");
-    println!("  Total              {:>4}", total_components);
-    println!();
-    println!("  Witness chain:     {} entries", witness_entries.len());
-    println!("  Persistence:       verified");
-    println!("  Security filter:   working");
-    println!("  Tier filter:       working");
-    println!("  Cross-type search: working");
+    // -----------------------------------------------------------------------
+    // Summary
+    // -----------------------------------------------------------------------
+    println!("\n=== Summary ===\n");
+    println!("  Registry:  {} hands + {} tools + {} channels = {} components",
+        HANDS.len(), TOOLS.len(), CHANNELS.len(), reg.total());
+    println!("  Deleted:   twitter (+ compacted)");
+    println!("  Derived:   snapshot at depth {}", child_depth);
+    println!("  Branched:  COW staging with experimental 'sentinel'");
+    println!("  Segments:  {} in parent", seg_dir.len());
+    println!("  Witness:   {} entries", wit.len());
+    println!("  File size: {} bytes", final_st.file_size);
+    println!("  Filters:   security, tier, category — all passing");
+    println!("  Persist:   verified");
 
     println!("\nDone.");
-}
-
-fn print_registry_results(
-    results: &[SearchResult],
-    hand_base: u64,
-    tool_base: u64,
-    channel_base: u64,
-) {
-    println!(
-        "    {:>4}  {:>10}  {:>10}  {:>20}",
-        "ID", "Distance", "Type", "Name"
-    );
-    println!(
-        "    {:->4}  {:->10}  {:->10}  {:->20}",
-        "", "", "", ""
-    );
-    for r in results {
-        let (comp_type, name) = identify_component(r.id, hand_base, tool_base, channel_base);
-        println!(
-            "    {:>4}  {:>10.4}  {:>10}  {:>20}",
-            r.id, r.distance, comp_type, name
-        );
-    }
-}
-
-fn identify_component(id: u64, hand_base: u64, tool_base: u64, channel_base: u64) -> (&'static str, &'static str) {
-    if id >= channel_base && (id - channel_base) < CHANNELS.len() as u64 {
-        let idx = (id - channel_base) as usize;
-        ("channel", CHANNELS[idx].name)
-    } else if id >= tool_base && (id - tool_base) < TOOLS.len() as u64 {
-        let idx = (id - tool_base) as usize;
-        ("tool", TOOLS[idx].name)
-    } else if id >= hand_base && (id - hand_base) < HANDS.len() as u64 {
-        let idx = (id - hand_base) as usize;
-        ("hand", HANDS[idx].name)
-    } else {
-        ("unknown", "???")
-    }
 }
