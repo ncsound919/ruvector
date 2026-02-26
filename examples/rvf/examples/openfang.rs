@@ -38,6 +38,17 @@ const F_DOMAIN: u16 = 2;
 const F_TIER: u16 = 3;
 const F_SEC: u16 = 4;
 
+// Segment type constants (from RVF file format)
+const SEG_VEC: u8 = 0x01;
+const SEG_MFST: u8 = 0x02;
+const SEG_JRNL: u8 = 0x03;
+const SEG_WITN: u8 = 0x04;
+const SEG_KERN: u8 = 0x05;
+const SEG_EBPF: u8 = 0x06;
+const SEG_EBPF2: u8 = 0x0F;
+const SEG_WASM: u8 = 0x10;
+const SEG_DASH: u8 = 0x11;
+
 // ---------------------------------------------------------------------------
 // Data definitions
 // ---------------------------------------------------------------------------
@@ -169,7 +180,12 @@ fn sv(s: &str) -> MetadataValue {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
 }
 
 fn witness(entries: &mut Vec<WitnessEntry>, action: &str, ts_ns: u64, wtype: u8) {
@@ -259,6 +275,7 @@ fn main() {
     // -----------------------------------------------------------------------
     println!("\n--- 2. Register Hands ({}) ---", HANDS.len());
     {
+        // Seeds: hands [100..218], tools [500..1647], channels [1000..1817] — non-overlapping
         let vecs: Vec<Vec<f32>> = HANDS.iter().enumerate()
             .map(|(i, h)| biased_vector(i as u64 * 17 + 100, h.tier as f32 * 0.1))
             .collect();
@@ -706,8 +723,9 @@ fn main() {
         println!("  Magic valid: {}", header.is_valid_magic());
         println!("  Flags: kernel={} orchestrator={} eval={} offline={} tools={}",
             header.has_kernel(), header.has_orchestrator(),
-            header.flags & 0x10 != 0, header.is_offline_capable(),
-            header.flags & 0x400 != 0);
+            header.flags & 0x10 != 0,  // bit 4: eval suite present
+            header.is_offline_capable(),
+            header.flags & 0x400 != 0); // bit 10: tool registry present
 
         let parsed = ParsedAgiManifest::parse(&payload).expect("parse manifest");
         println!("  Model: {:?}", parsed.model_id_str());
@@ -728,15 +746,15 @@ fn main() {
     println!("    {:->6}  {:->8}  {:->8}  {:->6}", "", "", "", "");
     for &(seg_id, offset, length, seg_type) in &seg_dir {
         let tname = match seg_type {
-            0x01 => "VEC",
-            0x02 => "MFST",
-            0x03 => "JRNL",
-            0x04 => "WITN",
-            0x05 => "KERN",
-            0x06 => "EBPF",
-            0x0F => "EBPF2",
-            0x10 => "WASM",
-            0x11 => "DASH",
+            SEG_VEC  => "VEC",
+            SEG_MFST => "MFST",
+            SEG_JRNL => "JRNL",
+            SEG_WITN => "WITN",
+            SEG_KERN => "KERN",
+            SEG_EBPF => "EBPF",
+            SEG_EBPF2 => "EBPF2",
+            SEG_WASM => "WASM",
+            SEG_DASH => "DASH",
             _ => "????",
         };
         println!("    {:>6}  {:>8}  {:>8}  {:>6}", seg_id, offset, length, tname);
@@ -775,6 +793,8 @@ fn main() {
     // 24. Persistence
     // -----------------------------------------------------------------------
     println!("\n--- 24. Persistence ---");
+    // Capture baseline *after* delete+compact so the comparison is stable
+    let pre_close = store.query(&query, K, &QueryOptions::default()).expect("pre-close query");
     let final_st = store.status();
     println!("  Before: {} vectors, {} segments, {} bytes",
         final_st.total_vectors, final_st.total_segments, final_st.file_size);
@@ -785,7 +805,7 @@ fn main() {
     println!("  After:  {} vectors, epoch {}", reopen_st.total_vectors, reopen_st.current_epoch);
     println!("  File ID preserved: {}", hex(&reopened.file_id()[..8]) == parent_fid);
 
-    // Verify WASM survives persistence
+    // Verify segments survive persistence
     let wasm_ok = reopened.extract_wasm().expect("re-extract wasm").is_some();
     let kern_ok = reopened.extract_kernel().expect("re-extract kernel").is_some();
     let ebpf_ok = reopened.extract_ebpf().expect("re-extract ebpf").is_some();
@@ -793,10 +813,10 @@ fn main() {
     println!("  WASM={} Kernel={} eBPF={} Dashboard={}", wasm_ok, kern_ok, ebpf_ok, dash_ok);
 
     let recheck = reopened.query(&query, K, &QueryOptions::default()).expect("recheck");
-    assert_eq!(all.len(), recheck.len(), "count mismatch");
-    for (a, b) in all.iter().zip(recheck.iter()) {
-        assert_eq!(a.id, b.id, "id mismatch");
-        assert!((a.distance - b.distance).abs() < 1e-6, "distance mismatch");
+    assert_eq!(pre_close.len(), recheck.len(), "count mismatch after reopen");
+    for (a, b) in pre_close.iter().zip(recheck.iter()) {
+        assert_eq!(a.id, b.id, "id mismatch after reopen");
+        assert!((a.distance - b.distance).abs() < 1e-6, "distance mismatch after reopen");
     }
     println!("  Persistence verified.");
 
