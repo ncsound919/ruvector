@@ -182,7 +182,7 @@ User Query → [SONA Engine] → Model Response → User Feedback
 
 ### Built by rUv, powered by [Cognitum.one](https://cognitum.one)
 
-RuVector is created by [rUv](https://ruv.io) and powers [Cognitum](https://cognitum.one), a 🏅 **CES 2026 Innovation Awards Honoree** — the world's first hardware designed specifically for AI agents.
+### RuVector is created by [rUv](https://ruv.io) and powers [Cognitum](https://cognitum.one), a 🏅 **CES 2026 Innovation Awards Honoree** — the world's first hardware designed specifically for AI agents.
 
 **Cognitum v0 — The Agentic Appliance**: Run tens of thousands of always-on agents at no incremental cost beyond the box. Learns in proximity to any signal — sensors, networks, machines — at near-zero power (~5 uW/inference, <15W total). Sub-millisecond response, 500x cheaper than cloud AI. No cloud bills, no per-agent fees. Like a nervous system, not a brain.
 
