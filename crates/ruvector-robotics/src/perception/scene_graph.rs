@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use crate::bridge::{Point3D, PointCloud, SceneEdge, SceneGraph, SceneObject};
+use crate::perception::clustering;
 use crate::perception::config::SceneGraphConfig;
 
 // ---------------------------------------------------------------------------
@@ -37,7 +38,7 @@ impl PointCloudSceneGraphBuilder {
             return SceneGraph::default();
         }
 
-        let clusters = self.cluster_points(cloud);
+        let clusters = clustering::cluster_point_cloud(cloud, self.config.cluster_radius);
 
         // Convert clusters to SceneObjects (cap at max_objects).
         let mut objects: Vec<SceneObject> = clusters
@@ -96,75 +97,6 @@ impl PointCloudSceneGraphBuilder {
     }
 
     // -- private helpers ----------------------------------------------------
-
-    /// Spatial-hash clustering with union-find (same algorithm as
-    /// `ObstacleDetector` but parameterised by `cluster_radius`).
-    fn cluster_points(&self, cloud: &PointCloud) -> Vec<Vec<Point3D>> {
-        let cell_size = self.config.cluster_radius;
-
-        let mut cell_map: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
-        for (idx, p) in cloud.points.iter().enumerate() {
-            let key = Self::cell_key(p, cell_size);
-            cell_map.entry(key).or_default().push(idx);
-        }
-
-        let cells: Vec<(i64, i64, i64)> = cell_map.keys().copied().collect();
-        let cell_count = cells.len();
-        let cell_idx: HashMap<(i64, i64, i64), usize> =
-            cells.iter().enumerate().map(|(i, &k)| (k, i)).collect();
-
-        let mut parent: Vec<usize> = (0..cell_count).collect();
-
-        for &(cx, cy, cz) in &cells {
-            let a = cell_idx[&(cx, cy, cz)];
-            for dx in -1..=1_i64 {
-                for dy in -1..=1_i64 {
-                    for dz in -1..=1_i64 {
-                        let neighbor = (cx + dx, cy + dy, cz + dz);
-                        if let Some(&b) = cell_idx.get(&neighbor) {
-                            Self::union(&mut parent, a, b);
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut groups: HashMap<usize, Vec<Point3D>> = HashMap::new();
-        for (cell_key, point_indices) in &cell_map {
-            let ci = cell_idx[cell_key];
-            let root = Self::find(&mut parent, ci);
-            let entry = groups.entry(root).or_default();
-            for &pi in point_indices {
-                entry.push(cloud.points[pi]);
-            }
-        }
-
-        groups.into_values().collect()
-    }
-
-    fn cell_key(p: &Point3D, cell_size: f64) -> (i64, i64, i64) {
-        (
-            (p.x as f64 / cell_size).floor() as i64,
-            (p.y as f64 / cell_size).floor() as i64,
-            (p.z as f64 / cell_size).floor() as i64,
-        )
-    }
-
-    fn find(parent: &mut [usize], mut i: usize) -> usize {
-        while parent[i] != i {
-            parent[i] = parent[parent[i]];
-            i = parent[i];
-        }
-        i
-    }
-
-    fn union(parent: &mut [usize], a: usize, b: usize) {
-        let ra = Self::find(parent, a);
-        let rb = Self::find(parent, b);
-        if ra != rb {
-            parent[ra] = rb;
-        }
-    }
 
     fn cluster_to_object(id: usize, points: &[Point3D]) -> SceneObject {
         let (mut min_x, mut min_y, mut min_z) = (f64::MAX, f64::MAX, f64::MAX);
