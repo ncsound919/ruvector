@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "exo-backend-classical"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "exo-core",
  "exo-exotic",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "exo-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -825,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "exo-exotic"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "dashmap",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "exo-federation"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "exo-hypergraph"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dashmap",
  "exo-core",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "exo-manifold"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "approx",
  "exo-core",
@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "exo-temporal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "chrono",

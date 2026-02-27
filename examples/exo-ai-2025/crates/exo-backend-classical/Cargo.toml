@@ -1,6 +1,6 @@
 [package]
 name = "exo-backend-classical"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["rUv <ruv@ruv.io>"]
@@ -23,7 +23,7 @@ exo-exotic = "0.1"
 # Ruvector dependencies
 ruvector-core = { version = "0.1", features = ["simd"] }
 ruvector-graph = "0.1"
-ruvector-domain-expansion = { version = "2.0", features = ["rvf"] }
+ruvector-domain-expansion = "2.0"
 thermorust = "0.1"
 ruvector-dither = "0.1"
 rand = { version = "0.8", features = ["small_rng"] }
@@ -34,5 +34,9 @@ serde_json = "1.0"
 thiserror = "2.0"
 parking_lot = "0.12"
 uuid = { version = "1.0", features = ["v4"] }
+
+[features]
+default = []
+rvf = ["ruvector-domain-expansion/rvf"]
 
 [dev-dependencies]

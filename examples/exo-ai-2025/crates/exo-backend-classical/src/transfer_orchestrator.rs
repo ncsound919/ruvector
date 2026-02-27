@@ -177,6 +177,9 @@ impl ExoTransferOrchestrator {
     ///
     /// The returned bytes can be written to a `.rvf` file or streamed over the
     /// network for federated transfer.
+    ///
+    /// Requires the `rvf` feature.
+    #[cfg(feature = "rvf")]
     pub fn package_as_rvf(&self) -> Vec<u8> {
         use ruvector_domain_expansion::rvf_bridge;
 
@@ -200,6 +203,9 @@ impl ExoTransferOrchestrator {
     }
 
     /// Write the current engine state to a `.rvf` file at `path`.
+    ///
+    /// Requires the `rvf` feature.
+    #[cfg(feature = "rvf")]
     pub fn save_rvf(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
         std::fs::write(path, self.package_as_rvf())
     }
@@ -251,6 +257,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "rvf")]
     fn test_package_as_rvf_empty() {
         // Before any cycle the population has kernels but no domain-specific
         // priors or curves, so we should still get a valid (possibly short) RVF stream.
@@ -263,6 +270,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "rvf")]
     fn test_package_as_rvf_after_cycles() {
         // RVF segment magic: "RVFS" in little-endian = 0x5256_4653
         const SEGMENT_MAGIC: u32 = 0x5256_4653;
@@ -292,6 +300,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "rvf")]
     fn test_save_rvf_to_file() {
         let mut orchestrator = ExoTransferOrchestrator::new("rvf_file_node");
         orchestrator.run_cycle();
