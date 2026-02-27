@@ -1,15 +1,87 @@
-# RuvLLM v2.3 - High-Performance LLM Inference for Rust
+# RuvLLM
 
-RuvLLM is a production-ready Rust LLM inference engine optimized for Apple Silicon (M1-M4), featuring real-time fine-tuning, NEON SIMD acceleration, Apple Neural Engine integration, and the SONA self-optimizing neural architecture.
+[![Crates.io](https://img.shields.io/crates/v/ruvllm.svg)](https://crates.io/crates/ruvllm)
+[![docs.rs](https://docs.rs/ruvllm/badge.svg)](https://docs.rs/ruvllm)
+[![npm](https://img.shields.io/npm/v/@ruvector/ruvllm.svg)](https://www.npmjs.com/package/@ruvector/ruvllm)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
+**Run LLMs on your own hardware -- Metal, CUDA, WebGPU, Neural Engine -- no cloud APIs, no per-query bills.**
+
+RuvLLM is a Rust inference engine that loads GGUF models and runs them locally with hardware acceleration. It learns from every request through SONA (Self-Optimizing Neural Architecture), so responses get better over time without manual tuning. It supports Apple Silicon, NVIDIA GPUs, and WebAssembly, and plugs directly into the [RuVector](https://github.com/ruvnet/ruvector) ecosystem for vector search and graph intelligence.
+
+| | RuvLLM (local) | Cloud LLM API |
+|---|---|---|
+| **Cost** | Free after hardware | Pay per token / per call |
+| **Privacy** | Data never leaves your machine | Data sent to third party |
+| **Latency** | No network round-trip | 100-500 ms network overhead |
+| **Self-learning** | SONA adapts to your workload automatically | Static -- same behavior every time |
+| **Fine-tuning** | MicroLoRA per-request in <1 ms | Upload datasets, wait hours |
+| **Offline** | Works without internet | Requires connectivity |
+| **Hardware** | Metal, CUDA, ANE, WebGPU, CPU | N/A |
+
+## Quick Start
+
+```rust
+use ruvllm::prelude::*;
+
+let mut backend = CandleBackend::with_device(DeviceType::Metal)?;
+backend.load_gguf("models/qwen2.5-7b-q4_k.gguf", ModelConfig::default())?;
+
+let response = backend.generate("Explain quantum computing in simple terms.",
+    GenerateParams {
+        max_tokens: 256,
+        temperature: 0.7,
+        top_p: 0.9,
+        ..Default::default()
+    }
+)?;
+
+println!("{}", response);
+```
+
+## Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+# Recommended for Apple Silicon Mac
+ruvllm = { version = "2.0", features = ["inference-metal", "coreml", "parallel"] }
+
+# For NVIDIA GPUs
+ruvllm = { version = "2.0", features = ["inference-cuda", "parallel"] }
+
+# Minimal (CPU only)
+ruvllm = { version = "2.0" }
+```
+
+Or install the npm package:
+
+```bash
+npm install @ruvector/ruvllm
+```
+
+## Key Features
+
+| Feature | What It Does | Why It Matters |
+|---------|-------------|----------------|
+| **SONA three-tier learning** | Adapts to your queries at three speeds: instant (<1 ms), background (~100 ms), deep (minutes) | Responses improve automatically without manual retraining |
+| **Metal + CUDA + ANE** | Hardware-accelerated inference across Apple Silicon, NVIDIA GPUs, and Apple Neural Engine | Get the most out of whatever hardware you have |
+| **Flash Attention 2** | Memory-efficient attention with O(N) complexity and online softmax | Longer contexts with less memory |
+| **GGUF memory mapping** | Memory-mapped model loading with quantization (Q4K, Q8, FP16) | Load large models fast, use 4-8x less RAM |
+| **Speculative decoding** | Draft model generates candidates, target model verifies in parallel | 2-3x faster text generation |
+| **Continuous batching** | Dynamic batch scheduling for concurrent requests | 2-3x throughput improvement for serving |
+| **MicroLoRA** | Per-request fine-tuning with rank 1-2 adapters | Personalize responses in <1 ms without full retraining |
+| **HuggingFace Hub** | Download and upload models directly | One-line model access, easy sharing |
+| **mistral-rs backend** | PagedAttention, X-LoRA, ISQ for production serving | Scale to 50+ concurrent users |
+| **Task-specific adapters** | 5 pre-trained LoRA adapters (coder, researcher, security, architect, reviewer) | Instant specialization with hot-swap |
 
 ## What's New in v2.3
-
-### Major Features
 
 | Feature | Description | Benefit |
 |---------|-------------|---------|
 | **RuvLTRA-Medium 3B** | Purpose-built 3B model for Claude Flow | 42 layers, 256K context, speculative decode |
-| **HuggingFace Hub** | Full Hub integration (download/upload) | Easy model sharing & distribution |
+| **HuggingFace Hub** | Full Hub integration (download/upload) | Easy model sharing and distribution |
 | **Task-Specific LoRA** | 5 pre-trained adapters for agent types | Optimized for coder/researcher/security/architect/reviewer |
 | **Adapter Merging** | TIES, DARE, SLERP, Task Arithmetic | Combine adapters for multi-task models |
 | **Hot-Swap Adapters** | Zero-downtime adapter switching | Runtime task specialization |
@@ -34,82 +106,14 @@ RuvLLM is a production-ready Rust LLM inference engine optimized for Apple Silic
 | **Speculative Decoding** | Draft model acceleration | 2-3x faster generation |
 | **Gemma-2 & Phi-3** | New model architectures | Extended model support |
 
-## Features
+## Backends
 
-### Multiple Backends
-- **Candle Backend**: HuggingFace's Candle framework with Metal/CUDA GPU acceleration
-- **Core ML Backend**: Apple Neural Engine for maximum efficiency on Apple Silicon
-- **Hybrid Pipeline**: Automatic routing between GPU and ANE based on operation type
-
-### Optimized Kernels
-- **NEON SIMD**: ARM64-optimized kernels with 4x loop unrolling and FMA instructions
-- **Flash Attention 2**: Memory-efficient attention with O(N) complexity and online softmax
-- **Paged Attention**: Efficient KV cache management for long-context inference
-- **ANE Operations**: GELU, SiLU, softmax, layer norm optimized for Neural Engine
-
-### Real-Time Learning (SONA)
-- **MicroLoRA**: Per-request fine-tuning with rank 1-2 adapters (<1ms latency)
-- **EWC++**: Elastic Weight Consolidation to prevent catastrophic forgetting
-- **Three-Tier Learning**: Instant (<1ms), Background (~100ms), Deep (minutes)
-
-### Memory Efficiency
-- **Two-Tier KV Cache**: FP16 tail + Q4/Q8 quantized store
-- **Grouped-Query Attention (GQA)**: 4-8x KV memory reduction
-- **Memory Pool**: Arena allocator for zero-allocation inference
-- **GGUF Memory Mapping**: Efficient large model loading
-
-## Quick Start
-
-```rust
-use ruvllm::prelude::*;
-
-// Initialize backend with Metal GPU + ANE hybrid
-let mut backend = CandleBackend::with_device(DeviceType::Metal)?;
-
-// Load a GGUF model
-backend.load_gguf("models/qwen2.5-7b-q4_k.gguf", ModelConfig::default())?;
-
-// Or load from HuggingFace
-backend.load_model("Qwen/Qwen2.5-7B-Instruct", ModelConfig {
-    quantization: Quantization::Q4K,
-    use_flash_attention: true,
-    ..Default::default()
-})?;
-
-// Generate text
-let response = backend.generate("Explain quantum computing in simple terms.",
-    GenerateParams {
-        max_tokens: 256,
-        temperature: 0.7,
-        top_p: 0.9,
-        ..Default::default()
-    }
-)?;
-
-println!("{}", response);
-
-// Check SONA learning stats
-if let Some(stats) = backend.sona_stats() {
-    println!("Patterns learned: {}", stats.patterns_learned);
-    println!("Quality improvement: {:.1}%", stats.quality_improvement * 100.0);
-}
-```
-
-## Installation
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-# Recommended for Apple Silicon Mac
-ruvllm = { version = "2.0", features = ["inference-metal", "coreml", "parallel"] }
-
-# For NVIDIA GPUs
-ruvllm = { version = "2.0", features = ["inference-cuda", "parallel"] }
-
-# Minimal (CPU only)
-ruvllm = { version = "2.0" }
-```
+| Backend | Best For | Acceleration |
+|---------|----------|-------------|
+| **Candle** | Single user, edge, WASM | Metal, CUDA, CPU |
+| **Core ML** | Apple Silicon efficiency | Apple Neural Engine (38 TOPS) |
+| **Hybrid Pipeline** | Maximum throughput on Mac | GPU for attention, ANE for MLP |
+| **mistral-rs** | Production serving (10-100 users) | PagedAttention, X-LoRA, ISQ |
 
 ### Feature Flags
 
