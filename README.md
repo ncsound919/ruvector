@@ -1054,7 +1054,8 @@ Think of it like your computer's memory hierarchy—frequently accessed data liv
 
 ## Use Cases
 
-From AI-powered search to genomics, from real-time recommendations to knowledge graphs — see what people are building with RuVector.
+<details>
+<summary>From AI-powered search to genomics, from real-time recommendations to knowledge graphs — see what people are building with RuVector.</summary>
 
 ### AI & LLM Applications
 
@@ -1191,6 +1192,8 @@ SELECT * FROM documents ORDER BY embedding <-> query_vector LIMIT 10;
 | **Self-Learning Pipelines** | DAG workflows that learn optimal execution paths over time | [crates/ruvector-dag](./crates/ruvector-dag) |
 | **Web Scraping → Embeddings** | Apify integration — scrape, embed, and index in one pipeline | [examples/apify](./examples/apify) |
 | **Synthetic Data** | Agentic synthesis and generation for training data | [Agentic-Flow](https://github.com/ruvnet/agentic-flow) |
+
+</details>
 
 ## Installation
 
