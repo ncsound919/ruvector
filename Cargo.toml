@@ -111,6 +111,7 @@ members = [
     "crates/ruvector-graph-transformer-node",
     "examples/rvf-kernel-optimized",
     "examples/verified-applications",
+    "crates/thermorust",
 ]
 resolver = "2"
 
