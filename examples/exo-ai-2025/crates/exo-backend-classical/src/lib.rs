@@ -6,6 +6,7 @@
 
 #![warn(missing_docs)]
 
+pub mod domain_bridge;
 pub mod graph;
 pub mod vector;
 
