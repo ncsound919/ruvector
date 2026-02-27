@@ -275,7 +275,7 @@ RuVector powers two major AI orchestration platforms:
 
 | Platform | Purpose | Install | Downloads |
 |----------|---------|---------|-----------|
-| [**Claude-Flow**](https://github.com/ruvnet/claude-flow) | Enterprise multi-agent orchestration for Claude Code | `npx ruvflo@latest` | [![npm downloads](https://img.shields.io/npm/dt/claude-flow.svg)](https://www.npmjs.com/package/claude-flow) |
+| [**ruFlo**](https://github.com/ruvnet/claude-flow) | Enterprise multi-agent orchestration for Claude Code | `npx ruvflo@latest` | [![npm downloads](https://img.shields.io/npm/dt/claude-flow.svg)](https://www.npmjs.com/package/claude-flow) |
 | [**Agentic-Flow**](https://github.com/ruvnet/agentic-flow) | Run AI agents on any cloud with any model — Claude, GPT, Gemini, or local | `npx agentic-flow@latest` | [![npm downloads](https://img.shields.io/npm/dt/agentic-flow.svg)](https://www.npmjs.com/package/agentic-flow) |
 | [**AgentDB**](https://github.com/ruvnet/agentdb) | Give AI agents long-term memory that gets smarter over time | `npm install agentdb@alpha` | [![npm downloads](https://img.shields.io/npm/dt/agentdb.svg)](https://www.npmjs.com/package/agentdb) |
 
