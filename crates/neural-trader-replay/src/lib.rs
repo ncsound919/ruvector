@@ -3,7 +3,9 @@
 //! Witnessable replay segments, RVF serialization stubs, and audit
 //! receipt logging for the RuVector Neural Trader (ADR-084).
 
-use neural_trader_coherence::{CoherenceDecision, WitnessReceipt};
+use std::collections::VecDeque;
+
+use neural_trader_coherence::{CoherenceDecision, RegimeLabel, WitnessReceipt};
 use neural_trader_core::MarketEvent;
 use serde::{Deserialize, Serialize};
 
@@ -72,7 +74,7 @@ pub struct SegmentLineage {
 pub struct MemoryQuery {
     pub symbol_id: u32,
     pub embedding: Vec<f32>,
-    pub regime: Option<String>,
+    pub regime: Option<RegimeLabel>,
     pub limit: usize,
 }
 
@@ -132,23 +134,32 @@ impl neural_trader_coherence::WitnessLogger for InMemoryReceiptLog {
 // ---------------------------------------------------------------------------
 
 /// Simple bounded reservoir memory store for research use.
+///
+/// Uses `VecDeque` for O(1) front eviction instead of `Vec::remove(0)` O(n).
 pub struct ReservoirStore {
-    pub segments: Vec<ReplaySegment>,
+    pub segments: VecDeque<ReplaySegment>,
     pub max_size: usize,
 }
 
 impl ReservoirStore {
     pub fn new(max_size: usize) -> Self {
         Self {
-            segments: Vec::new(),
+            segments: VecDeque::with_capacity(max_size.min(1024)),
             max_size,
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
     }
 }
 
 impl MemoryStore for ReservoirStore {
     fn retrieve(&self, query: &MemoryQuery) -> anyhow::Result<Vec<ReplaySegment>> {
-        // Naive: return segments matching symbol_id, up to limit.
         let results: Vec<_> = self
             .segments
             .iter()
@@ -168,10 +179,9 @@ impl MemoryStore for ReservoirStore {
             return Ok(false);
         }
         if self.segments.len() >= self.max_size {
-            // Evict oldest (simplistic; real impl uses reservoir sampling).
-            self.segments.remove(0);
+            self.segments.pop_front(); // O(1) eviction
         }
-        self.segments.push(seg);
+        self.segments.push_back(seg);
         Ok(true)
     }
 }
@@ -221,7 +231,7 @@ mod tests {
             reasons: vec!["test block".into()],
         };
         assert!(!store.maybe_write(seg.clone(), &blocked).unwrap());
-        assert!(store.segments.is_empty());
+        assert!(store.is_empty());
 
         let allowed = CoherenceDecision {
             allow_retrieve: true,
@@ -235,7 +245,7 @@ mod tests {
             reasons: vec![],
         };
         assert!(store.maybe_write(seg, &allowed).unwrap());
-        assert_eq!(store.segments.len(), 1);
+        assert_eq!(store.len(), 1);
     }
 
     #[test]
@@ -255,9 +265,9 @@ mod tests {
         store.maybe_write(make_test_segment(1), &gate).unwrap();
         store.maybe_write(make_test_segment(2), &gate).unwrap();
         store.maybe_write(make_test_segment(3), &gate).unwrap();
-        assert_eq!(store.segments.len(), 2);
-        // First segment (id=1) was evicted.
-        assert_eq!(store.segments[0].segment_id, 2);
+        assert_eq!(store.len(), 2);
+        // First segment (id=1) was evicted via O(1) pop_front.
+        assert_eq!(store.segments.front().unwrap().segment_id, 2);
     }
 
     fn make_test_segment(id: u64) -> ReplaySegment {

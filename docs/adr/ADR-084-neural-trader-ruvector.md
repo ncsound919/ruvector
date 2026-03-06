@@ -20,6 +20,7 @@ ruv
 - ADR-041 curated module registry
 - ADR-042 Security RVF AIDefence TEE
 - ADR-047 Proof-gated mutation protocol
+- `examples/neural-trader/` existing example scaffold
 - Cognitive MinCut Engine
 - Mincut Gated Transformer
 - ruvector-postgres architecture
@@ -242,17 +243,25 @@ Each important subgraph window is embedded into RuVector.
 **Example keyspaces in ruvector-postgres:**
 
 ```sql
+-- Event log: range-partitioned by ts_exchange_ns for bounded retention
 CREATE TABLE nt_event_log (
-    event_id       BYTEA PRIMARY KEY,
+    event_id       BYTEA NOT NULL,
     ts_exchange_ns BIGINT NOT NULL,
     ts_ingest_ns   BIGINT NOT NULL,
     venue_id       INT NOT NULL,
     symbol_id      INT NOT NULL,
     event_type     INT NOT NULL,
     payload        JSONB NOT NULL,
-    witness_hash   BYTEA
-);
+    witness_hash   BYTEA,
+    PRIMARY KEY (ts_exchange_ns, event_id)
+) PARTITION BY RANGE (ts_exchange_ns);
 
+CREATE INDEX idx_event_log_symbol_ts
+    ON nt_event_log (symbol_id, ts_exchange_ns);
+CREATE INDEX idx_event_log_venue_ts
+    ON nt_event_log (venue_id, ts_exchange_ns);
+
+-- Embeddings: composite index for time-range similarity queries
 CREATE TABLE nt_embeddings (
     embedding_id   BIGSERIAL PRIMARY KEY,
     symbol_id      INT NOT NULL,
@@ -264,8 +273,17 @@ CREATE TABLE nt_embeddings (
     embedding      vector(256)
 );
 
+CREATE INDEX idx_embeddings_symbol_ts
+    ON nt_embeddings (symbol_id, ts_ns DESC);
+CREATE INDEX idx_embeddings_type_ts
+    ON nt_embeddings (embedding_type, ts_ns DESC);
+CREATE INDEX idx_embeddings_vec_hnsw
+    ON nt_embeddings USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200);
+
+-- Replay segments: partitioned by start_ts_ns for retention management
 CREATE TABLE nt_segments (
-    segment_id   BIGSERIAL PRIMARY KEY,
+    segment_id   BIGSERIAL NOT NULL,
     symbol_id    INT NOT NULL,
     start_ts_ns  BIGINT NOT NULL,
     end_ts_ns    BIGINT NOT NULL,
@@ -273,8 +291,14 @@ CREATE TABLE nt_segments (
     rvf_blob     BYTEA,
     signature    BYTEA,
     witness_hash BYTEA,
-    metadata     JSONB
-);
+    metadata     JSONB,
+    PRIMARY KEY (start_ts_ns, segment_id)
+) PARTITION BY RANGE (start_ts_ns);
+
+CREATE INDEX idx_segments_symbol_ts
+    ON nt_segments (symbol_id, start_ts_ns DESC);
+CREATE INDEX idx_segments_kind
+    ON nt_segments (segment_kind, start_ts_ns DESC);
 ```
 
 ### 4. Learning Layer
@@ -574,6 +598,8 @@ Where:
 - `structural_overlap` — graph neighborhood match
 - `regime_match` — volatility and spread regime comparison
 - `coherence_bonus` — reward for fragments from stable partitions
+
+Weights are constrained: `α + β + γ + δ = 1`. Defaults: `α=0.4, β=0.25, γ=0.2, δ=0.15`. Tuned per regime via walk-forward validation.
 
 ---
 
@@ -910,6 +936,13 @@ neural_trader:
     allow_calibration_updates: true
     allow_memory_write: true
     allow_weight_updates: false
+
+  retention:
+    hot_window_hours: 4
+    warm_retention_days: 30
+    cold_archive_days: 365
+    partition_interval_ns: 3600000000000  # 1 hour per partition
+    vacuum_schedule_cron: "0 */6 * * *"
 ```
 
 ---

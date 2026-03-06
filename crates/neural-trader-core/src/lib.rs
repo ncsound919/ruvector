@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Every raw feed message is normalized into this structure before it
 /// enters the graph or embedding pipeline.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MarketEvent {
     pub event_id: [u8; 16],
     pub ts_exchange_ns: u64,
@@ -95,12 +95,37 @@ pub enum EdgeKind {
 // Graph delta
 // ---------------------------------------------------------------------------
 
+/// Property keys for graph node updates.
+///
+/// Using an enum avoids heap-allocating strings on the hot ingest path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum PropertyKey {
+    VisibleDepth = 0,
+    EstimatedHiddenDepth = 1,
+    QueueLength = 2,
+    LocalImbalance = 3,
+    RefillRate = 4,
+    DepletionRate = 5,
+    SpreadDistance = 6,
+    LocalRealizedVol = 7,
+    CancelHazard = 8,
+    FillHazard = 9,
+    SlippageToMid = 10,
+    PostTradeImpact = 11,
+    InfluenceScore = 12,
+    CoherenceContribution = 13,
+    QueueEstimate = 14,
+    Age = 15,
+    ModifyCount = 16,
+}
+
 /// Describes changes applied to the market graph after processing one event.
 #[derive(Debug, Clone, Default)]
 pub struct GraphDelta {
     pub nodes_added: Vec<(NodeKind, u64)>,
     pub edges_added: Vec<(EdgeKind, u64, u64)>,
-    pub properties_updated: Vec<(u64, String, f64)>,
+    pub properties_updated: Vec<(u64, PropertyKey, f64)>,
 }
 
 // ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Every memory write, model update, retrieval, and actuation must pass
 /// through this gate before proceeding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoherenceDecision {
     pub allow_retrieve: bool,
     pub allow_write: bool,
@@ -58,6 +58,9 @@ pub struct GateContext {
     pub drift_score: f32,
     /// Current regime label.
     pub regime: RegimeLabel,
+    /// Number of consecutive windows with stable boundary identity.
+    /// Gate requires this >= `GateConfig::boundary_stability_windows`.
+    pub boundary_stable_count: usize,
 }
 
 /// Coarse regime classification.
@@ -127,6 +130,10 @@ impl CoherenceGate for ThresholdGate {
         let cut_ok = ctx.mincut_value >= floor;
         let cusum_ok = ctx.cusum_score < self.config.cusum_threshold;
         let drift_ok = ctx.drift_score < self.config.max_drift_score;
+        let boundary_ok =
+            ctx.boundary_stable_count >= self.config.boundary_stability_windows;
+        // Learning requires tighter drift margin (half the max).
+        let learn_drift_ok = ctx.drift_score < self.config.max_drift_score * 0.5;
 
         let mut reasons = Vec::new();
         if !cut_ok {
@@ -147,13 +154,19 @@ impl CoherenceGate for ThresholdGate {
                 ctx.drift_score, self.config.max_drift_score
             ));
         }
+        if !boundary_ok {
+            reasons.push(format!(
+                "boundary stable for {} windows, need {}",
+                ctx.boundary_stable_count, self.config.boundary_stability_windows
+            ));
+        }
 
-        let base_ok = cut_ok && cusum_ok && drift_ok;
+        let base_ok = cut_ok && cusum_ok && drift_ok && boundary_ok;
 
         Ok(CoherenceDecision {
             allow_retrieve: cut_ok, // retrieval is most permissive
             allow_write: base_ok,
-            allow_learn: base_ok && drift_ok,
+            allow_learn: base_ok && learn_drift_ok, // stricter: half drift margin
             allow_act: base_ok,
             mincut_value: ctx.mincut_value,
             partition_hash: ctx.partition_hash,
@@ -215,6 +228,7 @@ mod tests {
             cusum_score: cusum,
             drift_score: drift,
             regime,
+            boundary_stable_count: 10, // above default threshold of 8
         }
     }
 
@@ -255,8 +269,33 @@ mod tests {
     #[test]
     fn drift_blocks_learning() {
         let gate = ThresholdGate::new(GateConfig::default());
+        // drift 0.4 > max_drift*0.5 (0.25) so learning blocked,
+        // but < max_drift (0.5) so act/write still allowed.
+        let ctx = make_ctx(15, 1.0, 0.4, RegimeLabel::Calm);
+        let d = gate.evaluate(&ctx).unwrap();
+        assert!(!d.allow_learn);
+        assert!(d.allow_act); // act is still permitted
+    }
+
+    #[test]
+    fn high_drift_blocks_everything() {
+        let gate = ThresholdGate::new(GateConfig::default());
         let ctx = make_ctx(15, 1.0, 0.8, RegimeLabel::Calm);
         let d = gate.evaluate(&ctx).unwrap();
         assert!(!d.allow_learn);
+        assert!(!d.allow_act);
+        assert!(!d.allow_write);
+        assert!(d.allow_retrieve); // retrieval only needs cut_ok
+    }
+
+    #[test]
+    fn boundary_instability_blocks_action() {
+        let gate = ThresholdGate::new(GateConfig::default());
+        let mut ctx = make_ctx(15, 1.0, 0.1, RegimeLabel::Calm);
+        ctx.boundary_stable_count = 3; // below threshold of 8
+        let d = gate.evaluate(&ctx).unwrap();
+        assert!(!d.allow_act);
+        assert!(!d.allow_write);
+        assert!(d.allow_retrieve); // retrieval permissive
     }
 }
