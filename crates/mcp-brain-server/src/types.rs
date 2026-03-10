@@ -552,10 +552,16 @@ pub struct CreatePageRequest {
     pub category: BrainCategory,
     pub title: String,
     pub content: String,
+    #[serde(default)]
     pub tags: Vec<String>,
     pub code_snippet: Option<String>,
+    /// Client-provided embedding. If omitted, server generates via ruvllm.
+    #[serde(default)]
     pub embedding: Vec<f32>,
+    #[serde(default)]
     pub evidence_links: Vec<EvidenceLink>,
+    /// Witness hash for integrity. If omitted, server computes from content.
+    #[serde(default)]
     pub witness_hash: String,
 }
 

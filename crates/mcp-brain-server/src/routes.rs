@@ -1865,9 +1865,21 @@ async fn create_page(
         return Err((StatusCode::TOO_MANY_REQUESTS, "Write rate limit exceeded".into()));
     }
 
+    // Auto-generate embedding via ruvllm if client didn't provide one or dim mismatches
+    let embedding = if req.embedding.is_empty()
+        || req.embedding.len() != crate::embeddings::EMBED_DIM
+    {
+        let text = crate::embeddings::EmbeddingEngine::prepare_text(&req.title, &req.content, &req.tags);
+        let emb = state.embedding_engine.read().embed_for_storage(&text);
+        tracing::debug!("Auto-generated {}-dim embedding for page '{}'", emb.len(), req.title);
+        emb
+    } else {
+        req.embedding
+    };
+
     // Verify input
     state.verifier.read()
-        .verify_share(&req.title, &req.content, &req.tags, &req.embedding)
+        .verify_share(&req.title, &req.content, &req.tags, &embedding)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     // Get or create contributor
@@ -1897,6 +1909,18 @@ async fn create_page(
         PageStatus::Draft
     };
 
+    // Auto-generate witness hash if not provided
+    let witness_hash = if req.witness_hash.is_empty() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ruvector-witness:");
+        data.extend_from_slice(req.title.as_bytes());
+        data.extend_from_slice(b":");
+        data.extend_from_slice(req.content.as_bytes());
+        hex::encode(rvf_crypto::shake256_256(&data))
+    } else {
+        req.witness_hash
+    };
+
     let memory = BrainMemory {
         id,
         category: req.category,
@@ -1904,11 +1928,11 @@ async fn create_page(
         content: req.content,
         tags: req.tags,
         code_snippet: req.code_snippet,
-        embedding: req.embedding,
+        embedding,
         contributor_id: contributor.pseudonym.clone(),
         quality_score: BetaParams::new(),
         partition_id: None,
-        witness_hash: req.witness_hash,
+        witness_hash,
         rvf_gcs_path: None,
         redaction_log: None,
         dp_proof: None,
