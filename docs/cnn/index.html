@@ -648,14 +648,14 @@
                 // Dynamic import from CDN
                 const module = await import(`${CDN_BASE}/ruvector_cnn_wasm.js`);
 
-                // Initialize the WASM
-                await module.default(`${CDN_BASE}/ruvector_cnn_wasm_bg.wasm`);
+                // Initialize the WASM (use object format to avoid deprecation warning)
+                await module.default({ module_or_path: `${CDN_BASE}/ruvector_cnn_wasm_bg.wasm` });
 
-                // Create embedder
-                embedder = new module.CnnEmbedder({ embeddingDim: 512, normalize: true });
+                // Create embedder (WasmCnnEmbedder, not CnnEmbedder)
+                embedder = new module.WasmCnnEmbedder();
 
                 log('WASM module loaded successfully!', 'success');
-                log(`Embedding dimension: ${embedder.embeddingDim}`);
+                log(`Embedding dimension: ${embedder.embedding_dim}`);
 
                 loadingScreen.classList.remove('active');
                 mainContent.classList.remove('hidden');
@@ -681,7 +681,7 @@
         // Demo mode with simulated embeddings
         window.startDemoMode = function() {
             embedder = {
-                embeddingDim: 512,
+                embedding_dim: 512,
                 extract: () => {
                     const arr = new Float32Array(512);
                     for (let i = 0; i < 512; i++) arr[i] = (Math.random() - 0.5) * 2;
@@ -690,7 +690,7 @@
                     for (let i = 0; i < 512; i++) arr[i] /= norm;
                     return arr;
                 },
-                cosineSimilarity: (a, b) => {
+                cosine_similarity: (a, b) => {
                     let dot = 0;
                     for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
                     return dot;
@@ -892,8 +892,8 @@
 
                 validImages.forEach((img2, j) => {
                     let similarity;
-                    if (embedder.cosineSimilarity) {
-                        similarity = embedder.cosineSimilarity(img1.embedding, img2.embedding);
+                    if (embedder.cosine_similarity) {
+                        similarity = embedder.cosine_similarity(img1.embedding, img2.embedding);
                     } else {
                         // Fallback calculation
                         let dot = 0;
