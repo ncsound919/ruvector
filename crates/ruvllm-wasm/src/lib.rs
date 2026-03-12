@@ -122,6 +122,13 @@ pub mod workers;
 #[cfg(feature = "webgpu")]
 pub mod webgpu;
 
+// Pi-Quantization modules (ADR-090 Phase 4)
+#[cfg(feature = "pi-quant")]
+pub mod pi_quant_wasm;
+
+#[cfg(feature = "pi-quant")]
+pub mod quant_bench_wasm;
+
 // Re-export all bindings
 pub use bindings::*;
 pub use hnsw_router::{HnswRouterWasm, PatternWasm, RouteResultWasm};
@@ -138,6 +145,13 @@ pub use workers::{
 // Re-export WebGPU module when enabled
 #[cfg(feature = "webgpu")]
 pub use webgpu::*;
+
+// Re-export Pi-Quantization modules when enabled (ADR-090 Phase 4)
+#[cfg(feature = "pi-quant")]
+pub use pi_quant_wasm::PiQuantWasm;
+
+#[cfg(feature = "pi-quant")]
+pub use quant_bench_wasm::QuantBenchWasm;
 
 /// Initialize the WASM module.
 ///

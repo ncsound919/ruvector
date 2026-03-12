@@ -73,3 +73,7 @@ parallel = []
 simd = []
 # Enable intelligent features (HNSW Router, MicroLoRA, SONA)
 intelligent = []
+# Enable Pi-Quantization for ultra-low-bit weight compression (ADR-090 Phase 4)
+pi-quant = []
+# Enable Quantization-Aware Training (requires pi-quant)
+qat = ["pi-quant"]

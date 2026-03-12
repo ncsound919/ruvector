@@ -55,6 +55,18 @@ pub enum TargetFormat {
     Q8_0,
     /// FP16 (no quantization, half precision)
     F16,
+    /// Pi-constant 3-bit quantization (ADR-090)
+    ///
+    /// Uses pi-scaled step sizes: step = alpha * pi / k
+    /// Provides ~0.5 effective bits better precision than uniform 3-bit.
+    /// Storage: 3.0625 bits/weight (including scale overhead)
+    PiQ3,
+    /// Pi-constant 2-bit quantization (ADR-090)
+    ///
+    /// Ultra-low-bit format for extreme compression.
+    /// Uses pi-scaled step sizes: step = alpha * pi / k
+    /// Storage: 2.0625 bits/weight (including scale overhead)
+    PiQ2,
 }
 
 impl TargetFormat {
@@ -65,25 +77,35 @@ impl TargetFormat {
             TargetFormat::Q5_K_M => GgufQuantType::Q5_K,
             TargetFormat::Q8_0 => GgufQuantType::Q8_0,
             TargetFormat::F16 => GgufQuantType::F16,
+            // Pi-quant formats use reserved GGUF type IDs (INV-7 from ADR-090)
+            // PiQ3 = 40, PiQ2 = 41 (to be registered in gguf/quantization.rs)
+            TargetFormat::PiQ3 => GgufQuantType::Q4_K, // Fallback until type 40 is registered
+            TargetFormat::PiQ2 => GgufQuantType::Q2_K, // Fallback until type 41 is registered
         }
     }
 
-    /// Get bits per weight
+    /// Get bits per weight (including scale overhead)
     pub fn bits_per_weight(&self) -> f32 {
         match self {
             TargetFormat::Q4_K_M => 4.5,
             TargetFormat::Q5_K_M => 5.5,
             TargetFormat::Q8_0 => 8.5,
             TargetFormat::F16 => 16.0,
+            // Pi-quant bits/weight from ADR-090 spec
+            TargetFormat::PiQ3 => 3.0625, // 3 bits + scale overhead
+            TargetFormat::PiQ2 => 2.0625, // 2 bits + scale overhead
         }
     }
 
-    /// Get the block size
+    /// Get the block size (number of weights per quantization block)
     pub fn block_size(&self) -> usize {
         match self {
             TargetFormat::Q4_K_M | TargetFormat::Q5_K_M => K_BLOCK_SIZE,
             TargetFormat::Q8_0 => Q8_BLOCK_SIZE,
             TargetFormat::F16 => 1,
+            // Pi-quant block sizes
+            TargetFormat::PiQ3 => 8,  // 8 weights per 3-byte block
+            TargetFormat::PiQ2 => 4,  // 4 weights per 1-byte block
         }
     }
 
@@ -94,6 +116,9 @@ impl TargetFormat {
             "q5_k_m" | "q5k" | "q5km" | "q5" => Some(TargetFormat::Q5_K_M),
             "q8_0" | "q8" | "q80" => Some(TargetFormat::Q8_0),
             "f16" | "fp16" | "half" => Some(TargetFormat::F16),
+            // Pi-quant format parsing
+            "piq3" | "pi_q3" | "pi3" | "pi-q3" => Some(TargetFormat::PiQ3),
+            "piq2" | "pi_q2" | "pi2" | "pi-q2" => Some(TargetFormat::PiQ2),
             _ => None,
         }
     }
@@ -105,6 +130,25 @@ impl TargetFormat {
             TargetFormat::Q5_K_M => "Q5_K_M",
             TargetFormat::Q8_0 => "Q8_0",
             TargetFormat::F16 => "F16",
+            TargetFormat::PiQ3 => "PiQ3",
+            TargetFormat::PiQ2 => "PiQ2",
+        }
+    }
+
+    /// Check if this is a pi-quantization format
+    pub fn is_pi_quant(&self) -> bool {
+        matches!(self, TargetFormat::PiQ3 | TargetFormat::PiQ2)
+    }
+
+    /// Get the number of quantization bits (without overhead)
+    pub fn raw_bits(&self) -> u8 {
+        match self {
+            TargetFormat::Q4_K_M => 4,
+            TargetFormat::Q5_K_M => 5,
+            TargetFormat::Q8_0 => 8,
+            TargetFormat::F16 => 16,
+            TargetFormat::PiQ3 => 3,
+            TargetFormat::PiQ2 => 2,
         }
     }
 }
@@ -954,6 +998,77 @@ impl RuvltraQuantizer {
                 Ok(bytes)
             }
             TargetFormat::F16 => self.quantize_to_fp16(data),
+            TargetFormat::PiQ3 => {
+                // Pi-constant 3-bit quantization (ADR-090)
+                // Uses pi-scaled step sizes for better precision at ultra-low bits
+                use super::pi_quant_simd::{pi_scale_adaptive, pi_quantize_scalar, PI3_VALUES_PER_GROUP, PI3_BYTES_PER_GROUP, DEFAULT_K};
+
+                let num_groups = (padded_data.len() + PI3_VALUES_PER_GROUP - 1) / PI3_VALUES_PER_GROUP;
+                let mut bytes = Vec::with_capacity(num_groups * (PI3_BYTES_PER_GROUP + 2)); // +2 for scale as f16
+
+                for chunk in padded_data.chunks(PI3_VALUES_PER_GROUP) {
+                    // Compute adaptive scale for this block using max absolute value
+                    let max_abs = chunk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                    // Scale = alpha * pi / k, where alpha is derived from max_abs
+                    // For 3-bit signed range [-4, 3], we need max_abs / 4 as alpha
+                    let alpha = if max_abs > 1e-10 { max_abs / 4.0 } else { 1e-10 };
+                    let scale = pi_scale_adaptive(alpha, DEFAULT_K);
+
+                    // Store scale as f16 (2 bytes)
+                    bytes.extend_from_slice(&f32_to_f16(scale).to_le_bytes());
+
+                    // Pad chunk to exactly 8 values if needed
+                    let mut chunk_padded = [0.0f32; PI3_VALUES_PER_GROUP];
+                    for (i, &v) in chunk.iter().enumerate() {
+                        chunk_padded[i] = v;
+                    }
+
+                    // Quantize values in groups of 8 -> 3 bytes using the scalar function
+                    let mut packed_bytes = [0u8; PI3_BYTES_PER_GROUP];
+                    pi_quantize_scalar(&chunk_padded, scale, &mut packed_bytes);
+                    bytes.extend_from_slice(&packed_bytes);
+                }
+
+                self.stats.tensors_quantized += 1;
+                self.stats.elements_processed += data.len();
+                Ok(bytes)
+            }
+            TargetFormat::PiQ2 => {
+                // Pi-constant 2-bit quantization (ADR-090)
+                // Ultra-low-bit format: 4 weights per byte
+                use super::pi_quant_simd::{pi_scale_adaptive, DEFAULT_K};
+
+                let num_groups = (padded_data.len() + 3) / 4; // 4 weights per byte
+                let mut bytes = Vec::with_capacity(num_groups * 3); // 1 byte data + 2 bytes scale per 4 values
+
+                for chunk in padded_data.chunks(4) {
+                    // Compute adaptive scale for this block
+                    let max_abs = chunk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                    // For 2-bit signed range [-2, 1], we need max_abs / 2 as alpha
+                    let alpha = if max_abs > 1e-10 { max_abs / 2.0 } else { 1e-10 };
+                    let scale = pi_scale_adaptive(alpha, DEFAULT_K);
+
+                    // Store scale as f16 (2 bytes)
+                    bytes.extend_from_slice(&f32_to_f16(scale).to_le_bytes());
+
+                    // Quantize 4 values into 1 byte (2 bits each)
+                    let mut packed_byte = 0u8;
+                    let inv_scale = if scale.abs() > 1e-10 { 1.0 / scale } else { 0.0 };
+                    for (i, &val) in chunk.iter().take(4).enumerate() {
+                        // 2-bit quantization: round and clamp to [-2, 1]
+                        let quantized = (val * inv_scale).round() as i32;
+                        let clamped = quantized.clamp(-2, 1);
+                        // Convert to unsigned: add 2 to get [0, 3]
+                        let q_unsigned = (clamped + 2) as u8;
+                        packed_byte |= (q_unsigned & 0x3) << (i * 2);
+                    }
+                    bytes.push(packed_byte);
+                }
+
+                self.stats.tensors_quantized += 1;
+                self.stats.elements_processed += data.len();
+                Ok(bytes)
+            }
         }
     }
 
@@ -997,6 +1112,17 @@ impl RuvltraQuantizer {
             TargetFormat::Q5_K_M => num_blocks * Q5KMBlock::SIZE,
             TargetFormat::Q8_0 => num_blocks * Q8Block::SIZE,
             TargetFormat::F16 => input_elements * 2,
+            // Pi-quant formats: 8 values per 5 bytes (3 data + 2 scale) for PiQ3
+            // 4 values per 3 bytes (1 data + 2 scale) for PiQ2
+            TargetFormat::PiQ3 => {
+                use super::pi_quant_simd::{PI3_VALUES_PER_GROUP, PI3_BYTES_PER_GROUP};
+                let num_groups = (input_elements + PI3_VALUES_PER_GROUP - 1) / PI3_VALUES_PER_GROUP;
+                num_groups * (PI3_BYTES_PER_GROUP + 2) // +2 for f16 scale
+            }
+            TargetFormat::PiQ2 => {
+                let num_groups = (input_elements + 3) / 4; // 4 weights per byte
+                num_groups * 3 // 1 byte data + 2 bytes scale
+            }
         }
     }
 }

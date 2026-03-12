@@ -1,6 +1,6 @@
 # ADR-091: INT8 CNN Quantization — Domain-Driven Design Architecture
 
-**Status**: Accepted
+**Status**: Accepted (Implementing)
 **Date**: 2026-03-12
 **Authors**: RuVector Architecture Team
 **Deciders**: ruv
@@ -13,6 +13,37 @@
 |---------|------|--------|---------|
 | 0.1 | 2026-03-12 | RuVector Team | Initial proposal based on INT8 quantization design |
 | 0.2 | 2026-03-12 | RuVector Team | Added decision statement, invariants, operator coverage, acceptance gates |
+| 0.3 | 2026-03-12 | RuVector Team | Implementation complete for Phase 1-3. Added status section. |
+
+## Implementation Status
+
+**Branch**: `feat/adr-090-ultra-low-bit-qat`
+**Last Updated**: 2026-03-12
+
+### Phase Completion
+
+| Phase | Status | Files Created | Tests |
+|-------|--------|---------------|-------|
+| Phase 1: PiQ3 PTQ | ✅ Complete | `pi_quant.rs`, `pi_quant_simd.rs`, `ruvltra_quant.rs` | 54 |
+| Phase 2: LoRA-QAT | ✅ Complete | `qat/` (9 files), `lora_qat.rs` | 24 |
+| Phase 3: Incoherence | ✅ Complete | `hadamard.rs`, `incoherence.rs`, `quip.rs` | 23 |
+| Phase 4: WASM | 🔄 In Progress | `pi_quant_wasm.rs`, `quant_bench_wasm.rs` | - |
+
+### Invariants Verified
+
+| Invariant | Status | Test File |
+|-----------|--------|-----------|
+| INV-1: STE Gradient Flow | ✅ | `ste_tests.rs` |
+| INV-2: Scale Positivity | ✅ | `pi_quant_tests.rs` |
+| INV-3: Step Size Constraint | ✅ | `pi_quant_tests.rs` |
+| INV-4: Hadamard Orthogonality | ✅ | `hadamard_tests.rs` |
+| INV-5: Calibration Provenance | ✅ | `acceptance_gates.rs` |
+| INV-8: SIMD ≈ Scalar | ✅ | `simd_equivalence_tests.rs` |
+
+### Test Summary
+
+- **Total Tests**: 114
+- **All Passing**: ✅ Yes
 
 ---
 

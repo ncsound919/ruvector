@@ -218,6 +218,10 @@ harness = false
 name = "ruvltra_benchmark"
 harness = false
 
+[[bench]]
+name = "pi_quant_bench"
+harness = false
+
 # Test configurations
 [[test]]
 name = "real_model_test"

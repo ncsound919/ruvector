@@ -133,6 +133,7 @@ pub mod models;
 pub mod optimization;
 pub mod paged_attention;
 pub mod policy_store;
+pub mod qat;
 pub mod quality;
 pub mod quantize;
 pub mod reasoning_bank;
@@ -329,6 +330,12 @@ pub use optimization::{
 };
 pub use paged_attention::{PageBlock, PageTable, PagedAttention, PagedAttentionConfig};
 pub use policy_store::{PolicyEntry, PolicyStore, PolicyType, QuantizationPolicy, RouterPolicy};
+// QAT (Quantization-Aware Training) - ADR-090 Phase 2
+pub use qat::{
+    create_quantizer, piq2_quantizer, piq3_quantizer, uniform_quantizer, DifferentiableQuantizer,
+    PiQuantDifferentiable, QatConfig, QatLossWeights, QuantGranularity, SteVariant,
+    UniformQuantizer, DEFAULT_BITS, DEFAULT_QAT_LR, MAX_BITS, MIN_BITS,
+};
 pub use quantize::{
     dequantize_for_ane,
     // Memory estimation
@@ -351,6 +358,23 @@ pub use quantize::{
     // Core quantizer
     RuvltraQuantizer,
     TargetFormat,
+    // Hadamard transform (ADR-090 Phase 3)
+    hadamard_batch_inverse,
+    hadamard_batch_transform,
+    log2_exact,
+    next_power_of_2,
+    pad_to_power_of_2,
+    HadamardTransform,
+    MAX_LOG_DIM,
+    SIMD_LANES,
+    // Incoherence transform (ADR-090 Phase 3)
+    apply_incoherence,
+    restore_incoherence,
+    IncoherenceConfig,
+    IncoherenceEvent,
+    IncoherencePhase,
+    IncoherenceStats,
+    IncoherenceTransform,
 };
 pub use serving::{
     BatchStats,
