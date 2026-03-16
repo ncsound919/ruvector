@@ -1,1020 +1,640 @@
 #!/usr/bin/env bash
 # =============================================================================
 # RuVector Training Orchestrator
-# Connects pi.ruv.io brain with local discovery files for self-improving knowledge
+# Interactive CLI for managing the pi.ruv.io brain API
+#
+# Provides 6 modes:
+#   1. Discovery Scanner      - Scan local discovery JSON files
+#   2. Brain Gap Analysis      - Query brain for high-novelty domains
+#   3. Batch Upload            - Upload discoveries with nonce auth + PII strip
+#   4. Training & Optimization - Trigger training, view SONA stats
+#   5. Cross-Domain Discovery  - Find connections via drift & partition
+#   6. Interactive Explorer    - Search brain memories
+#
+# Usage:
+#   PI=<token> ./scripts/training_orchestrator.sh [--help] [--dry-run]
+#
+# Environment:
+#   PI              Bearer token for brain API authentication
+#   DISCOVERIES_DIR Override default discoveries directory
 # =============================================================================
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BRAIN_URL="${BRAIN_URL:-https://pi.ruv.io}"
-AUTH_TOKEN="${AUTH_TOKEN:-ruvector-swarm}"
-DISCOVERY_DIR="$(cd "$(dirname "$0")" && pwd)"
-CURL_OPTS=(-s --max-time 15 -H "Authorization: Bearer ${AUTH_TOKEN}" -H "Content-Type: application/json")
+BRAIN_API="https://pi.ruv.io"
+DISCOVERIES_DIR="${DISCOVERIES_DIR:-$(cd "$(dirname "$0")/.." && pwd)/examples/data/discoveries}"
+DRY_RUN=false
 
 # ---------------------------------------------------------------------------
-# Colors & formatting
+# ANSI color codes
 # ---------------------------------------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 BLUE='\033[0;34m'
 MAGENTA='\033[0;35m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-DIM='\033[2m'
 BOLD='\033[1m'
-RESET='\033[0m'
+DIM='\033[2m'
+NC='\033[0m'
 
-banner() {
-    echo ""
-    echo -e "${MAGENTA}${BOLD}"
-    echo "  ╔══════════════════════════════════════════════════════════════╗"
-    echo "  ║           RuVector Training Orchestrator v1.0               ║"
-    echo "  ║       Brain: ${BRAIN_URL}                          ║"
-    echo "  ╚══════════════════════════════════════════════════════════════╝"
-    echo -e "${RESET}"
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+log_info()  { echo -e "  ${CYAN}[INFO]${NC}  $(date '+%H:%M:%S') $*"; }
+log_ok()    { echo -e "  ${GREEN}[ OK ]${NC}  $(date '+%H:%M:%S') $*"; }
+log_fail()  { echo -e "  ${RED}[FAIL]${NC}  $(date '+%H:%M:%S') $*"; }
+log_warn()  { echo -e "  ${YELLOW}[WARN]${NC}  $(date '+%H:%M:%S') $*"; }
+log_head()  { echo -e "\n  ${BOLD}${MAGENTA}=== $* ===${NC}\n"; }
+
+# ---------------------------------------------------------------------------
+# CLI flags
+# ---------------------------------------------------------------------------
+show_help() {
+    cat <<'HELPTEXT'
+RuVector Training Orchestrator - Interactive brain training CLI
+
+USAGE:
+    PI=<token> ./scripts/training_orchestrator.sh [OPTIONS]
+
+OPTIONS:
+    --help, -h   Show this help message and exit
+    --dry-run    Simulate uploads without sending data to the API
+
+ENVIRONMENT:
+    PI               Bearer token for API authentication (required for modes 2-6)
+    DISCOVERIES_DIR  Override the default discoveries directory
+
+MODES (interactive menu):
+    1  Discovery Scanner       Scan local JSON files, count entries, show domain coverage
+    2  Brain Gap Analysis      Query /v1/explore for curiosity/novelty, find gaps
+    3  Batch Upload            Upload discovery entries via /v1/memories with nonce auth
+    4  Training & Optimization Trigger /v1/train, display SONA stats from /v1/sona/stats
+    5  Cross-Domain Discovery  Query /v1/drift and /v1/partition for cross-domain links
+    6  Interactive Explorer    Search brain memories via /v1/memories/search?q=QUERY
+
+FEATURES:
+    - PII stripping: emails, phone numbers, SSNs removed before upload
+    - Progress bar for batch uploads
+    - Colored terminal output
+    - Graceful error handling on all API calls
+
+EXAMPLES:
+    PI=my-secret-token ./scripts/training_orchestrator.sh
+    PI=my-secret-token ./scripts/training_orchestrator.sh --dry-run
+HELPTEXT
+    exit 0
 }
 
-info()    { echo -e "  ${BLUE}[INFO]${RESET}    $*"; }
-success() { echo -e "  ${GREEN}[OK]${RESET}      $*"; }
-warn()    { echo -e "  ${YELLOW}[WARN]${RESET}    $*"; }
-error()   { echo -e "  ${RED}[ERROR]${RESET}   $*"; }
-header()  { echo -e "\n  ${CYAN}${BOLD}━━━ $* ━━━${RESET}\n"; }
-dim()     { echo -e "  ${DIM}$*${RESET}"; }
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h) show_help ;;
+        --dry-run)  DRY_RUN=true ;;
+        *)          echo "Unknown option: $arg" >&2; show_help ;;
+    esac
+done
 
-# Progress bar: progress_bar current total label
+# ---------------------------------------------------------------------------
+# Dependency checks
+# ---------------------------------------------------------------------------
+check_deps() {
+    local missing=()
+    for cmd in curl jq; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_fail "Missing required tools: ${missing[*]}"
+        echo "  Install with: sudo apt-get install -y ${missing[*]}"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# API helper - wraps curl with Bearer auth and error handling
+# Returns the response body on success, prints error and returns 1 on failure
+# ---------------------------------------------------------------------------
+api_call() {
+    local method="$1" endpoint="$2"
+    shift 2
+    local url="${BRAIN_API}${endpoint}"
+    local -a headers=(-H "Content-Type: application/json")
+
+    if [[ -n "${PI:-}" ]]; then
+        headers+=(-H "Authorization: Bearer ${PI}")
+    fi
+
+    local response http_code body
+    response=$(curl -s -w "\n%{http_code}" --max-time 15 \
+        "${headers[@]}" -X "$method" "$@" "$url" 2>/dev/null) || {
+        log_fail "Network error calling $method $url"
+        return 1
+    }
+
+    http_code=$(echo "$response" | tail -1)
+    body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
+        echo "$body"
+        return 0
+    else
+        log_fail "HTTP $http_code on $method $endpoint"
+        echo "$body" | jq . 2>/dev/null || echo "$body"
+        return 1
+    fi
+}
+
+# Checks that PI token is set; prints instructions if not
+require_token() {
+    if [[ -z "${PI:-}" ]]; then
+        log_fail "PI environment variable not set."
+        echo -e "  Export your bearer token first: ${BOLD}export PI=your-token${NC}"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# PII stripping - remove emails, phone numbers, SSNs from text
+# ---------------------------------------------------------------------------
+strip_pii() {
+    sed -E \
+        -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[REDACTED_EMAIL]/g' \
+        -e 's/(\+?1?[-. ]?\(?[0-9]{3}\)?[-. ]?[0-9]{3}[-. ]?[0-9]{4})/[REDACTED_PHONE]/g' \
+        -e 's/[0-9]{3}-[0-9]{2}-[0-9]{4}/[REDACTED_SSN]/g'
+}
+
+# ---------------------------------------------------------------------------
+# Progress bar: progress_bar <current> <total>
+# ---------------------------------------------------------------------------
 progress_bar() {
-    local current=$1 total=$2 label="${3:-}"
-    local width=40
-    local pct=0
+    local current="$1" total="$2" width=40
+    local pct=0 filled=0 empty=0
     if (( total > 0 )); then
         pct=$(( current * 100 / total ))
+        filled=$(( current * width / total ))
     fi
-    local filled=$(( current * width / (total > 0 ? total : 1) ))
-    local empty=$(( width - filled ))
-    local bar=""
-    for ((i=0; i<filled; i++)); do bar+="█"; done
-    for ((i=0; i<empty; i++)); do bar+="░"; done
-    printf "\r  ${GREEN}[%s]${RESET} %3d%% (%d/%d) %s" "$bar" "$pct" "$current" "$total" "$label"
+    empty=$(( width - filled ))
+    local bar_full="" bar_empty=""
+    for (( i=0; i<filled; i++ )); do bar_full+="█"; done
+    for (( i=0; i<empty; i++ )); do bar_empty+="░"; done
+    printf "\r  ${GREEN}[%s${DIM}%s${NC}${GREEN}]${NC} %3d%% (%d/%d)" \
+        "$bar_full" "$bar_empty" "$pct" "$current" "$total"
 }
 
-# Safe curl wrapper that handles errors
-brain_get() {
-    local endpoint="$1"
-    local result
-    result=$(curl "${CURL_OPTS[@]}" "${BRAIN_URL}${endpoint}" 2>/dev/null) || true
-    echo "$result"
-}
+# ===========================================================================
+# Mode 1: Discovery Scanner
+# ===========================================================================
+mode_discovery_scanner() {
+    log_head "Discovery Scanner"
 
-brain_post() {
-    local endpoint="$1"
-    local data="$2"
-    local result
-    result=$(curl "${CURL_OPTS[@]}" -X POST -d "$data" "${BRAIN_URL}${endpoint}" 2>/dev/null) || true
-    echo "$result"
-}
-
-# ---------------------------------------------------------------------------
-# 1. Discovery Scanner
-# ---------------------------------------------------------------------------
-discovery_scan() {
-    header "Discovery Scanner"
-    info "Scanning ${DISCOVERY_DIR} for discovery files..."
-
-    local scan_result
-    scan_result=$(python3 << 'PYEOF'
-import json, os, sys
-from collections import defaultdict
-
-discovery_dir = os.environ.get("DISCOVERY_DIR", ".")
-files = sorted([f for f in os.listdir(discovery_dir) if f.endswith('.json')])
-total_entries = 0
-domains = defaultdict(int)
-categories = defaultdict(int)
-tags_all = defaultdict(int)
-entries_per_file = {}
-all_tags_sets = []
-errors = []
-
-for fname in files:
-    fpath = os.path.join(discovery_dir, fname)
-    try:
-        with open(fpath) as fh:
-            data = json.load(fh)
-        if isinstance(data, list):
-            entries_per_file[fname] = len(data)
-            total_entries += len(data)
-            file_tags = set()
-            for entry in data:
-                d = entry.get("domain", "unknown")
-                domains[d] += 1
-                c = entry.get("category", "uncategorized")
-                categories[c] += 1
-                for t in entry.get("tags", []):
-                    tags_all[t] += 1
-                    file_tags.add(t)
-            all_tags_sets.append(file_tags)
-        elif isinstance(data, dict):
-            entries_per_file[fname] = 1
-            total_entries += 1
-            d = data.get("domain", "unknown")
-            if d != "unknown":
-                domains[d] += 1
-    except Exception as e:
-        errors.append(f"{fname}: {e}")
-
-# Cross-reference density: average tag overlap between files
-overlap_count = 0
-pair_count = 0
-for i in range(len(all_tags_sets)):
-    for j in range(i+1, min(i+20, len(all_tags_sets))):
-        if all_tags_sets[i] and all_tags_sets[j]:
-            overlap = len(all_tags_sets[i] & all_tags_sets[j])
-            union = len(all_tags_sets[i] | all_tags_sets[j])
-            if union > 0:
-                overlap_count += overlap / union
-                pair_count += 1
-cross_ref = overlap_count / pair_count if pair_count > 0 else 0
-
-# Novelty gaps: domains with fewest entries
-sorted_domains = sorted(domains.items(), key=lambda x: x[1])
-novelty_gaps = sorted_domains[:5] if len(sorted_domains) > 5 else sorted_domains
-
-# Top tags
-top_tags = sorted(tags_all.items(), key=lambda x: -x[1])[:15]
-
-# Top files by entry count
-top_files = sorted(entries_per_file.items(), key=lambda x: -x[1])[:10]
-
-result = {
-    "total_files": len(files),
-    "total_entries": total_entries,
-    "unique_domains": len(domains),
-    "domains": dict(sorted(domains.items(), key=lambda x: -x[1])),
-    "unique_categories": len(categories),
-    "top_categories": dict(sorted(categories.items(), key=lambda x: -x[1])[:10]),
-    "cross_ref_density": round(cross_ref, 4),
-    "novelty_gaps": dict(novelty_gaps),
-    "top_tags": dict(top_tags),
-    "top_files": dict(top_files),
-    "errors": errors
-}
-print(json.dumps(result))
-PYEOF
-)
-
-    local total_files total_entries unique_domains cross_ref
-    total_files=$(echo "$scan_result" | python3 -c "import sys,json; print(json.load(sys.stdin)['total_files'])")
-    total_entries=$(echo "$scan_result" | python3 -c "import sys,json; print(json.load(sys.stdin)['total_entries'])")
-    unique_domains=$(echo "$scan_result" | python3 -c "import sys,json; print(json.load(sys.stdin)['unique_domains'])")
-    cross_ref=$(echo "$scan_result" | python3 -c "import sys,json; print(json.load(sys.stdin)['cross_ref_density'])")
-
-    echo -e "  ${WHITE}${BOLD}Scan Results:${RESET}"
-    echo -e "  ${CYAN}Files scanned:${RESET}        $total_files"
-    echo -e "  ${CYAN}Total entries:${RESET}        $total_entries"
-    echo -e "  ${CYAN}Unique domains:${RESET}       $unique_domains"
-    echo -e "  ${CYAN}Cross-ref density:${RESET}    $cross_ref"
-    echo ""
-
-    echo -e "  ${WHITE}${BOLD}Domain Distribution:${RESET}"
-    echo "$scan_result" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for d, c in data['domains'].items():
-    bar = '█' * min(c // 5, 40)
-    print(f'    {d:<25s} {c:>5d}  {bar}')
-"
-    echo ""
-
-    echo -e "  ${WHITE}${BOLD}Top Tags:${RESET}"
-    echo "$scan_result" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for t, c in list(data['top_tags'].items())[:10]:
-    print(f'    {t:<25s} {c:>5d}')
-"
-    echo ""
-
-    echo -e "  ${WHITE}${BOLD}Novelty Gaps (underrepresented domains):${RESET}"
-    echo "$scan_result" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for d, c in data['novelty_gaps'].items():
-    print(f'    {d:<25s} {c:>5d} entries  ⚠ needs enrichment')
-"
-
-    # Store for later use
-    SCAN_RESULT="$scan_result"
-    export SCAN_RESULT
-}
-
-# ---------------------------------------------------------------------------
-# 2. Brain Gap Analysis
-# ---------------------------------------------------------------------------
-brain_gap_analysis() {
-    header "Brain Gap Analysis"
-    info "Querying brain at ${BRAIN_URL}..."
-
-    # Query explore endpoint
-    local explore_result
-    explore_result=$(brain_get "/v1/explore")
-    if [ -z "$explore_result" ] || echo "$explore_result" | grep -q '"error"'; then
-        warn "Explore endpoint unavailable or returned error"
-        explore_result='{"clusters":[]}'
-    else
-        success "Explore endpoint responded"
+    if [[ ! -d "$DISCOVERIES_DIR" ]]; then
+        log_fail "Discoveries directory not found: $DISCOVERIES_DIR"
+        return 1
     fi
 
-    # Query partition endpoint
-    local partition_result
-    partition_result=$(brain_get "/v1/partition")
-    if [ -z "$partition_result" ] || echo "$partition_result" | grep -q '"error"'; then
-        warn "Partition endpoint unavailable or returned error"
-        partition_result='{"partitions":[]}'
-    else
-        success "Partition endpoint responded"
-    fi
+    local total_files=0 total_entries=0
+    # Associative array for domain counts
+    declare -A domain_counts
 
-    # Query drift endpoint
-    local drift_result
-    drift_result=$(brain_get "/v1/drift")
-    if [ -z "$drift_result" ] || echo "$drift_result" | grep -q '"error"'; then
-        warn "Drift endpoint unavailable or returned error"
-        drift_result='{"drift":0}'
-    else
-        success "Drift endpoint responded"
-    fi
+    echo -e "  ${BOLD}Scanning:${NC} ${DIM}${DISCOVERIES_DIR}${NC}\n"
+    printf "  ${BOLD}%-45s %8s  %-30s${NC}\n" "FILE" "ENTRIES" "DOMAINS"
+    printf "  %s\n" "$(printf '%.0s-' {1..85})"
 
-    # Query status
-    local status_result
-    status_result=$(brain_get "/v1/status")
-    if [ -z "$status_result" ] || echo "$status_result" | grep -q '"error"'; then
-        warn "Status endpoint unavailable"
-        status_result='{"status":"unknown"}'
-    else
-        success "Status endpoint responded"
-    fi
-
-    echo ""
-    echo -e "  ${WHITE}${BOLD}Brain Status:${RESET}"
-    echo "$status_result" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(v, (str, int, float, bool)):
-                print(f'    {k:<30s} {v}')
-            elif isinstance(v, dict):
-                print(f'    {k}:')
-                for k2, v2 in v.items():
-                    print(f'      {k2:<28s} {v2}')
-except: print('    (could not parse status)')
-" 2>/dev/null || dim "    (could not parse status)"
-
-    echo ""
-    echo -e "  ${WHITE}${BOLD}Explore / Cluster Analysis:${RESET}"
-    echo "$explore_result" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(v, list) and len(v) > 0:
-                print(f'    {k}: {len(v)} items')
-                for item in v[:5]:
-                    if isinstance(item, dict):
-                        label = item.get('label', item.get('category', item.get('id', str(item)[:60])))
-                        score = item.get('coherence', item.get('score', item.get('curiosity', '')))
-                        print(f'      - {label}  (score: {score})')
-                    else:
-                        print(f'      - {str(item)[:80]}')
-            elif isinstance(v, (str, int, float)):
-                print(f'    {k}: {v}')
-except: print('    (could not parse explore data)')
-" 2>/dev/null || dim "    (could not parse explore data)"
-
-    echo ""
-    echo -e "  ${WHITE}${BOLD}Partition Analysis:${RESET}"
-    echo "$partition_result" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(v, list):
-                print(f'    {k}: {len(v)} partitions')
-                for item in v[:8]:
-                    if isinstance(item, dict):
-                        name = item.get('name', item.get('label', item.get('category', '?')))
-                        size = item.get('size', item.get('count', '?'))
-                        coh = item.get('coherence', item.get('density', '?'))
-                        print(f'      - {name:<30s} size={size}  coherence={coh}')
-                    else:
-                        print(f'      - {str(item)[:80]}')
-            elif isinstance(v, (str, int, float)):
-                print(f'    {k}: {v}')
-except: print('    (could not parse partition data)')
-" 2>/dev/null || dim "    (could not parse partition data)"
-
-    echo ""
-    echo -e "  ${WHITE}${BOLD}Drift Analysis:${RESET}"
-    echo "$drift_result" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(v, (str, int, float, bool)):
-                print(f'    {k:<30s} {v}')
-except: print('    (could not parse drift data)')
-" 2>/dev/null || dim "    (could not parse drift data)"
-}
-
-# ---------------------------------------------------------------------------
-# 3. Batch Upload Pipeline
-# ---------------------------------------------------------------------------
-batch_upload() {
-    header "Batch Upload Pipeline"
-    info "Uploading discovery entries to brain..."
-
-    local json_files
-    json_files=$(find "$DISCOVERY_DIR" -maxdepth 1 -name '*.json' -not -name '*.tmp' | sort)
-    local file_count
-    file_count=$(echo "$json_files" | wc -l)
-
-    local total_uploaded=0
-    local total_failed=0
-    local total_skipped=0
-    local total_to_upload=0
-
-    # First pass: count entries
-    for f in $json_files; do
-        local count
-        count=$(python3 -c "
-import json, sys
-try:
-    with open('$f') as fh:
-        data = json.load(fh)
-    if isinstance(data, list):
-        print(len(data))
-    elif isinstance(data, dict) and 'title' in data:
-        print(1)
-    else:
-        print(0)
-except:
-    print(0)
-" 2>/dev/null)
-        total_to_upload=$((total_to_upload + count))
-    done
-
-    info "Found $total_to_upload entries across $file_count files"
-    echo ""
-
-    local current=0
-    for f in $json_files; do
-        local fname
+    for f in "$DISCOVERIES_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        local fname count domains_str
         fname=$(basename "$f")
 
-        # Process each file
-        local upload_result
-        upload_result=$(BRAIN_URL="$BRAIN_URL" AUTH_TOKEN="$AUTH_TOKEN" python3 << PYEOF
-import json, sys, os, urllib.request, urllib.error, ssl
+        # Count entries (works for arrays and single objects)
+        count=$(jq 'if type == "array" then length else 1 end' "$f" 2>/dev/null || echo 0)
 
-brain_url = os.environ.get("BRAIN_URL", "https://pi.ruv.io")
-auth_token = os.environ.get("AUTH_TOKEN", "ruvector-swarm")
-fpath = "$f"
-fname = "$fname"
+        # Extract unique domains
+        domains_str=$(jq -r '
+            if type == "array" then
+                [.[].domain // "unknown"] | unique | join(", ")
+            else
+                .domain // "unknown"
+            end
+        ' "$f" 2>/dev/null || echo "parse-error")
 
-ctx = ssl.create_default_context()
+        # Track domain counts per file
+        while IFS=',' read -ra doms; do
+            for d in "${doms[@]}"; do
+                d=$(echo "$d" | xargs)  # trim whitespace
+                [[ -n "$d" ]] && domain_counts["$d"]=$(( ${domain_counts["$d"]:-0} + 1 ))
+            done
+        done <<< "$domains_str"
 
-def brain_request(method, endpoint, data=None):
-    url = brain_url + endpoint
-    headers = {
-        "Authorization": f"Bearer {auth_token}",
-        "Content-Type": "application/json"
+        printf "  ${CYAN}%-45s${NC} ${GREEN}%8d${NC}  %s\n" "$fname" "$count" "$domains_str"
+        total_files=$((total_files + 1))
+        total_entries=$((total_entries + count))
+    done
+
+    printf "  %s\n" "$(printf '%.0s-' {1..85})"
+    echo -e "\n  ${BOLD}Summary:${NC}"
+    echo -e "    Files scanned:  ${GREEN}${total_files}${NC}"
+    echo -e "    Total entries:  ${GREEN}${total_entries}${NC}"
+    echo -e "    Unique domains: ${GREEN}${#domain_counts[@]}${NC}"
+
+    if [[ ${#domain_counts[@]} -gt 0 ]]; then
+        echo -e "\n  ${BOLD}Domain Coverage:${NC}"
+        # Sort domains by count descending
+        for domain in $(
+            for k in "${!domain_counts[@]}"; do
+                echo "${domain_counts[$k]} $k"
+            done | sort -rn | awk '{print $2}'
+        ); do
+            local cnt=${domain_counts[$domain]}
+            printf "    ${BLUE}%-30s${NC} %d file(s)\n" "$domain" "$cnt"
+        done
+    fi
+}
+
+# ===========================================================================
+# Mode 2: Brain Gap Analysis
+# ===========================================================================
+mode_gap_analysis() {
+    log_head "Brain Gap Analysis"
+    require_token || return 1
+
+    log_info "Querying brain exploration data from /v1/explore..."
+    local explore_data
+    explore_data=$(api_call GET "/v1/explore") || {
+        log_fail "Could not reach /v1/explore"
+        return 1
     }
-    body = json.dumps(data).encode() if data else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-            return json.loads(resp.read().decode())
-    except Exception as e:
-        return {"error": str(e)}
 
-uploaded = 0
-failed = 0
-skipped = 0
+    echo -e "\n  ${BOLD}Curiosity & Novelty Landscape:${NC}\n"
 
-try:
-    with open(fpath) as fh:
-        data = json.load(fh)
+    # Parse the explore response - handles various response shapes
+    # Extract domain/novelty/curiosity tuples and display as bar chart
+    echo "$explore_data" | jq -r '
+        # Normalize different response shapes into lines of "domain\tnovelty\tcuriosity"
+        if type == "object" then
+            if .domains then
+                .domains | to_entries[] |
+                "\(.key)\t\(.value.novelty // .value.score // 0)\t\(.value.curiosity // 0)"
+            elif .explorations then
+                .explorations[] |
+                "\(.domain // .topic // "unknown")\t\(.novelty // 0)\t\(.curiosity // 0)"
+            elif .clusters then
+                .clusters[] |
+                "\(.label // .category // "unknown")\t\(.novelty // .coherence // 0)\t\(.curiosity // 0)"
+            else
+                to_entries[] |
+                "\(.key)\t\(if (.value | type) == "number" then .value else 0 end)\t0"
+            end
+        elif type == "array" then
+            .[] |
+            "\(.domain // .topic // .label // "unknown")\t\(.novelty // 0)\t\(.curiosity // 0)"
+        else empty end
+    ' 2>/dev/null | sort -t$'\t' -k2 -rn | head -20 | while IFS=$'\t' read -r domain novelty curiosity; do
+        # Build a visual bar proportional to novelty score
+        local bar_len color
+        bar_len=$(printf '%.0f' "$(echo "$novelty * 30" | bc -l 2>/dev/null || echo 5)")
+        [[ "$bar_len" -gt 30 ]] && bar_len=30
+        [[ "$bar_len" -lt 1 ]] && bar_len=1
+        local bar=""
+        for (( i=0; i<bar_len; i++ )); do bar+="█"; done
 
-    entries = []
-    if isinstance(data, list):
-        entries = data
-    elif isinstance(data, dict) and "title" in data:
-        entries = [data]
-
-    for entry in entries:
-        title = entry.get("title", "")
-        content = entry.get("content", "")
-        category = entry.get("category", entry.get("domain", "discovery"))
-        tags = entry.get("tags", [])
-        domain = entry.get("domain", "general")
-
-        if not title or not content:
-            skipped += 1
-            continue
-
-        # Get nonce
-        challenge = brain_request("GET", "/v1/challenge")
-        nonce = challenge.get("nonce", "")
-        if not nonce:
-            failed += 1
-            continue
-
-        # Upload
-        payload = {
-            "category": category,
-            "title": title,
-            "content": content[:2000],
-            "tags": tags[:10] + [domain, fname.replace(".json","")],
-            "nonce": nonce
-        }
-        result = brain_request("POST", "/v1/memories", payload)
-        if "error" in result:
-            failed += 1
-        else:
-            uploaded += 1
-
-except Exception as e:
-    print(json.dumps({"file": fname, "uploaded": 0, "failed": 0, "skipped": 0, "error": str(e)}))
-    sys.exit(0)
-
-print(json.dumps({"file": fname, "uploaded": uploaded, "failed": failed, "skipped": skipped}))
-PYEOF
-)
-
-        local file_uploaded file_failed file_skipped
-        file_uploaded=$(echo "$upload_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uploaded',0))" 2>/dev/null || echo 0)
-        file_failed=$(echo "$upload_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('failed',0))" 2>/dev/null || echo 0)
-        file_skipped=$(echo "$upload_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('skipped',0))" 2>/dev/null || echo 0)
-
-        total_uploaded=$((total_uploaded + file_uploaded))
-        total_failed=$((total_failed + file_failed))
-        total_skipped=$((total_skipped + file_skipped))
-        current=$((current + file_uploaded + file_failed + file_skipped))
-
-        progress_bar "$current" "$total_to_upload" "$fname"
-    done
-
-    echo ""
-    echo ""
-    echo -e "  ${WHITE}${BOLD}Upload Summary:${RESET}"
-    echo -e "  ${GREEN}Uploaded:${RESET}  $total_uploaded"
-    echo -e "  ${RED}Failed:${RESET}    $total_failed"
-    echo -e "  ${YELLOW}Skipped:${RESET}   $total_skipped"
-    echo -e "  ${CYAN}Total:${RESET}     $((total_uploaded + total_failed + total_skipped))"
-}
-
-# ---------------------------------------------------------------------------
-# 4. Training & Optimization Cycle
-# ---------------------------------------------------------------------------
-training_cycle() {
-    header "Training & Optimization Cycle"
-
-    # Step 1: Trigger training
-    info "Triggering training..."
-    local train_result
-    train_result=$(brain_post "/v1/pipeline/optimize" '{"actions":["train"]}')
-    if [ -z "$train_result" ]; then
-        # Fallback to /v1/train
-        train_result=$(brain_post "/v1/train" '{}')
-    fi
-    if echo "$train_result" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if 'error' not in d else 1)" 2>/dev/null; then
-        success "Training triggered"
-    else
-        warn "Training response: $(echo "$train_result" | head -c 200)"
-    fi
-    echo "$train_result" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for k, v in data.items():
-        if isinstance(v, (str, int, float, bool)):
-            print(f'    {k:<30s} {v}')
-except: pass
-" 2>/dev/null
-
-    echo ""
-
-    # Step 2: Drift check
-    info "Running drift check..."
-    local drift_result
-    drift_result=$(brain_post "/v1/pipeline/optimize" '{"actions":["drift_check"]}')
-    if [ -z "$drift_result" ]; then
-        drift_result=$(brain_get "/v1/drift")
-    fi
-    if [ -n "$drift_result" ]; then
-        success "Drift check complete"
-        echo "$drift_result" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for k, v in data.items():
-        if isinstance(v, (str, int, float, bool)):
-            print(f'    {k:<30s} {v}')
-except: pass
-" 2>/dev/null
-    else
-        warn "Drift check unavailable"
-    fi
-
-    echo ""
-
-    # Step 3: Domain transfers between related categories
-    info "Running cross-domain transfers..."
-    local transfers=(
-        "space-science:earth-science"
-        "academic-research:medical-genomics"
-        "economics-finance:academic-research"
-        "materials-physics:space-science"
-    )
-    for pair in "${transfers[@]}"; do
-        local src="${pair%%:*}"
-        local dst="${pair##*:}"
-        local xfer_result
-        xfer_result=$(brain_post "/v1/transfer" "{\"source_domain\":\"$src\",\"target_domain\":\"$dst\"}")
-        if [ -n "$xfer_result" ] && ! echo "$xfer_result" | grep -q '"error"' 2>/dev/null; then
-            success "Transfer: $src -> $dst"
+        # Color by novelty threshold
+        if (( $(echo "$novelty > 0.7" | bc -l 2>/dev/null || echo 0) )); then
+            color="$RED"
+        elif (( $(echo "$novelty > 0.4" | bc -l 2>/dev/null || echo 0) )); then
+            color="$YELLOW"
         else
-            dim "    Transfer $src -> $dst: $(echo "$xfer_result" | head -c 100)"
+            color="$GREEN"
         fi
+        printf "    ${BOLD}%-25s${NC} ${color}%-30s${NC} novelty=%-6s curiosity=%s\n" \
+            "$domain" "$bar" "$novelty" "$curiosity"
     done
 
     echo ""
+    echo -e "  ${BOLD}Legend:${NC}"
+    echo -e "    ${RED}█${NC} High novelty (>0.7) = domain needs more content"
+    echo -e "    ${YELLOW}█${NC} Medium novelty (0.4-0.7) = partially covered"
+    echo -e "    ${GREEN}█${NC} Low novelty (<0.4) = well covered"
+}
 
-    # Step 4: Attractor analysis
-    info "Triggering attractor analysis..."
-    local attractor_result
-    attractor_result=$(brain_get "/v1/explore")
-    if [ -n "$attractor_result" ]; then
-        success "Attractor analysis complete"
-        echo "$attractor_result" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    # Show summary stats
-    for k, v in data.items():
-        if isinstance(v, list):
-            print(f'    {k}: {len(v)} attractors found')
-        elif isinstance(v, (str, int, float)):
-            print(f'    {k}: {v}')
-except: pass
-" 2>/dev/null
+# ===========================================================================
+# Mode 3: Batch Upload
+# ===========================================================================
+mode_batch_upload() {
+    log_head "Batch Upload to Brain"
+    require_token || return 1
+
+    if $DRY_RUN; then
+        echo -e "  ${YELLOW}*** DRY-RUN MODE -- no data will be sent ***${NC}\n"
+    fi
+
+    if [[ ! -d "$DISCOVERIES_DIR" ]]; then
+        log_fail "Discoveries directory not found: $DISCOVERIES_DIR"
+        return 1
+    fi
+
+    # Collect all entries into a temp file (one JSON object per line)
+    local entries_file
+    entries_file=$(mktemp /tmp/ruv_upload.XXXXXX)
+    trap "rm -f '$entries_file'" RETURN
+
+    for f in "$DISCOVERIES_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        jq -c 'if type == "array" then .[] else . end' "$f" 2>/dev/null >> "$entries_file"
+    done
+
+    local total
+    total=$(wc -l < "$entries_file")
+    if [[ "$total" -eq 0 ]]; then
+        log_warn "No discovery entries found in $DISCOVERIES_DIR"
+        return 0
+    fi
+
+    log_info "Found $total entries to upload"
+    echo ""
+
+    local success=0 fail=0 skipped=0 current=0
+
+    while IFS= read -r entry; do
+        current=$((current + 1))
+        progress_bar "$current" "$total"
+
+        # Extract fields
+        local title content tags domain
+        title=$(echo "$entry" | jq -r '.title // "untitled"')
+        content=$(echo "$entry" | jq -r '.content // ""')
+        tags=$(echo "$entry" | jq -c '.tags // []')
+        domain=$(echo "$entry" | jq -r '.domain // "general"')
+
+        # Skip entries missing content
+        if [[ -z "$content" || "$content" == "null" ]]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        # Strip PII from title and content
+        title=$(echo "$title" | strip_pii)
+        content=$(echo "$content" | strip_pii)
+
+        # In dry-run mode, skip actual upload
+        if $DRY_RUN; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        # Step 1: Get challenge nonce
+        local nonce_resp nonce
+        nonce_resp=$(api_call GET "/v1/challenge" 2>/dev/null) || { fail=$((fail + 1)); continue; }
+        nonce=$(echo "$nonce_resp" | jq -r '.nonce // .challenge // empty' 2>/dev/null)
+        if [[ -z "$nonce" ]]; then
+            fail=$((fail + 1))
+            continue
+        fi
+
+        # Step 2: Build payload with nonce
+        local payload
+        payload=$(jq -n \
+            --arg t "$title" \
+            --arg c "$content" \
+            --arg d "$domain" \
+            --arg n "$nonce" \
+            --argjson tags "$tags" \
+            '{title: $t, content: ($c | .[:2000]), domain: $d, tags: $tags, nonce: $n}')
+
+        # Step 3: POST to /v1/memories
+        if api_call POST "/v1/memories" -d "$payload" &>/dev/null; then
+            success=$((success + 1))
+        else
+            fail=$((fail + 1))
+        fi
+
+        # Brief rate-limit pause
+        sleep 0.3
+    done < "$entries_file"
+
+    echo ""  # clear progress bar line
+    echo ""
+    echo -e "  ${BOLD}Upload Summary:${NC}"
+    echo -e "    Total processed: $total"
+    echo -e "    ${GREEN}Uploaded:  $success${NC}"
+    [[ $fail -gt 0 ]]    && echo -e "    ${RED}Failed:    $fail${NC}"
+    [[ $skipped -gt 0 ]] && echo -e "    ${YELLOW}Skipped:   $skipped${NC}"
+    $DRY_RUN && echo -e "    ${DIM}(dry-run -- nothing was sent)${NC}"
+}
+
+# ===========================================================================
+# Mode 4: Training & Optimization
+# ===========================================================================
+mode_training() {
+    log_head "Training & Optimization"
+    require_token || return 1
+
+    # Trigger training
+    log_info "Triggering training via POST /v1/train..."
+    local train_result
+    train_result=$(api_call POST "/v1/train" -d '{}') || {
+        log_warn "Training endpoint returned an error (may still have triggered)"
+    }
+
+    if [[ -n "${train_result:-}" ]]; then
+        echo -e "\n  ${BOLD}Training Response:${NC}"
+        echo "$train_result" | jq -r '
+            to_entries[] |
+            "    \(.key): \(.value)"
+        ' 2>/dev/null || echo "  $train_result"
+    fi
+
+    # Fetch SONA stats
+    echo ""
+    log_info "Fetching SONA stats from GET /v1/sona/stats..."
+    local sona_stats
+    sona_stats=$(api_call GET "/v1/sona/stats") || {
+        log_warn "Could not retrieve SONA stats"
+        return 0
+    }
+
+    echo -e "\n  ${BOLD}SONA Statistics:${NC}"
+    echo "$sona_stats" | jq -r '
+        if type == "object" then
+            to_entries[] |
+            if (.value | type) == "object" then
+                "\n    \(.key):",
+                (.value | to_entries[] | "      \(.key): \(.value)")
+            else
+                "    \(.key): \(.value)"
+            end
+        else
+            "    \(.)"
+        end
+    ' 2>/dev/null || echo "  $sona_stats"
+}
+
+# ===========================================================================
+# Mode 5: Cross-Domain Discovery
+# ===========================================================================
+mode_cross_domain() {
+    log_head "Cross-Domain Discovery"
+    require_token || return 1
+
+    # Query semantic drift
+    log_info "Querying semantic drift via GET /v1/drift..."
+    local drift_data
+    drift_data=$(api_call GET "/v1/drift" 2>/dev/null) || true
+
+    if [[ -n "${drift_data:-}" ]]; then
+        echo -e "\n  ${BOLD}Semantic Drift:${NC}"
+        echo "$drift_data" | jq -r '
+            if type == "array" then
+                .[] |
+                "    [\(.from // .source // "?")] --> [\(.to // .target // "?")] drift=\(.score // .magnitude // "n/a")"
+            elif type == "object" then
+                if .drifts then
+                    .drifts[] |
+                    "    [\(.from // .source)] --> [\(.to // .target)] drift=\(.score // .magnitude // "n/a")"
+                else
+                    to_entries[] | "    \(.key): \(.value)"
+                end
+            else "    \(.)" end
+        ' 2>/dev/null || echo "$drift_data" | jq . 2>/dev/null || echo "  $drift_data"
+    else
+        log_warn "Drift endpoint unavailable"
     fi
 
     echo ""
 
-    # Step 5: Full optimization
-    info "Running full optimization..."
-    local opt_result
-    opt_result=$(brain_post "/v1/pipeline/optimize" '{"actions":["train","drift_check"]}')
-    if [ -n "$opt_result" ]; then
-        success "Optimization complete"
-        echo "$opt_result" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for k, v in data.items():
-        if isinstance(v, (str, int, float, bool)):
-            print(f'    {k:<30s} {v}')
-except: pass
-" 2>/dev/null
+    # Query domain partitions
+    log_info "Querying domain partitions via GET /v1/partition..."
+    local partition_data
+    partition_data=$(api_call GET "/v1/partition" 2>/dev/null) || true
+
+    if [[ -n "${partition_data:-}" ]]; then
+        echo -e "\n  ${BOLD}Domain Partitions:${NC}"
+        echo "$partition_data" | jq -r '
+            if type == "array" then
+                .[] |
+                "    Cluster: \(.id // .name // "?") | Members: \(.members // .domains // [] | join(", ")) | Size: \(.size // (.members // [] | length))"
+            elif type == "object" then
+                if .partitions then
+                    .partitions[] |
+                    "    Cluster: \(.id // .name) | Size: \(.size // "?") | Members: \(.members // .domains // [] | join(", "))"
+                else
+                    to_entries[] | "    \(.key): \(.value)"
+                end
+            else "    \(.)" end
+        ' 2>/dev/null || echo "$partition_data" | jq . 2>/dev/null || echo "  $partition_data"
+    else
+        log_warn "Partition endpoint unavailable"
+    fi
+
+    # Show cross-domain insight
+    if [[ -n "${drift_data:-}" && -n "${partition_data:-}" ]]; then
+        echo ""
+        echo -e "  ${BOLD}Insight:${NC} Domains with high drift and small partition size"
+        echo -e "  are the best candidates for cross-domain knowledge transfer."
     fi
 }
 
-# ---------------------------------------------------------------------------
-# 5. Cross-Domain Discovery Engine
-# ---------------------------------------------------------------------------
-cross_domain_discovery() {
-    header "Cross-Domain Discovery Engine"
-    info "Finding novel connections across domains..."
+# ===========================================================================
+# Mode 6: Interactive Explorer
+# ===========================================================================
+mode_explorer() {
+    log_head "Interactive Explorer"
+    require_token || return 1
 
-    local domains=("space" "earthquake" "economics" "genomics" "quantum" "climate" "AI" "defense" "energy" "materials")
-    local search_results=""
-
-    for domain in "${domains[@]}"; do
-        local result
-        result=$(brain_get "/v1/memories/search?q=${domain}")
-        if [ -n "$result" ]; then
-            search_results="${search_results}${domain}|||${result}
-"
-        fi
-        printf "\r  Searching: %-20s" "$domain"
-    done
-    echo ""
-    echo ""
-
-    # Analyze cross-domain similarities
-    echo "$search_results" | python3 << 'PYEOF'
-import sys, json
-from collections import defaultdict
-
-lines = sys.stdin.read().strip().split("\n")
-domain_tags = defaultdict(set)
-domain_entries = defaultdict(list)
-
-for line in lines:
-    if "|||" not in line:
-        continue
-    domain, raw = line.split("|||", 1)
-    try:
-        data = json.loads(raw)
-        entries = []
-        if isinstance(data, list):
-            entries = data
-        elif isinstance(data, dict):
-            if "results" in data:
-                entries = data["results"]
-            elif "memories" in data:
-                entries = data["memories"]
-            elif "title" in data:
-                entries = [data]
-
-        for e in entries:
-            if isinstance(e, dict):
-                tags = set(e.get("tags", []))
-                domain_tags[domain] |= tags
-                domain_entries[domain].append(e.get("title", "")[:80])
-    except:
-        continue
-
-# Find cross-domain overlaps
-print("  Cross-Domain Tag Overlaps:")
-print("  " + "-" * 60)
-domains = list(domain_tags.keys())
-connections = []
-for i in range(len(domains)):
-    for j in range(i+1, len(domains)):
-        overlap = domain_tags[domains[i]] & domain_tags[domains[j]]
-        if overlap:
-            connections.append((domains[i], domains[j], overlap))
-
-connections.sort(key=lambda x: -len(x[2]))
-for src, dst, overlap in connections[:15]:
-    shared = ", ".join(list(overlap)[:5])
-    print(f"    {src:<15s} <-> {dst:<15s}  shared: {shared}")
-
-print()
-print("  Domain Knowledge Map:")
-print("  " + "-" * 60)
-for domain in sorted(domain_entries.keys()):
-    entries = domain_entries[domain]
-    tag_count = len(domain_tags.get(domain, set()))
-    print(f"    {domain:<15s}  {len(entries):>3d} entries  {tag_count:>3d} unique tags")
-PYEOF
-}
-
-# ---------------------------------------------------------------------------
-# 6. Interactive Mode
-# ---------------------------------------------------------------------------
-interactive_mode() {
-    header "Interactive Mode"
-    echo -e "  ${DIM}Commands: explore, inject, train, status, gaps, transfer, optimize, scan, upload, quit${RESET}"
-    echo ""
+    echo -e "  Search the brain for memories. Type ${BOLD}q${NC} to return to menu.\n"
 
     while true; do
-        echo -ne "  ${MAGENTA}ruv>${RESET} "
-        read -r cmd args || break
+        echo -ne "  ${CYAN}search>${NC} "
+        read -r query || break
+        [[ -z "$query" ]] && continue
+        [[ "$query" == "q" || "$query" == "quit" || "$query" == "exit" ]] && break
 
-        case "$cmd" in
-            explore)
-                if [ -z "$args" ]; then
-                    warn "Usage: explore <topic>"
-                    continue
-                fi
-                info "Searching brain for: $args"
-                local result
-                result=$(brain_get "/v1/memories/search?q=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$args'))")")
-                if [ -n "$result" ]; then
-                    echo "$result" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    entries = data if isinstance(data, list) else data.get('results', data.get('memories', [data] if 'title' in data else []))
-    if not entries:
-        print('    No results found.')
-    for i, e in enumerate(entries[:10]):
-        if isinstance(e, dict):
-            title = e.get('title', 'untitled')[:70]
-            cat = e.get('category', '?')
-            score = e.get('score', e.get('similarity', ''))
-            tags = ', '.join(e.get('tags', [])[:5])
-            print(f'    {i+1:>2d}. [{cat}] {title}')
-            if score: print(f'        score: {score}')
-            if tags: print(f'        tags: {tags}')
-except Exception as ex:
-    print(f'    Parse error: {ex}')
-    print(f'    Raw: {sys.stdin.read()[:200]}')
-" 2>/dev/null
-                else
-                    warn "No response from brain"
-                fi
-                ;;
+        # URL-encode the query
+        local encoded_query
+        encoded_query=$(printf '%s' "$query" | jq -sRr @uri 2>/dev/null || echo "$query")
 
-            inject)
-                local title content
-                title=$(echo "$args" | awk '{print $1}')
-                content=$(echo "$args" | cut -d' ' -f2-)
-                if [ -z "$title" ] || [ -z "$content" ]; then
-                    warn "Usage: inject <title> <content>"
-                    continue
-                fi
-                info "Injecting: $title"
-                # Get nonce
-                local nonce_resp
-                nonce_resp=$(brain_get "/v1/challenge")
-                local nonce
-                nonce=$(echo "$nonce_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('nonce',''))" 2>/dev/null)
-                if [ -z "$nonce" ]; then
-                    error "Could not get nonce"
-                    continue
-                fi
-                local inject_data
-                inject_data=$(python3 -c "
-import json
-print(json.dumps({
-    'category': 'interactive',
-    'title': '''$title''',
-    'content': '''$content''',
-    'tags': ['interactive', 'live-inject'],
-    'nonce': '$nonce'
-}))
-")
-                local inject_result
-                inject_result=$(brain_post "/v1/memories" "$inject_data")
-                if echo "$inject_result" | grep -q '"error"' 2>/dev/null; then
-                    error "Injection failed: $(echo "$inject_result" | head -c 200)"
-                else
-                    success "Injected successfully"
-                    echo "$inject_result" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for k, v in data.items():
-        if isinstance(v, (str, int, float, bool)):
-            print(f'    {k}: {v}')
-except: pass
-" 2>/dev/null
-                fi
-                ;;
+        local results
+        results=$(api_call GET "/v1/memories/search?q=${encoded_query}") || {
+            log_fail "Search failed"
+            continue
+        }
 
-            train)
-                info "Triggering training cycle..."
-                local train_r
-                train_r=$(brain_post "/v1/pipeline/optimize" '{"actions":["train"]}')
-                if [ -z "$train_r" ]; then
-                    train_r=$(brain_post "/v1/train" '{}')
-                fi
-                if [ -n "$train_r" ]; then
-                    success "Training triggered"
-                    echo "$train_r" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for k,v in data.items():
-        print(f'    {k}: {v}')
-except: pass
-" 2>/dev/null
-                else
-                    warn "No response from training endpoint"
-                fi
-                ;;
+        # Count results (handle array or wrapper object)
+        local count
+        count=$(echo "$results" | jq '
+            if type == "array" then length
+            elif .results then .results | length
+            elif .memories then .memories | length
+            else 0 end
+        ' 2>/dev/null || echo 0)
+        echo -e "  ${GREEN}Found $count result(s)${NC}\n"
 
-            status)
-                local stat_r
-                stat_r=$(brain_get "/v1/status")
-                if [ -n "$stat_r" ]; then
-                    echo "$stat_r" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for k,v in data.items():
-        if isinstance(v, dict):
-            print(f'    {k}:')
-            for k2,v2 in v.items():
-                print(f'      {k2:<28s} {v2}')
-        else:
-            print(f'    {k:<30s} {v}')
-except: pass
-" 2>/dev/null
-                else
-                    warn "Brain unreachable"
-                fi
-                ;;
-
-            gaps)
-                info "Analyzing knowledge gaps..."
-                local gap_explore
-                gap_explore=$(brain_get "/v1/explore")
-                local gap_partition
-                gap_partition=$(brain_get "/v1/partition")
-                echo "$gap_explore" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for k, v in data.items():
-        if isinstance(v, list):
-            low_coherence = [item for item in v if isinstance(item, dict) and item.get('coherence', 1.0) < 0.5]
-            if low_coherence:
-                print(f'    Low-coherence clusters ({k}):')
-                for item in low_coherence[:5]:
-                    label = item.get('label', item.get('category', '?'))
-                    coh = item.get('coherence', '?')
-                    print(f'      - {label}: coherence={coh}')
-            else:
-                high_curiosity = sorted(v, key=lambda x: x.get('curiosity', 0) if isinstance(x, dict) else 0, reverse=True)[:5]
-                if high_curiosity and isinstance(high_curiosity[0], dict):
-                    print(f'    Highest curiosity ({k}):')
-                    for item in high_curiosity:
-                        label = item.get('label', item.get('category', '?'))
-                        cur = item.get('curiosity', '?')
-                        print(f'      - {label}: curiosity={cur}')
-        elif isinstance(v, (str, int, float)):
-            print(f'    {k}: {v}')
-except: print('    (could not analyze gaps)')
-" 2>/dev/null
-                echo "$gap_partition" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for k, v in data.items():
-        if isinstance(v, list):
-            small = sorted(v, key=lambda x: x.get('size', 999) if isinstance(x, dict) else 999)[:5]
-            if small and isinstance(small[0], dict):
-                print(f'    Smallest partitions ({k}):')
-                for item in small:
-                    name = item.get('name', item.get('label', '?'))
-                    size = item.get('size', '?')
-                    print(f'      - {name}: size={size}')
-except: pass
-" 2>/dev/null
-                ;;
-
-            transfer)
-                local src dst
-                src=$(echo "$args" | awk '{print $1}')
-                dst=$(echo "$args" | awk '{print $2}')
-                if [ -z "$src" ] || [ -z "$dst" ]; then
-                    warn "Usage: transfer <source_domain> <target_domain>"
-                    continue
-                fi
-                info "Transferring: $src -> $dst"
-                local xfer_r
-                xfer_r=$(brain_post "/v1/transfer" "{\"source_domain\":\"$src\",\"target_domain\":\"$dst\"}")
-                if [ -n "$xfer_r" ]; then
-                    success "Transfer complete"
-                    echo "$xfer_r" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for k,v in data.items():
-        print(f'    {k}: {v}')
-except: pass
-" 2>/dev/null
-                else
-                    warn "Transfer failed"
-                fi
-                ;;
-
-            optimize)
-                info "Running full optimization pipeline..."
-                training_cycle
-                ;;
-
-            scan)
-                discovery_scan
-                ;;
-
-            upload)
-                batch_upload
-                ;;
-
-            help|h|\?)
-                echo -e "  ${WHITE}${BOLD}Available Commands:${RESET}"
-                echo -e "    ${CYAN}explore <topic>${RESET}         Search brain for topic, show related memories"
-                echo -e "    ${CYAN}inject <title> <content>${RESET} Inject new knowledge in real-time"
-                echo -e "    ${CYAN}train${RESET}                   Trigger training cycle"
-                echo -e "    ${CYAN}status${RESET}                  Show brain status"
-                echo -e "    ${CYAN}gaps${RESET}                    Show knowledge gaps"
-                echo -e "    ${CYAN}transfer <from> <to>${RESET}    Cross-domain transfer"
-                echo -e "    ${CYAN}optimize${RESET}                Run full optimization pipeline"
-                echo -e "    ${CYAN}scan${RESET}                    Re-scan discovery files"
-                echo -e "    ${CYAN}upload${RESET}                  Batch upload all discoveries"
-                echo -e "    ${CYAN}help${RESET}                    Show this help"
-                echo -e "    ${CYAN}quit${RESET}                    Exit"
-                ;;
-
-            quit|exit|q)
-                echo ""
-                info "Shutting down orchestrator. Knowledge persists in the brain."
-                break
-                ;;
-
-            "")
-                ;;
-
-            *)
-                warn "Unknown command: $cmd (type 'help' for available commands)"
-                ;;
-        esac
-        echo ""
+        # Display results
+        echo "$results" | jq -r '
+            (if type == "array" then .
+             elif .results then .results
+             elif .memories then .memories
+             else [.] end)[:10][] |
+            "  \u001b[1m\(.title // .key // "untitled")\u001b[0m",
+            "    Domain: \(.domain // "unknown") | Score: \(.score // .similarity // "n/a")",
+            "    \(.content // .value // "" | if length > 120 then .[:120] + "..." else . end)",
+            ""
+        ' 2>/dev/null || echo "$results" | jq . 2>/dev/null || echo "  $results"
     done
 }
 
-# ---------------------------------------------------------------------------
-# Main execution
-# ---------------------------------------------------------------------------
-main() {
-    banner
-
-    # Check dependencies
-    for dep in curl python3; do
-        if ! command -v "$dep" &>/dev/null; then
-            error "Required dependency not found: $dep"
-            exit 1
-        fi
-    done
-    success "Dependencies verified (curl, python3)"
-
-    # Check brain connectivity
-    info "Testing brain connectivity..."
-    local ping_result
-    ping_result=$(brain_get "/v1/status")
-    if [ -n "$ping_result" ] && ! echo "$ping_result" | grep -q "Could not resolve"; then
-        success "Brain is reachable at ${BRAIN_URL}"
+# ===========================================================================
+# Banner and main menu
+# ===========================================================================
+show_banner() {
+    echo -e "${BOLD}${MAGENTA}"
+    echo "  ╔═══════════════════════════════════════════════════════════╗"
+    echo "  ║         RuVector Training Orchestrator v1.0              ║"
+    echo "  ║         Brain API: pi.ruv.io                             ║"
+    echo "  ╚═══════════════════════════════════════════════════════════╝"
+    echo -ne "${NC}"
+    if $DRY_RUN; then
+        echo -e "  ${YELLOW}[DRY-RUN MODE ACTIVE]${NC}"
+    fi
+    if [[ -n "${PI:-}" ]]; then
+        echo -e "  ${GREEN}API token: configured${NC}"
     else
-        warn "Brain may be unreachable -- continuing in offline mode where possible"
+        echo -e "  ${YELLOW}API token: not set (export PI=your-token)${NC}"
     fi
     echo ""
-
-    # Parse CLI arguments
-    local mode="${1:-interactive}"
-
-    case "$mode" in
-        scan)
-            discovery_scan
-            ;;
-        gaps)
-            brain_gap_analysis
-            ;;
-        upload)
-            discovery_scan
-            batch_upload
-            ;;
-        train)
-            training_cycle
-            ;;
-        cross)
-            cross_domain_discovery
-            ;;
-        full)
-            discovery_scan
-            brain_gap_analysis
-            batch_upload
-            training_cycle
-            cross_domain_discovery
-            header "Full Pipeline Complete"
-            success "All stages finished. Brain has been updated and optimized."
-            ;;
-        interactive|"")
-            discovery_scan
-            echo ""
-            interactive_mode
-            ;;
-        help|--help|-h)
-            echo -e "  ${WHITE}${BOLD}Usage:${RESET} $0 [mode]"
-            echo ""
-            echo -e "  ${WHITE}${BOLD}Modes:${RESET}"
-            echo -e "    ${CYAN}interactive${RESET}   Interactive command mode (default)"
-            echo -e "    ${CYAN}scan${RESET}          Scan discovery files only"
-            echo -e "    ${CYAN}gaps${RESET}          Brain gap analysis only"
-            echo -e "    ${CYAN}upload${RESET}        Scan + upload all discoveries"
-            echo -e "    ${CYAN}train${RESET}         Training & optimization cycle"
-            echo -e "    ${CYAN}cross${RESET}         Cross-domain discovery engine"
-            echo -e "    ${CYAN}full${RESET}          Run complete pipeline (scan->gaps->upload->train->cross)"
-            echo -e "    ${CYAN}help${RESET}          Show this help"
-            ;;
-        *)
-            error "Unknown mode: $mode"
-            echo "  Run '$0 help' for usage"
-            exit 1
-            ;;
-    esac
 }
 
-main "$@"
+main_menu() {
+    echo -e "  ${BOLD}Select a mode:${NC}\n"
+    echo -e "    ${CYAN}1${NC}  Discovery Scanner        ${DIM}Scan local JSON files for entries and domains${NC}"
+    echo -e "    ${CYAN}2${NC}  Brain Gap Analysis        ${DIM}Query /v1/explore for novelty gaps${NC}"
+    echo -e "    ${CYAN}3${NC}  Batch Upload              ${DIM}Upload entries via /v1/memories with nonce auth${NC}"
+    echo -e "    ${CYAN}4${NC}  Training & Optimization   ${DIM}POST /v1/train + GET /v1/sona/stats${NC}"
+    echo -e "    ${CYAN}5${NC}  Cross-Domain Discovery    ${DIM}GET /v1/drift + /v1/partition${NC}"
+    echo -e "    ${CYAN}6${NC}  Interactive Explorer       ${DIM}Search brain with /v1/memories/search${NC}"
+    echo -e "    ${CYAN}q${NC}  Quit"
+    echo ""
+    echo -ne "  ${BOLD}Choice [1-6/q]:${NC} "
+}
+
+# ===========================================================================
+# Entry point
+# ===========================================================================
+check_deps
+show_banner
+
+while true; do
+    main_menu
+    read -r choice || break
+    case "$choice" in
+        1) mode_discovery_scanner ;;
+        2) mode_gap_analysis ;;
+        3) mode_batch_upload ;;
+        4) mode_training ;;
+        5) mode_cross_domain ;;
+        6) mode_explorer ;;
+        q|Q|quit|exit) echo -e "\n  ${GREEN}Goodbye.${NC}\n"; exit 0 ;;
+        *) log_warn "Invalid choice: '$choice'. Enter 1-6 or q." ;;
+    esac
+    echo ""
+done
