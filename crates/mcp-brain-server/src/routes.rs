@@ -179,6 +179,11 @@ pub async fn create_router() -> (Router, AppState) {
     let feeds: Arc<dashmap::DashMap<String, crate::types::FeedConfig>> =
         Arc::new(dashmap::DashMap::new());
 
+    // ── Common Crawl Integration (ADR-115) ──
+    let web_store = Arc::new(crate::web_store::WebMemoryStore::new(store.clone()));
+    let crawl_adapter = Arc::new(crate::pipeline::CommonCrawlAdapter::new());
+    tracing::info!("Common Crawl adapter initialized (ADR-115)");
+
     // ── Midstream Platform (ADR-077) ──
     let nano_scheduler = Arc::new(crate::midstream::create_scheduler());
     let attractor_results = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
@@ -257,6 +262,8 @@ pub async fn create_router() -> (Router, AppState) {
         optimizer,
         pipeline_metrics,
         feeds,
+        web_store,
+        crawl_adapter,
     };
 
     let router = Router::new()
@@ -309,9 +316,10 @@ pub async fn create_router() -> (Router, AppState) {
         .route("/v1/pipeline/optimize", post(pipeline_optimize))
         .route("/v1/pipeline/feeds", post(pipeline_add_feed).get(pipeline_list_feeds))
         .route("/v1/pipeline/scheduler/status", get(pipeline_scheduler_status))
-        // Common Crawl Integration (ADR-096 §10)
+        // Common Crawl Integration (ADR-096 §10, ADR-115)
         .route("/v1/pipeline/crawl/discover", post(pipeline_crawl_discover))
         .route("/v1/pipeline/crawl/stats", get(pipeline_crawl_stats))
+        .route("/v1/pipeline/crawl/test", get(pipeline_crawl_test))
         // MCP SSE transport
         .route("/sse", get(sse_handler))
         .route("/messages", post(messages_handler))
@@ -2850,7 +2858,8 @@ async fn pipeline_crawl_discover(
 ) -> Result<Json<CrawlDiscoverResponse>, (StatusCode, String)> {
     check_read_only(&state)?;
 
-    let cc = crate::pipeline::CommonCrawlAdapter::new();
+    // Use persistent adapter from AppState (ADR-115)
+    let cc = &state.crawl_adapter;
     if let Some(ref idx) = req.crawl_index {
         cc.set_crawl_index(idx).await;
     }
@@ -2869,9 +2878,9 @@ async fn pipeline_crawl_discover(
     })?;
     let cdx_records_found = records.len();
 
-    // Fetch pages
-    let items = cc.discover_domain(
-        &req.domain_pattern,
+    // Fetch pages using pre-queried records (avoids double CDX query)
+    let items = cc.discover_from_records(
+        &records,
         req.category.clone(),
         req.tags.clone(),
         limit,
@@ -2929,23 +2938,124 @@ async fn pipeline_crawl_discover(
     }))
 }
 
-/// GET /v1/pipeline/crawl/stats — Common Crawl adapter statistics
+/// GET /v1/pipeline/crawl/stats — Common Crawl adapter statistics (ADR-115)
 async fn pipeline_crawl_stats(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
-    // Create a fresh adapter (in production, this would be part of AppState)
-    let cc = crate::pipeline::CommonCrawlAdapter::new();
+    // Use persistent adapter from AppState (ADR-115)
+    let cc = &state.crawl_adapter;
     let (queries, fetched, extracted, dupes, errors) = cc.stats();
+    let (cache_hits, cache_misses, cache_entries) = cc.cache_stats();
+
+    // Include WebMemoryStore stats
+    let web_status = state.web_store.status();
+
+    // Calculate cache hit rate
+    let total_cache_ops = cache_hits + cache_misses;
+    let cache_hit_rate = if total_cache_ops > 0 {
+        cache_hits as f64 / total_cache_ops as f64
+    } else {
+        0.0
+    };
 
     Json(serde_json::json!({
         "adapter": "common_crawl",
         "cdx_queries": queries,
+        "cdx_cache": {
+            "hits": cache_hits,
+            "misses": cache_misses,
+            "entries": cache_entries,
+            "hit_rate": format!("{:.1}%", cache_hit_rate * 100.0),
+        },
         "pages_fetched": fetched,
         "pages_extracted": extracted,
         "duplicates_skipped": dupes,
         "errors": errors,
         "seen_urls": cc.seen_urls_count(),
         "seen_hashes": cc.seen_hashes_count(),
+        "web_memory": {
+            "total_memories": web_status.total_web_memories,
+            "total_domains": web_status.total_domains,
+            "link_edges": web_status.total_link_edges,
+            "page_deltas": web_status.total_page_deltas,
+            "compression_ratio": web_status.compression_ratio,
+            "tier_distribution": {
+                "full": web_status.tier_distribution.full,
+                "delta_compressed": web_status.tier_distribution.delta_compressed,
+                "centroid_merged": web_status.tier_distribution.centroid_merged,
+                "archived": web_status.tier_distribution.archived,
+            }
+        }
+    }))
+}
+
+/// GET /v1/pipeline/crawl/test — Test CDX connectivity (diagnostic)
+async fn pipeline_crawl_test(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let adapter = &state.crawl_adapter;
+    let test_url = "https://index.commoncrawl.org/collinfo.json";
+
+    // Test Common Crawl using our configured HTTP client (native-tls, HTTP/1.1, with retry)
+    let start = std::time::Instant::now();
+    let (success, status, body_len, error, attempts) = adapter.test_connectivity().await;
+    let latency_ms = start.elapsed().as_millis();
+
+    let cc_result = if success {
+        serde_json::json!({
+            "success": true,
+            "url": test_url,
+            "status": status,
+            "body_length": body_len,
+            "latency_ms": latency_ms,
+            "attempts": attempts,
+        })
+    } else {
+        serde_json::json!({
+            "success": false,
+            "url": test_url,
+            "status": status,
+            "error": error,
+            "latency_ms": latency_ms,
+            "attempts": attempts,
+        })
+    };
+
+    // Test multiple HTTPS endpoints for comparison
+    let start2 = std::time::Instant::now();
+    let external_results = adapter.test_external_connectivity().await;
+    let latency_ms2 = start2.elapsed().as_millis();
+
+    let external_tests: Vec<serde_json::Value> = external_results.iter().map(|(name, success, status, body_len, error, url)| {
+        if *success {
+            serde_json::json!({
+                "name": name,
+                "success": true,
+                "url": url,
+                "status": status,
+                "body_length": body_len,
+            })
+        } else {
+            serde_json::json!({
+                "name": name,
+                "success": false,
+                "url": url,
+                "status": status,
+                "error": error,
+            })
+        }
+    }).collect();
+
+    let adapter_status = serde_json::json!({
+        "adapter_queries": adapter.stats().0,
+        "cache_stats": adapter.cache_stats(),
+    });
+
+    Json(serde_json::json!({
+        "common_crawl_cdx_test": cc_result,
+        "external_tests": external_tests,
+        "external_tests_latency_ms": latency_ms2,
+        "adapter_status": adapter_status,
     }))
 }
 

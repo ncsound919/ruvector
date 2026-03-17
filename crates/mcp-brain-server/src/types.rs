@@ -1212,6 +1212,11 @@ pub struct AppState {
     pub pipeline_metrics: std::sync::Arc<PipelineState>,
     /// RSS/Atom feed configurations for periodic ingestion
     pub feeds: std::sync::Arc<dashmap::DashMap<String, FeedConfig>>,
+    // ── Common Crawl Integration (ADR-115) ──
+    /// Web memory store for crawled pages with tier-aware compression
+    pub web_store: std::sync::Arc<crate::web_store::WebMemoryStore>,
+    /// Common Crawl adapter for CDX queries and WARC fetching
+    pub crawl_adapter: std::sync::Arc<crate::pipeline::CommonCrawlAdapter>,
 }
 
 // ──────────────────────────────────────────────────────────────────────
