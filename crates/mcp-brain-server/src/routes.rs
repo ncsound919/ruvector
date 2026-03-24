@@ -414,8 +414,16 @@ pub struct EnhancedTrainingResult {
     pub working_memory_load: f64,
     /// Neural-symbolic rule count
     pub rule_count: usize,
+    /// Inferences derived via forward chaining
+    pub inferences_derived: usize,
     /// Auto-votes applied to under-voted memories (Gap 1: vote coverage)
     pub auto_votes: usize,
+    /// Self-reflection summary from the brain's self-analysis
+    pub self_reflection: String,
+    /// Whether a curiosity action was triggered due to knowledge stagnation
+    pub curiosity_triggered: bool,
+    /// Current adaptive SONA quality threshold
+    pub sona_adaptive_threshold: f32,
 }
 
 /// Run enhanced training cycle with neural-symbolic feedback (ADR-110).
@@ -434,10 +442,12 @@ pub fn run_enhanced_training_cycle(state: &AppState) -> EnhancedTrainingResult {
     // 3. Neural-symbolic rule extraction (ADR-110)
     let all_memories = state.store.all_memories();
     let clusters = build_memory_clusters(&all_memories);
-    let propositions_extracted = {
+    let (propositions_extracted, inferences_derived) = {
         let mut ns = state.neural_symbolic.write();
         let props = ns.extract_from_clusters(&clusters);
-        props.len()
+        // Run forward-chaining inference over all propositions (new + existing)
+        let inferences = ns.run_inference();
+        (props.len(), inferences.len())
     };
 
     // 3b. ADR-123: Record drift snapshots from cluster centroids
@@ -492,9 +502,12 @@ pub fn run_enhanced_training_cycle(state: &AppState) -> EnhancedTrainingResult {
         let reflections = voice.reflect_on_learning(&sona_result);
 
         // Record observation about the learning
-        if propositions_extracted > 0 {
+        if propositions_extracted > 0 || inferences_derived > 0 {
             voice.observe(
-                format!("extracted {} symbolic propositions", propositions_extracted),
+                format!(
+                    "extracted {} symbolic propositions, derived {} inferences",
+                    propositions_extracted, inferences_derived
+                ),
                 uuid::Uuid::nil(),
             );
         }
@@ -530,19 +543,219 @@ pub fn run_enhanced_training_cycle(state: &AppState) -> EnhancedTrainingResult {
     let sona_stats = state.sona.read().stats();
     let working_memory_load = state.internal_voice.read().working_memory_utilization();
     let rule_count = state.neural_symbolic.read().rule_count();
+    let memory_count = state.store.memory_count();
+
+    // ── Step 6: Self-Reflection — the brain analyzes its own learning gaps ──
+
+    // 6a. Detect knowledge imbalance: flag if any category has >40% of memories
+    let total_memories = all_memories.len();
+    let mut category_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for mem in &all_memories {
+        *category_counts.entry(mem.category.to_string()).or_insert(0) += 1;
+    }
+    let mut reflection_parts: Vec<String> = Vec::new();
+    if total_memories > 0 {
+        for (cat, count) in &category_counts {
+            let pct = (*count as f64) / (total_memories as f64);
+            if pct > 0.4 {
+                let msg = format!(
+                    "Knowledge imbalance: '{}' has {:.0}% of all memories ({}/{})",
+                    cat,
+                    pct * 100.0,
+                    count,
+                    total_memories
+                );
+                reflection_parts.push(msg.clone());
+                state.internal_voice.write().observe(msg, uuid::Uuid::nil());
+            }
+        }
+    }
+
+    // 6b. Dynamic SONA threshold — if 0 patterns after trajectories, lower threshold
+    let sona_adaptive_threshold = {
+        let trajectories_recorded = sona_stats.trajectories_recorded;
+        let current_patterns = sona_stats.patterns_stored;
+        // Access SONA's reasoning bank to adjust quality threshold adaptively
+        let sona_guard = state.sona.read();
+        let rb = sona_guard.coordinator().reasoning_bank();
+        let mut rb_write = rb.write();
+        let current_threshold = rb_write.config().quality_threshold;
+        let new_threshold = if current_patterns == 0 && trajectories_recorded >= 5 {
+            // No patterns crystallized despite having trajectories — lower threshold by 20%
+            let lowered = (current_threshold * 0.8).max(0.01);
+            tracing::info!(
+                "SONA adaptive threshold: lowering {:.3} -> {:.3} (0 patterns after {} trajectories)",
+                current_threshold,
+                lowered,
+                trajectories_recorded
+            );
+            reflection_parts.push(format!(
+                "SONA threshold lowered {:.3} -> {:.3}: no patterns crystallized yet",
+                current_threshold, lowered
+            ));
+            lowered
+        } else if current_patterns > 5 {
+            // Patterns are crystallizing well — gradually raise threshold (max 0.3)
+            let raised = (current_threshold * 1.05).min(0.3);
+            if raised > current_threshold {
+                tracing::debug!(
+                    "SONA adaptive threshold: raising {:.3} -> {:.3} ({} patterns crystallized)",
+                    current_threshold,
+                    raised,
+                    current_patterns
+                );
+            }
+            raised
+        } else {
+            current_threshold
+        };
+        rb_write.set_quality_threshold(new_threshold);
+        new_threshold
+    };
+
+    // 6c. Check vote coverage — if <60%, increase auto-vote cap for next cycle
+    let vote_coverage = if total_memories > 0 {
+        let voted_count = all_memories.iter().filter(|m| m.quality_score.observations() >= 1.0).count();
+        voted_count as f64 / total_memories as f64
+    } else {
+        1.0
+    };
+    if vote_coverage < 0.6 {
+        reflection_parts.push(format!(
+            "Vote coverage low: {:.0}% — should increase auto-voting next cycle",
+            vote_coverage * 100.0
+        ));
+        state.internal_voice.write().observe(
+            format!("vote coverage is only {:.0}%, knowledge quality signals are sparse", vote_coverage * 100.0),
+            uuid::Uuid::nil(),
+        );
+    }
+
+    // ── Step 7: Knowledge Velocity Feedback Loop (Curiosity) ──
+    let curiosity_triggered = {
+        let ds = state.delta_stream.read();
+        let delta_count = ds.len();
+        if delta_count == 0 && total_memories > 10 {
+            // Stagnation detected — find under-represented categories and synthesize
+            let all_categories = ["architecture", "pattern", "solution", "convention",
+                                  "security", "performance", "tooling", "debug"];
+            let mut underrepresented: Vec<&str> = Vec::new();
+            for cat in &all_categories {
+                let count = category_counts.get(*cat).copied().unwrap_or(0);
+                if count < 3 {
+                    underrepresented.push(cat);
+                }
+            }
+
+            if !underrepresented.is_empty() {
+                let synthesis_content = format!(
+                    "Curiosity synthesis: knowledge gaps detected in [{}]. \
+                     These areas have fewer than 3 memories each. \
+                     The brain should seek knowledge in these domains to improve coverage.",
+                    underrepresented.join(", ")
+                );
+                // Generate embedding for this synthesis memory
+                let embedding = state.embedding_engine.read().embed(&synthesis_content);
+                let now = chrono::Utc::now();
+                let curiosity_memory = BrainMemory {
+                    id: uuid::Uuid::new_v4(),
+                    category: crate::types::BrainCategory::Debug,
+                    title: format!("Curiosity: knowledge gaps in {}", underrepresented.join(", ")),
+                    content: synthesis_content.clone(),
+                    tags: vec!["self-reflection".to_string(), "curiosity".to_string(), "auto-generated".to_string()],
+                    code_snippet: None,
+                    embedding,
+                    contributor_id: "brain-self".to_string(),
+                    quality_score: crate::types::BetaParams::new(),
+                    partition_id: None,
+                    witness_hash: String::new(),
+                    rvf_gcs_path: None,
+                    redaction_log: None,
+                    dp_proof: None,
+                    witness_chain: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+                state.store.store_memory_sync(curiosity_memory);
+                reflection_parts.push(synthesis_content);
+                tracing::info!("Curiosity triggered: synthesized knowledge gap memory for [{}]", underrepresented.join(", "));
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+
+    // ── Step 8: Self-Reflection Summary — record as a debug memory ──
+    // Compile the self-reflection and store it as a searchable memory
+    let sona_summary = if sona_stats.patterns_stored > 0 {
+        format!("{} patterns crystallized", sona_stats.patterns_stored)
+    } else {
+        format!("0 patterns (threshold={:.3})", sona_adaptive_threshold)
+    };
+    let self_reflection = format!(
+        "Training cycle summary: {} memories, {} propositions extracted, {} inferences derived, \
+         {} voice thoughts, {} auto-votes. SONA: {}. {}",
+        memory_count,
+        propositions_extracted,
+        inferences_derived,
+        voice_thoughts,
+        auto_votes,
+        sona_summary,
+        if reflection_parts.is_empty() {
+            "No learning gaps detected.".to_string()
+        } else {
+            reflection_parts.join(". ")
+        }
+    );
+
+    // Store self-reflection as a searchable memory so the brain can review its own history
+    {
+        let embedding = state.embedding_engine.read().embed(&self_reflection);
+        let now = chrono::Utc::now();
+        let reflection_memory = BrainMemory {
+            id: uuid::Uuid::new_v4(),
+            category: crate::types::BrainCategory::Debug,
+            title: format!("Self-reflection: training cycle at {}", now.format("%Y-%m-%d %H:%M")),
+            content: self_reflection.clone(),
+            tags: vec!["self-reflection".to_string(), "training-cycle".to_string(), "auto-generated".to_string()],
+            code_snippet: None,
+            embedding,
+            contributor_id: "brain-self".to_string(),
+            quality_score: crate::types::BetaParams::new(),
+            partition_id: None,
+            witness_hash: String::new(),
+            rvf_gcs_path: None,
+            redaction_log: None,
+            dp_proof: None,
+            witness_chain: None,
+            created_at: now,
+            updated_at: now,
+        };
+        state.store.store_memory_sync(reflection_memory);
+    }
+
+    // Record reflection in the internal voice
+    state.internal_voice.write().reflect(self_reflection.clone());
 
     EnhancedTrainingResult {
         sona_message: sona_result,
         sona_patterns: sona_stats.patterns_stored,
         pareto_before,
         pareto_after,
-        memory_count: state.store.memory_count(),
+        memory_count,
         vote_count: state.store.vote_count(),
         propositions_extracted,
         voice_thoughts,
         working_memory_load,
         rule_count,
+        inferences_derived,
         auto_votes,
+        self_reflection,
+        curiosity_triggered,
+        sona_adaptive_threshold,
     }
 }
 
@@ -2334,12 +2547,15 @@ async fn train_enhanced_endpoint(
     check_read_only(&state)?;
     let result = run_enhanced_training_cycle(&state);
     tracing::info!(
-        "Enhanced training cycle: sona={}, propositions={}, voice_thoughts={}, rules={}, auto_votes={}",
+        "Enhanced training cycle: sona={}, propositions={}, inferences={}, voice_thoughts={}, rules={}, auto_votes={}, curiosity={}, sona_threshold={:.3}",
         result.sona_patterns,
         result.propositions_extracted,
+        result.inferences_derived,
         result.voice_thoughts,
         result.rule_count,
-        result.auto_votes
+        result.auto_votes,
+        result.curiosity_triggered,
+        result.sona_adaptive_threshold
     );
     Ok(Json(result))
 }

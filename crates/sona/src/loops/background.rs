@@ -27,7 +27,7 @@ pub struct BackgroundLoopConfig {
 impl Default for BackgroundLoopConfig {
     fn default() -> Self {
         Self {
-            min_trajectories: 100,
+            min_trajectories: 10, // Was 100; lowered so patterns crystallize from fewer trajectories
             base_lora_lr: 0.0001,
             ewc_lambda: 1000.0,
             extraction_interval: Duration::from_secs(3600),
@@ -38,7 +38,7 @@ impl Default for BackgroundLoopConfig {
 impl From<&SonaConfig> for BackgroundLoopConfig {
     fn from(config: &SonaConfig) -> Self {
         Self {
-            min_trajectories: 100,
+            min_trajectories: 10, // Was 100; lowered so patterns crystallize from fewer trajectories
             base_lora_lr: config.base_lora_lr,
             ewc_lambda: config.ewc_lambda,
             extraction_interval: Duration::from_millis(config.background_interval_ms),

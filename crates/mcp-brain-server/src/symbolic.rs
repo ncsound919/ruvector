@@ -616,6 +616,151 @@ impl NeuralSymbolicBridge {
         ))
     }
 
+    /// Run forward-chaining inference over all propositions.
+    ///
+    /// For each Horn clause rule, find all pairs of propositions matching
+    /// the antecedent predicates. For transitive rules (same predicate on
+    /// both sides), require that the second argument of the first
+    /// proposition equals the first argument of the second proposition
+    /// (chain linking: A→B + B→C yields A→C).
+    ///
+    /// Derived conclusions are added as new propositions so subsequent
+    /// cycles can chain further. Returns all newly produced inferences.
+    pub fn run_inference(&mut self) -> Vec<Inference> {
+        // Snapshot rules and propositions so we don't hold borrows on self
+        // during the matching loop.
+        let rules: Vec<HornClause> = self.rules.clone();
+
+        let all_props: Vec<GroundedProposition> =
+            self.proposition_index.values().cloned().collect();
+
+        // Index propositions by predicate string for fast lookup.
+        let mut by_predicate: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, prop) in all_props.iter().enumerate() {
+            by_predicate
+                .entry(prop.predicate.clone())
+                .or_default()
+                .push(i);
+        }
+
+        // Build a set of existing (predicate, arguments) pairs to check
+        // for duplicates without borrowing self.
+        let mut existing: std::collections::HashSet<(String, Vec<String>)> =
+            std::collections::HashSet::new();
+        for prop in &all_props {
+            existing.insert((prop.predicate.clone(), prop.arguments.clone()));
+        }
+
+        // Collect derived propositions and inferences; store after the loop.
+        let mut derived: Vec<(GroundedProposition, Inference)> = Vec::new();
+        let min_confidence = self.config.min_confidence;
+
+        for rule in &rules {
+            if rule.antecedents.len() != 2 {
+                continue;
+            }
+
+            let pred_a = rule.antecedents[0].as_str();
+            let pred_b = rule.antecedents[1].as_str();
+
+            let indices_a = match by_predicate.get(pred_a) {
+                Some(g) => g,
+                None => continue,
+            };
+            let indices_b = match by_predicate.get(pred_b) {
+                Some(g) => g,
+                None => continue,
+            };
+
+            for &ia in indices_a {
+                let pa = &all_props[ia];
+                for &ib in indices_b {
+                    if ia == ib {
+                        continue;
+                    }
+                    let pb = &all_props[ib];
+
+                    // Chain-linking: last arg of pa == first arg of pb.
+                    let linked = match (pa.arguments.last(), pb.arguments.first()) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => false,
+                    };
+                    if !linked {
+                        continue;
+                    }
+
+                    // Derived arguments: first arg of pa, last arg of pb.
+                    let derived_args = match (pa.arguments.first(), pb.arguments.last()) {
+                        (Some(first), Some(last)) => {
+                            if first == last {
+                                continue; // Skip self-loops.
+                            }
+                            vec![first.clone(), last.clone()]
+                        }
+                        _ => continue,
+                    };
+
+                    let consequent_pred = rule.consequent.as_str().to_string();
+
+                    // Skip if already known.
+                    if existing.contains(&(consequent_pred.clone(), derived_args.clone())) {
+                        continue;
+                    }
+
+                    let combined_confidence =
+                        rule.confidence * pa.confidence * pb.confidence;
+
+                    if combined_confidence < min_confidence * 0.5 {
+                        continue;
+                    }
+
+                    let centroid: Vec<f32> = pa
+                        .centroid
+                        .iter()
+                        .zip(pb.centroid.iter())
+                        .map(|(a, b)| (a + b) / 2.0)
+                        .collect();
+
+                    let mut evidence: Vec<Uuid> = pa.evidence.clone();
+                    evidence.extend_from_slice(&pb.evidence);
+                    evidence.truncate(20);
+
+                    // Mark as existing so we don't duplicate within this cycle.
+                    existing.insert((consequent_pred.clone(), derived_args.clone()));
+
+                    let conclusion = GroundedProposition::new(
+                        consequent_pred,
+                        derived_args,
+                        centroid,
+                        combined_confidence,
+                        evidence,
+                    );
+
+                    let inference = Inference::new(
+                        conclusion.clone(),
+                        vec![rule.id.clone()],
+                        vec![pa.id, pb.id],
+                        combined_confidence,
+                    );
+
+                    derived.push((conclusion, inference));
+                }
+            }
+        }
+
+        // Now store all derived propositions (requires &mut self).
+        let new_inferences: Vec<Inference> = derived
+            .into_iter()
+            .map(|(conclusion, inference)| {
+                self.store_proposition(conclusion);
+                inference
+            })
+            .collect();
+
+        self.inference_count += new_inferences.len() as u64;
+        new_inferences
+    }
+
     /// Get all propositions
     pub fn all_propositions(&self) -> Vec<&GroundedProposition> {
         self.proposition_index.values().collect()
@@ -844,6 +989,104 @@ mod tests {
         let inferences = bridge.reason(&[0.95, 0.05, 0.0, 0.0], 5);
         // Should find transitivity inference
         assert!(bridge.rule_count() > 0);
+    }
+
+    #[test]
+    fn test_forward_chaining_transitive() {
+        let mut bridge = NeuralSymbolicBridge::default();
+
+        // Ground: relates_to(A, B) and relates_to(B, C)
+        bridge.ground_proposition(
+            "relates_to".to_string(),
+            vec!["A".to_string(), "B".to_string()],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![Uuid::new_v4()],
+        );
+        bridge.ground_proposition(
+            "relates_to".to_string(),
+            vec!["B".to_string(), "C".to_string()],
+            vec![0.9, 0.1, 0.0, 0.0],
+            vec![Uuid::new_v4()],
+        );
+
+        assert_eq!(bridge.proposition_count(), 2);
+        assert_eq!(bridge.inference_count(), 0);
+
+        let inferences = bridge.run_inference();
+
+        // Should derive relates_to(A, C) via transitivity rule
+        assert!(!inferences.is_empty(), "expected at least one inference");
+        let inf = &inferences[0];
+        assert_eq!(inf.conclusion.predicate, "relates_to");
+        assert_eq!(inf.conclusion.arguments, vec!["A".to_string(), "C".to_string()]);
+        assert!(inf.combined_confidence > 0.0);
+        assert!(bridge.inference_count() > 0);
+
+        // The derived proposition should now exist
+        assert_eq!(bridge.proposition_count(), 3);
+
+        // Running again should produce no new inferences (already derived)
+        let inferences2 = bridge.run_inference();
+        assert!(inferences2.is_empty(), "should not re-derive existing conclusions");
+    }
+
+    #[test]
+    fn test_forward_chaining_cross_predicate() {
+        let mut bridge = NeuralSymbolicBridge::default();
+
+        // Ground: solves(X, Y) and depends_on(Y, Z)
+        // Rule: solves + depends_on → solves (transitive solution via dependency)
+        bridge.ground_proposition(
+            "solves".to_string(),
+            vec!["tool_A".to_string(), "problem_B".to_string()],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![Uuid::new_v4()],
+        );
+        bridge.ground_proposition(
+            "depends_on".to_string(),
+            vec!["problem_B".to_string(), "problem_C".to_string()],
+            vec![0.8, 0.2, 0.0, 0.0],
+            vec![Uuid::new_v4()],
+        );
+
+        let inferences = bridge.run_inference();
+
+        // Should derive solves(tool_A, problem_C)
+        assert!(!inferences.is_empty(), "expected cross-predicate inference");
+        let inf = &inferences[0];
+        assert_eq!(inf.conclusion.predicate, "solves");
+        assert_eq!(
+            inf.conclusion.arguments,
+            vec!["tool_A".to_string(), "problem_C".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_forward_chaining_no_self_loop() {
+        let mut bridge = NeuralSymbolicBridge::default();
+
+        // Ground: relates_to(A, B) and relates_to(B, A)
+        // Should NOT derive relates_to(A, A) (self-loop)
+        bridge.ground_proposition(
+            "relates_to".to_string(),
+            vec!["A".to_string(), "B".to_string()],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![Uuid::new_v4()],
+        );
+        bridge.ground_proposition(
+            "relates_to".to_string(),
+            vec!["B".to_string(), "A".to_string()],
+            vec![0.9, 0.1, 0.0, 0.0],
+            vec![Uuid::new_v4()],
+        );
+
+        let inferences = bridge.run_inference();
+        for inf in &inferences {
+            assert_ne!(
+                inf.conclusion.arguments[0], inf.conclusion.arguments[1],
+                "should not produce self-loop inference"
+            );
+        }
     }
 
     #[test]

@@ -909,6 +909,12 @@ impl FirestoreClient {
         }
     }
 
+    /// Store a memory synchronously (local cache only, no Firestore write-through).
+    /// Used by the self-reflection training loop for ephemeral diagnostic memories.
+    pub fn store_memory_sync(&self, memory: BrainMemory) {
+        self.memories.insert(memory.id, memory);
+    }
+
     /// Update a memory's embedding in-place (used during RLM re-embedding on startup)
     pub fn update_embedding(&self, id: &Uuid, embedding: &[f32]) {
         if let Some(mut entry) = self.memories.get_mut(id) {

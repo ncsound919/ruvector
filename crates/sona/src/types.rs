@@ -387,7 +387,7 @@ impl Default for SonaConfig {
             pattern_clusters: 100, // OPTIMIZED: 2.3x faster search (1.3ms vs 3.0ms)
             trajectory_capacity: 10000,
             background_interval_ms: 3600000, // 1 hour
-            quality_threshold: 0.3,          // OPTIMIZED: Lower threshold for more learning
+            quality_threshold: 0.15,         // Was 0.3; lowered 50% so patterns crystallize earlier
             enable_simd: true,
         }
     }

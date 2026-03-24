@@ -32,13 +32,13 @@ impl Default for PatternConfig {
         //   with fewer trajectories. Previous defaults (k=100, min=5, q=0.3)
         //   prevented crystallization when trajectory count < 500.
         Self {
-            k_clusters: 50,  // ADR-123: fewer clusters = more members per cluster
+            k_clusters: 5,   // Was 50; fewer clusters = more members per cluster with low trajectory counts
             embedding_dim: 256,
             max_iterations: 100,
             convergence_threshold: 0.001,
-            min_cluster_size: 2,  // ADR-123: was 5, allow small clusters to crystallize
+            min_cluster_size: 1,  // Was 2; allow single-trajectory clusters to crystallize
             max_trajectories: 10000,
-            quality_threshold: 0.1, // ADR-123: was 0.3, allow lower-quality patterns through
+            quality_threshold: 0.05, // Was 0.1; very permissive so early patterns survive
         }
     }
 }
@@ -402,6 +402,17 @@ impl ReasoningBank {
             .retain(|(_, id)| self.patterns.contains_key(id));
     }
 
+    /// Get current configuration (read-only)
+    pub fn config(&self) -> &PatternConfig {
+        &self.config
+    }
+
+    /// Dynamically adjust the quality threshold for pattern crystallization.
+    /// Used by the self-optimization loop to adapt when patterns are not forming.
+    pub fn set_quality_threshold(&mut self, threshold: f32) {
+        self.config.quality_threshold = threshold.clamp(0.01, 1.0);
+    }
+
     /// Get all patterns for export
     pub fn get_all_patterns(&self) -> Vec<LearnedPattern> {
         self.patterns.values().cloned().collect()
@@ -415,6 +426,22 @@ impl ReasoningBank {
         }
         self.pattern_index.push((pattern.centroid.clone(), id));
         self.patterns.insert(id, pattern);
+    }
+
+    /// Set the minimum cluster size required for a cluster to become a pattern.
+    ///
+    /// Lower values allow patterns to crystallize from fewer trajectories.
+    /// Default is 1 (was 2 before permissive tuning).
+    pub fn set_min_trajectory_length(&mut self, n: usize) {
+        self.config.min_cluster_size = n;
+    }
+
+    /// Set the minimum average quality a cluster must have to become a pattern.
+    ///
+    /// Lower values allow lower-quality patterns through.
+    /// Default is 0.05 (was 0.1 before permissive tuning).
+    pub fn set_min_pattern_quality(&mut self, q: f64) {
+        self.config.quality_threshold = q as f32;
     }
 
     /// Consolidate similar patterns
