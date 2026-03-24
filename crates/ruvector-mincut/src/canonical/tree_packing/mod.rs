@@ -38,7 +38,7 @@ use super::source_anchored::{
     canonical_mincut, SourceAnchoredConfig, SourceAnchoredCut,
 };
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 // ---------------------------------------------------------------------------
 // Gomory-Hu tree representation
@@ -125,13 +125,15 @@ impl AdjSnapshot {
         Self { n, vertices, id_to_idx, adj }
     }
 
-    /// Build a dense capacity matrix for max-flow computation.
-    fn capacity_matrix(&self) -> Vec<Vec<FixedWeight>> {
+    /// Build a flat dense capacity matrix for max-flow computation.
+    /// Layout: cap[i * n + j] = capacity from i to j.
+    fn capacity_matrix_flat(&self) -> Vec<FixedWeight> {
         let n = self.n;
-        let mut cap = vec![vec![FixedWeight::zero(); n]; n];
+        let mut cap = vec![FixedWeight::zero(); n * n];
         for i in 0..n {
+            let row = i * n;
             for &(j, w) in &self.adj[i] {
-                cap[i][j] = cap[i][j].add(w);
+                cap[row + j] = cap[row + j].add(w);
             }
         }
         cap
@@ -143,22 +145,30 @@ impl AdjSnapshot {
 // ---------------------------------------------------------------------------
 
 fn dinic_maxflow(
-    cap: &mut [Vec<FixedWeight>],
+    cap: &mut [FixedWeight],
     s: usize,
     t: usize,
     n: usize,
 ) -> FixedWeight {
     let mut total_flow = FixedWeight::zero();
+    let mut level = vec![-1i32; n];
+    let mut queue = VecDeque::with_capacity(n);
+    let mut iter = vec![0usize; n];
+    let inf = FixedWeight::from_f64(f64::MAX / 2.0);
 
     loop {
-        let mut level = vec![-1i32; n];
+        // BFS to build level graph (reuse allocations)
+        for l in level.iter_mut() {
+            *l = -1;
+        }
         level[s] = 0;
-        let mut queue = VecDeque::new();
+        queue.clear();
         queue.push_back(s);
 
         while let Some(u) = queue.pop_front() {
+            let row = u * n;
             for v in 0..n {
-                if level[v] == -1 && cap[u][v].raw() > 0 {
+                if level[v] == -1 && cap[row + v].raw() > 0 {
                     level[v] = level[u] + 1;
                     queue.push_back(v);
                 }
@@ -169,17 +179,11 @@ fn dinic_maxflow(
             break;
         }
 
-        let mut iter = vec![0usize; n];
+        for it in iter.iter_mut() {
+            *it = 0;
+        }
         loop {
-            let pushed = dinic_dfs(
-                cap,
-                &level,
-                &mut iter,
-                s,
-                t,
-                n,
-                FixedWeight::from_f64(f64::MAX / 2.0),
-            );
+            let pushed = dinic_dfs(cap, &level, &mut iter, s, t, n, inf);
             if pushed.raw() == 0 {
                 break;
             }
@@ -191,7 +195,7 @@ fn dinic_maxflow(
 }
 
 fn dinic_dfs(
-    cap: &mut [Vec<FixedWeight>],
+    cap: &mut [FixedWeight],
     level: &[i32],
     iter: &mut [usize],
     u: usize,
@@ -203,14 +207,16 @@ fn dinic_dfs(
         return pushed;
     }
 
+    let u_row = u * n;
     while iter[u] < n {
         let v = iter[u];
-        if level[v] == level[u] + 1 && cap[u][v].raw() > 0 {
-            let bottleneck = if pushed < cap[u][v] { pushed } else { cap[u][v] };
+        if level[v] == level[u] + 1 && cap[u_row + v].raw() > 0 {
+            let cap_uv = cap[u_row + v];
+            let bottleneck = if pushed < cap_uv { pushed } else { cap_uv };
             let d = dinic_dfs(cap, level, iter, v, t, n, bottleneck);
             if d.raw() > 0 {
-                cap[u][v] = cap[u][v].sub(d);
-                cap[v][u] = cap[v][u].add(d);
+                cap[u_row + v] = cap[u_row + v].sub(d);
+                cap[v * n + u] = cap[v * n + u].add(d);
                 return d;
             }
         }
@@ -221,24 +227,27 @@ fn dinic_dfs(
 }
 
 /// Compute min s-t cut via Dinic's and return (flow, source-side mask).
+/// Uses a flat capacity array for cache locality and efficient copying.
 fn min_st_cut(
-    cap_template: &[Vec<FixedWeight>],
+    cap_template: &[FixedWeight],
     s: usize,
     t: usize,
     n: usize,
 ) -> (FixedWeight, Vec<bool>) {
-    let mut cap: Vec<Vec<FixedWeight>> = cap_template.to_vec();
+    // Flat copy is a single memcpy -- much faster than Vec<Vec> deep clone
+    let mut cap = cap_template.to_vec();
     let flow = dinic_maxflow(&mut cap, s, t, n);
 
     // BFS from s on residual to find source side
     let mut source_side = vec![false; n];
-    let mut queue = VecDeque::new();
+    let mut queue = VecDeque::with_capacity(n);
     queue.push_back(s);
     source_side[s] = true;
 
     while let Some(u) = queue.pop_front() {
+        let row = u * n;
         for v in 0..n {
-            if !source_side[v] && cap[u][v].raw() > 0 {
+            if !source_side[v] && cap[row + v].raw() > 0 {
                 source_side[v] = true;
                 queue.push_back(v);
             }
@@ -268,7 +277,7 @@ impl GomoryHuTree {
             return None;
         }
 
-        let cap_template = snap.capacity_matrix();
+        let cap_template = snap.capacity_matrix_flat();
 
         // Gusfield's algorithm: simpler than full Gomory-Hu, same result.
         // parent[i] = tree parent of vertex i (all start pointing to 0).

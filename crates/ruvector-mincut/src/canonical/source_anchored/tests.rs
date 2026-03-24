@@ -331,11 +331,11 @@ fn test_ffi_result_conversion() {
 #[test]
 fn test_dinic_simple_flow() {
     let n = 4;
-    let mut cap = vec![vec![FixedWeight::zero(); n]; n];
-    cap[0][1] = FixedWeight::from_f64(3.0);
-    cap[0][2] = FixedWeight::from_f64(2.0);
-    cap[1][3] = FixedWeight::from_f64(2.0);
-    cap[2][3] = FixedWeight::from_f64(3.0);
+    let mut cap = vec![FixedWeight::zero(); n * n];
+    cap[0 * n + 1] = FixedWeight::from_f64(3.0);
+    cap[0 * n + 2] = FixedWeight::from_f64(2.0);
+    cap[1 * n + 3] = FixedWeight::from_f64(2.0);
+    cap[2 * n + 3] = FixedWeight::from_f64(3.0);
 
     let flow = dinic_maxflow(&mut cap, 0, 3, n);
     assert_eq!(flow, FixedWeight::from_f64(4.0));

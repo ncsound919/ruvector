@@ -53,7 +53,7 @@ fn bench_dspar(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("baseline", size), size, |b, _| {
             b.iter(|| {
-                let edges: Vec<_> = graph.edges().collect();
+                let edges = graph.edges();
                 black_box(edges.len())
             })
         });
@@ -345,9 +345,9 @@ fn bench_complete_suite(c: &mut Criterion) {
                 .with_sizes(vec![100])
                 .with_iterations(1);
 
-            let results = suite.run_all();
+            let results_len = suite.run_all().len();
             let combined = suite.combined_speedup();
-            black_box((results.len(), combined))
+            black_box((results_len, combined))
         })
     });
 

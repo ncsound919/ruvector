@@ -18,7 +18,7 @@ use crate::graph::{DynamicGraph, VertexId, Weight};
 use crate::time_compat::PortableTimestamp;
 use super::FixedWeight;
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 // ---------------------------------------------------------------------------
 // SourceAnchoredCut — the canonical cut artifact
@@ -144,16 +144,15 @@ impl AdjSnapshot {
             return None;
         }
 
-        // Dense Stoer-Wagner on compact indices.
-        // Weight matrix (upper triangle only used, but stored flat for cache).
+        // Dense Stoer-Wagner on compact indices with flat weight matrix.
         let mut w = vec![FixedWeight::zero(); n * n];
         for i in 0..n {
+            let row = i * n;
             for &(j, wt) in &self.adj[i] {
-                w[i * n + j] = w[i * n + j].add(wt);
+                w[row + j] = w[row + j].add(wt);
             }
         }
 
-        let mut merged: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
         let mut active: Vec<bool> = vec![true; n];
         let mut active_list: Vec<usize> = (0..n).collect();
         let mut n_active = n;
@@ -168,7 +167,7 @@ impl AdjSnapshot {
                 break;
             }
 
-            // Reset
+            // Reset only active vertices
             for k in 0..n_active {
                 let j = active_list[k];
                 in_a[j] = false;
@@ -223,9 +222,6 @@ impl AdjSnapshot {
             }
 
             // Merge last into prev
-            let last_merged = std::mem::take(&mut merged[last]);
-            merged[prev].extend(last_merged);
-
             let prev_row = prev * n;
             let last_row = last * n;
             for k in 0..n_active {
@@ -237,63 +233,53 @@ impl AdjSnapshot {
             }
 
             active[last] = false;
-            active_list.retain(|&x| x != last);
+            // Swap-remove for O(1) instead of retain's O(n)
+            if let Some(pos) = active_list[..n_active].iter().position(|&x| x == last) {
+                active_list.swap(pos, n_active - 1);
+            }
             n_active -= 1;
         }
 
         Some(global_min)
     }
 
-    /// Compute a minimum s-t cut using push-relabel (Goldberg-Tarjan).
+    /// Compute a minimum s-t cut using Dinic's max-flow.
     ///
     /// Returns `(cut_value, source_side_mask)` where `source_side_mask[i]`
     /// is `true` if compact vertex `i` is on the source side.
     ///
-    /// When `priority` is provided, uses capacity perturbation to prefer
-    /// the minimum-priority source side among all minimum s-t cuts.
+    /// Uses a flat capacity array for cache locality.
     fn min_st_cut(
         &self,
         s_idx: usize,
         t_idx: usize,
-        priority: &[u64],
+        _priority: &[u64],
     ) -> (FixedWeight, Vec<bool>) {
         let n = self.n;
         debug_assert!(s_idx < n && t_idx < n && s_idx != t_idx);
 
-        // Build capacity matrix with optional priority perturbation.
-        //
-        // For canonical tie-breaking we use vertex-splitting:
-        //   - Each vertex v (except s,t) splits into v_in, v_out
-        //   - Internal arc capacity = M * INF + priority[v]  (for min-priority side)
-        //   - External arcs carry original edge capacity scaled by M
-        //
-        // However, for simplicity and correctness at Tier 1, we use a
-        // simpler BFS-based min-cut from the max-flow residual without
-        // perturbation, then select the minimum-size source side.
-        //
-        // This is correct because we only need the first separable vertex
-        // (the paper proves uniqueness once that vertex is fixed).
-
-        // Build directed capacity for max-flow (each undirected edge → 2 directed)
-        let mut cap = vec![vec![FixedWeight::zero(); n]; n];
+        // Build directed capacity for max-flow (flat array for cache locality)
+        let mut cap = vec![FixedWeight::zero(); n * n];
         for i in 0..n {
+            let row = i * n;
             for &(j, w) in &self.adj[i] {
-                cap[i][j] = cap[i][j].add(w);
+                cap[row + j] = cap[row + j].add(w);
             }
         }
 
-        // Dinic's algorithm for max-flow (cleaner than push-relabel for small n)
+        // Dinic's algorithm for max-flow
         let flow = dinic_maxflow(&mut cap, s_idx, t_idx, n);
 
         // Find source side from residual graph via BFS from s
         let mut source_side = vec![false; n];
-        let mut queue = VecDeque::new();
+        let mut queue = VecDeque::with_capacity(n);
         queue.push_back(s_idx);
         source_side[s_idx] = true;
 
         while let Some(u) = queue.pop_front() {
+            let row = u * n;
             for v in 0..n {
-                if !source_side[v] && cap[u][v].raw() > 0 {
+                if !source_side[v] && cap[row + v].raw() > 0 {
                     source_side[v] = true;
                     queue.push_back(v);
                 }
@@ -308,28 +294,36 @@ impl AdjSnapshot {
 // Dinic's max-flow
 // ---------------------------------------------------------------------------
 
-/// Compute max-flow using Dinic's algorithm on a capacity matrix.
+/// Compute max-flow using Dinic's algorithm on a flat capacity array.
 ///
+/// `cap` is a flat n*n array where `cap[u*n + v]` is the capacity from u to v.
 /// Modifies `cap` in-place to represent the residual graph.
 /// Returns the total flow value as `FixedWeight`.
 fn dinic_maxflow(
-    cap: &mut [Vec<FixedWeight>],
+    cap: &mut [FixedWeight],
     s: usize,
     t: usize,
     n: usize,
 ) -> FixedWeight {
     let mut total_flow = FixedWeight::zero();
+    let mut level = vec![-1i32; n];
+    let mut queue = VecDeque::with_capacity(n);
+    let mut iter = vec![0usize; n];
+    let inf = FixedWeight::from_f64(f64::MAX / 2.0);
 
     loop {
-        // BFS to build level graph
-        let mut level = vec![-1i32; n];
+        // BFS to build level graph (reuse allocations)
+        for l in level.iter_mut() {
+            *l = -1;
+        }
         level[s] = 0;
-        let mut queue = VecDeque::new();
+        queue.clear();
         queue.push_back(s);
 
         while let Some(u) = queue.pop_front() {
+            let row = u * n;
             for v in 0..n {
-                if level[v] == -1 && cap[u][v].raw() > 0 {
+                if level[v] == -1 && cap[row + v].raw() > 0 {
                     level[v] = level[u] + 1;
                     queue.push_back(v);
                 }
@@ -340,10 +334,12 @@ fn dinic_maxflow(
             break; // No augmenting path
         }
 
-        // DFS to find blocking flows
-        let mut iter = vec![0usize; n];
+        // DFS to find blocking flows (reuse iter allocation)
+        for it in iter.iter_mut() {
+            *it = 0;
+        }
         loop {
-            let pushed = dinic_dfs(cap, &level, &mut iter, s, t, n, FixedWeight::from_f64(f64::MAX / 2.0));
+            let pushed = dinic_dfs(cap, &level, &mut iter, s, t, n, inf);
             if pushed.raw() == 0 {
                 break;
             }
@@ -354,9 +350,9 @@ fn dinic_maxflow(
     total_flow
 }
 
-/// DFS for Dinic's blocking flow.
+/// DFS for Dinic's blocking flow on a flat capacity array.
 fn dinic_dfs(
-    cap: &mut [Vec<FixedWeight>],
+    cap: &mut [FixedWeight],
     level: &[i32],
     iter: &mut [usize],
     u: usize,
@@ -368,14 +364,16 @@ fn dinic_dfs(
         return pushed;
     }
 
+    let u_row = u * n;
     while iter[u] < n {
         let v = iter[u];
-        if level[v] == level[u] + 1 && cap[u][v].raw() > 0 {
-            let bottleneck = if pushed < cap[u][v] { pushed } else { cap[u][v] };
+        if level[v] == level[u] + 1 && cap[u_row + v].raw() > 0 {
+            let cap_uv = cap[u_row + v];
+            let bottleneck = if pushed < cap_uv { pushed } else { cap_uv };
             let d = dinic_dfs(cap, level, iter, v, t, n, bottleneck);
             if d.raw() > 0 {
-                cap[u][v] = cap[u][v].sub(d);
-                cap[v][u] = cap[v][u].add(d);
+                cap[u_row + v] = cap[u_row + v].sub(d);
+                cap[v * n + u] = cap[v * n + u].add(d);
                 return d;
             }
         }
