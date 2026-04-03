@@ -94,6 +94,7 @@ fn main() {
         generate_source_maps: false, // Skip for speed on large files.
         generate_witness: true,
         output_filename: path.clone(),
+        model_path: None,
     };
     let result = decompile(&source, &config).unwrap();
     let t_full = t_full_start.elapsed();

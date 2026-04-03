@@ -25,6 +25,10 @@ pub enum DecompilerError {
     #[error("witness chain verification failed: {0}")]
     WitnessError(String),
 
+    /// Neural model loading or inference error (requires `neural` feature).
+    #[error("model error: {0}")]
+    ModelError(String),
+
     /// JSON serialization/deserialization error.
     #[error("json error: {0}")]
     JsonError(#[from] serde_json::Error),

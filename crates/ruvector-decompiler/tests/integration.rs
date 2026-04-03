@@ -144,6 +144,7 @@ fn test_full_pipeline_end_to_end() {
         generate_source_maps: true,
         generate_witness: true,
         output_filename: "test_output.js".to_string(),
+        model_path: None,
     };
 
     let result = decompile(SAMPLE_BUNDLE, &config).unwrap();

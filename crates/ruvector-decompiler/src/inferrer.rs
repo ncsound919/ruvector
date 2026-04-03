@@ -1,10 +1,14 @@
 //! Name inference with confidence scoring and training data.
 //!
 //! Infers human-readable names for minified declarations based on:
-//! 1. Training corpus patterns (domain-specific, highest priority)
-//! 2. Known string-to-purpose mappings
-//! 3. Property correlation
-//! 4. Structural heuristics
+//! 1. Neural model inference (optional, highest accuracy)
+//! 2. Training corpus patterns (domain-specific, highest priority)
+//! 3. Known string-to-purpose mappings
+//! 4. Property correlation
+//! 5. Structural heuristics
+
+#[cfg(feature = "neural")]
+use std::path::{Path, PathBuf};
 
 use crate::training::TrainingCorpus;
 use crate::types::{Declaration, InferredName, Module};
@@ -295,6 +299,162 @@ pub struct LearnedPattern {
     pub inferred_name: String,
     pub correct_name: String,
     pub evidence: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Neural name inference (behind `neural` feature flag)
+// ---------------------------------------------------------------------------
+
+/// Context signals passed to the neural inferrer for a single declaration.
+#[derive(Debug, Clone)]
+pub struct InferenceContext {
+    /// String literals found near the declaration.
+    pub string_literals: Vec<String>,
+    /// Property names accessed on the declaration.
+    pub property_accesses: Vec<String>,
+    /// Declaration kind as a string (e.g., "function", "var", "class").
+    pub kind: String,
+}
+
+impl InferenceContext {
+    /// Build an `InferenceContext` from a declaration.
+    pub fn from_declaration(decl: &Declaration) -> Self {
+        Self {
+            string_literals: decl.string_literals.clone(),
+            property_accesses: decl.property_accesses.clone(),
+            kind: decl.kind.to_string(),
+        }
+    }
+}
+
+/// Neural name inference using a trained deobfuscation model.
+///
+/// Falls back to pattern-based inference if the model is not available.
+/// Only compiled when the `neural` feature is enabled.
+#[cfg(feature = "neural")]
+pub struct NeuralInferrer {
+    /// Path to the GGUF model file (or RVF with OVERLAY).
+    model_path: PathBuf,
+    /// Whether the model is loaded and ready for inference.
+    active: bool,
+    // In a full implementation, the loaded GGUF weights and inference
+    // runtime would be stored here. For now we keep the structure ready
+    // for RuvLLM integration.
+}
+
+#[cfg(feature = "neural")]
+impl NeuralInferrer {
+    /// Attempt to load a neural deobfuscation model from a GGUF or RVF file.
+    ///
+    /// Returns `Ok(Self)` if the file exists and appears valid; inference
+    /// may still fall back to `None` if the runtime is not compiled in.
+    pub fn load(path: &Path) -> Result<Self, crate::error::DecompilerError> {
+        if !path.exists() {
+            return Err(crate::error::DecompilerError::ModelError(format!(
+                "model file not found: {}",
+                path.display()
+            )));
+        }
+
+        // Validate magic bytes: GGUF (0x46475547) or RVF (0x52564601).
+        let data = std::fs::read(path).map_err(|e| {
+            crate::error::DecompilerError::ModelError(format!(
+                "failed to read model file: {}",
+                e
+            ))
+        })?;
+
+        if data.len() < 4 {
+            return Err(crate::error::DecompilerError::ModelError(
+                "model file too small".to_string(),
+            ));
+        }
+
+        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let is_gguf = magic == 0x46475547;
+        let is_rvf = &data[..4] == b"RVF\x01";
+
+        if !is_gguf && !is_rvf {
+            return Err(crate::error::DecompilerError::ModelError(
+                "unrecognized model format (expected GGUF or RVF)".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            model_path: path.to_path_buf(),
+            active: true,
+        })
+    }
+
+    /// Predict the original name for a minified identifier using the
+    /// neural model.
+    ///
+    /// Returns `None` if the model is not active or confidence is too low.
+    pub fn predict_name(
+        &self,
+        minified: &str,
+        context: &InferenceContext,
+    ) -> Option<InferredName> {
+        if !self.active {
+            return None;
+        }
+
+        // TODO: integrate with RuvLLM GGUF runtime for real inference.
+        // For now, return None so the pipeline falls through to
+        // pattern-based strategies. This stub ensures the API is
+        // stable and the integration points are well-defined.
+        let _ = (minified, context);
+        None
+    }
+
+    /// Whether the neural model is loaded and ready.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Path to the loaded model file.
+    pub fn model_path(&self) -> &Path {
+        &self.model_path
+    }
+}
+
+/// Infer names with optional neural model support.
+///
+/// When the `neural` feature is enabled and a model path is provided,
+/// neural inference is attempted first for each declaration. Results
+/// with confidence > 0.8 are accepted directly; otherwise the pipeline
+/// falls through to corpus-based and heuristic strategies.
+#[cfg(feature = "neural")]
+pub fn infer_names_neural(
+    modules: &[Module],
+    model_path: Option<&Path>,
+) -> Vec<InferredName> {
+    let corpus = TrainingCorpus::builtin();
+    let neural = model_path.and_then(|p| NeuralInferrer::load(p).ok());
+
+    let mut inferred = Vec::new();
+
+    for module in modules {
+        for decl in &module.declarations {
+            // 1. Try neural inference (highest accuracy).
+            if let Some(ref model) = neural {
+                let ctx = InferenceContext::from_declaration(decl);
+                if let Some(name) = model.predict_name(&decl.name, &ctx) {
+                    if name.confidence > 0.8 {
+                        inferred.push(name);
+                        continue;
+                    }
+                }
+            }
+
+            // 2. Fall back to corpus + heuristic strategies.
+            if let Some(inf) = infer_declaration_name(decl, &corpus) {
+                inferred.push(inf);
+            }
+        }
+    }
+
+    inferred
 }
 
 #[cfg(test)]

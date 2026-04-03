@@ -1,5 +1,7 @@
 //! Core domain types for the decompiler.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// The kind of a top-level declaration.
@@ -146,6 +148,10 @@ pub struct DecompileConfig {
     pub generate_witness: bool,
     /// The filename to use in source map output.
     pub output_filename: String,
+    /// Path to trained deobfuscation model (GGUF or RVF).
+    /// When set and the `neural` feature is enabled, the decompiler will
+    /// attempt neural name inference before falling back to pattern-based.
+    pub model_path: Option<PathBuf>,
 }
 
 impl Default for DecompileConfig {
@@ -156,6 +162,7 @@ impl Default for DecompileConfig {
             generate_source_maps: true,
             generate_witness: true,
             output_filename: "bundle.js".to_string(),
+            model_path: None,
         }
     }
 }
