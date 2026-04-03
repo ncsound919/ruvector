@@ -147,6 +147,8 @@ members = [
     "examples/quantum-consciousness",
     "examples/gene-consciousness",
     "examples/climate-consciousness",
+    # JS bundle decompiler (ADR-135)
+    "crates/ruvector-decompiler",
 ]
 resolver = "2"
 
