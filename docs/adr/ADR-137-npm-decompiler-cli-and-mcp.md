@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Deployed (2026-04-03) — CLI command + 6 MCP tools implemented. Decompiler library with reconstruction, validation, and `--runnable` mode.
 
 ## Date
 
@@ -82,20 +82,34 @@ npx ruvector decompile <package>
 | `--diff <version>` | Compare against another version | — |
 | `--json` | JSON output (for piping) | `false` |
 | `--quiet, -q` | Suppress progress output | `false` |
+| `--runnable` | Guaranteed-runnable output (validated renames only) | `false` |
+| `--validate` | Run operational validation after decompilation | `false` |
+| `--reconstruct` | Apply AI name recovery + JSDoc + style fixes | `true` |
 
 #### Output Formats
 
-**`modules`** (default) — one file per detected module:
+**`modules`** (default) — graph-derived folder hierarchy:
 ```
 decompiled/express/
-├── README.md              # Summary, metrics, module list
-├── module-001-router.js   # Reconstructed module
-├── module-002-request.js
-├── module-003-response.js
-├── ...
-├── source-map.json        # V3 source map
+├── README.md
+├── source/                # Decompiled code (graph-derived folders)
+│   ├── core/
+│   ├── tools/
+│   ├── config/
+│   └── uncategorized/
+├── rvf/                   # RVF containers (separate from source)
+│   ├── master.rvf
+│   └── core.rvf
 ├── witness.json           # Merkle witness chain
 └── metrics.json           # Declarations, confidence, timing
+```
+
+**`runnable`** — single validated file (guaranteed to execute):
+```
+decompiled/express/
+├── express.runnable.js    # Renames validated one-by-one via vm sandbox
+├── witness.json
+└── rename-report.json     # Applied/rejected renames with reasons
 ```
 
 **`single`** — beautified single file with module comments:
