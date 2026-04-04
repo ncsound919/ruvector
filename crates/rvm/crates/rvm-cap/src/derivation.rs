@@ -263,6 +263,42 @@ impl<const N: usize> DerivationTree<N> {
 
     /// Iteratively revokes a subtree using an explicit stack.
     ///
+    /// Find the parent of a given node by scanning for a node whose
+    /// child chain contains the target index.
+    ///
+    /// Returns `None` for root nodes or if the parent is not found.
+    /// O(N) scan — acceptable for P3 verification which runs at most
+    /// `max_depth` times (typically 8).
+    #[must_use]
+    pub fn find_parent(&self, child_index: u32) -> Option<u32> {
+        let cidx = child_index as usize;
+        if cidx >= N || !self.nodes[cidx].is_valid {
+            return None;
+        }
+        // Root nodes have no parent.
+        if self.nodes[cidx].depth == 0 {
+            return None;
+        }
+        // Scan all nodes to find one whose child chain includes child_index.
+        for i in 0..N {
+            if !self.nodes[i].is_valid {
+                continue;
+            }
+            let mut cursor = self.nodes[i].first_child;
+            while cursor != u32::MAX {
+                if cursor == child_index {
+                    return Some(i as u32);
+                }
+                let c = cursor as usize;
+                if c >= N {
+                    break;
+                }
+                cursor = self.nodes[c].next_sibling;
+            }
+        }
+        None
+    }
+
     /// # Security
     ///
     /// The previous recursive implementation could overflow the stack on

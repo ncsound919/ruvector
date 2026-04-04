@@ -180,16 +180,101 @@ impl<const N: usize> ProofVerifier<N> {
         }
     }
 
-    /// P3: Deep proof verification (v1 stub).
+    /// P3: Deep proof — derivation chain integrity verification.
     ///
-    /// Returns `Err(ProofError::P3NotImplemented)` in v1.
+    /// Walks the derivation tree from the given capability back to its
+    /// root and verifies:
+    /// 1. Every ancestor is valid (not revoked).
+    /// 2. Depth decreases monotonically toward the root.
+    /// 3. Epoch values are non-decreasing from root to leaf.
+    /// 4. The chain terminates at a root node (depth 0).
+    /// 5. The chain length does not exceed `max_depth`.
+    ///
+    /// Budget: < 10 us for depth <= 8 (typical). Worst-case O(depth).
     ///
     /// # Errors
     ///
-    /// Always returns [`ProofError::P3NotImplemented`] in v1.
-    #[inline]
-    pub fn verify_p3(&self) -> Result<(), ProofError> {
-        Err(ProofError::P3NotImplemented)
+    /// Returns [`ProofError::DerivationChainBroken`] if the chain is
+    /// invalid, tampered, or does not reach a root.
+    pub fn verify_p3(
+        &self,
+        table: &CapabilityTable<N>,
+        tree: &DerivationTree<N>,
+        cap_index: u32,
+        cap_generation: u32,
+        max_depth: u8,
+    ) -> Result<(), ProofError> {
+        // Verify the capability itself is valid.
+        let _slot = table
+            .lookup(cap_index, cap_generation)
+            .map_err(|_| ProofError::DerivationChainBroken)?;
+
+        // Verify the derivation node exists and is valid.
+        let node = tree
+            .get(cap_index)
+            .ok_or(ProofError::DerivationChainBroken)?;
+        if !node.is_valid {
+            return Err(ProofError::DerivationChainBroken);
+        }
+
+        // If this IS a root, chain is trivially valid.
+        if node.depth == 0 {
+            return Ok(());
+        }
+
+        // Walk the derivation tree up to the root.
+        let mut current_depth = node.depth;
+        let mut current_epoch = node.epoch;
+        let mut steps = 0u8;
+
+        // Walk ancestors. The derivation tree uses first-child/next-sibling,
+        // so we need to find the parent. We do this by scanning for a node
+        // that has `cap_index` in its children chain.
+        let mut current_idx = cap_index;
+        loop {
+            steps += 1;
+            if steps > max_depth {
+                return Err(ProofError::DerivationChainBroken);
+            }
+
+            // Find the parent of current_idx.
+            let parent_idx = tree.find_parent(current_idx);
+            match parent_idx {
+                Some(pidx) => {
+                    let parent = match tree.get(pidx) {
+                        Some(p) => p,
+                        None => return Err(ProofError::DerivationChainBroken),
+                    };
+
+                    // Ancestor must be valid.
+                    if !parent.is_valid {
+                        return Err(ProofError::DerivationChainBroken);
+                    }
+                    // Depth must decrease.
+                    if parent.depth >= current_depth {
+                        return Err(ProofError::DerivationChainBroken);
+                    }
+                    // Epoch must be non-decreasing from root to leaf
+                    // (parent.epoch <= child.epoch).
+                    if parent.epoch > current_epoch {
+                        return Err(ProofError::DerivationChainBroken);
+                    }
+
+                    if parent.depth == 0 {
+                        // Reached the root — chain is valid.
+                        return Ok(());
+                    }
+
+                    current_depth = parent.depth;
+                    current_epoch = parent.epoch;
+                    current_idx = pidx;
+                }
+                None => {
+                    // No parent found but we're not at root — broken chain.
+                    return Err(ProofError::DerivationChainBroken);
+                }
+            }
+        }
     }
 
     /// Checks if a nonce has been used recently.
@@ -331,9 +416,64 @@ mod tests {
     }
 
     #[test]
-    fn test_p3_not_implemented() {
-        let verifier = ProofVerifier::<64>::new(0);
-        assert_eq!(verifier.verify_p3(), Err(ProofError::P3NotImplemented));
+    fn test_p3_root_passes() {
+        let (mut table, mut tree, verifier) = setup();
+        let token = CapToken::new(100, CapType::Region, all_rights(), 0);
+        let (idx, gen) = table.insert_root(token, PartitionId::new(1), 0).unwrap();
+        tree.add_root(idx, 0).unwrap();
+
+        assert!(verifier.verify_p3(&table, &tree, idx, gen, 8).is_ok());
+    }
+
+    #[test]
+    fn test_p3_one_level_derivation() {
+        let (mut table, mut tree, verifier) = setup();
+        let owner = PartitionId::new(1);
+
+        // Create root.
+        let root_token = CapToken::new(100, CapType::Region, all_rights(), 0);
+        let (root_idx, _root_gen) = table.insert_root(root_token, owner, 0).unwrap();
+        tree.add_root(root_idx, 0).unwrap();
+
+        // Derive a child.
+        let child_token = CapToken::new(200, CapType::Region, CapRights::READ, 0);
+        let (child_idx, child_gen) = table.insert_root(child_token, owner, 0).unwrap();
+        tree.add_child(root_idx, child_idx, 1, 1).unwrap();
+
+        // P3 should follow child → root and succeed.
+        assert!(verifier.verify_p3(&table, &tree, child_idx, child_gen, 8).is_ok());
+    }
+
+    #[test]
+    fn test_p3_nonexistent_fails() {
+        let (table, tree, verifier) = setup();
+        assert_eq!(
+            verifier.verify_p3(&table, &tree, 99, 0, 8),
+            Err(ProofError::DerivationChainBroken),
+        );
+    }
+
+    #[test]
+    fn test_p3_revoked_ancestor_fails() {
+        let (mut table, mut tree, verifier) = setup();
+        let owner = PartitionId::new(1);
+
+        let root_token = CapToken::new(100, CapType::Region, all_rights(), 0);
+        let (root_idx, _) = table.insert_root(root_token, owner, 0).unwrap();
+        tree.add_root(root_idx, 0).unwrap();
+
+        let child_token = CapToken::new(200, CapType::Region, CapRights::READ, 0);
+        let (child_idx, child_gen) = table.insert_root(child_token, owner, 0).unwrap();
+        tree.add_child(root_idx, child_idx, 1, 1).unwrap();
+
+        // Revoke the root.
+        tree.revoke(root_idx).unwrap();
+
+        // P3 should fail because root is revoked.
+        assert_eq!(
+            verifier.verify_p3(&table, &tree, child_idx, child_gen, 8),
+            Err(ProofError::DerivationChainBroken),
+        );
     }
 
     #[test]

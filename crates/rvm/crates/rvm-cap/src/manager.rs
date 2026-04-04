@@ -279,13 +279,23 @@ impl<const N: usize> CapabilityManager<N> {
         self.verifier.verify_p2(&self.table, &self.derivation, cap_index, cap_generation, ctx)
     }
 
-    /// P3 verification stub (returns `P3NotImplemented` in v1).
+    /// P3: Deep proof — derivation chain integrity verification.
+    ///
+    /// Walks the derivation tree from the capability back to its root,
+    /// verifying that every ancestor is valid, depth is monotonic, and
+    /// epochs are non-decreasing.
     ///
     /// # Errors
     ///
-    /// Always returns [`ProofError::P3NotImplemented`] in v1.
-    pub fn verify_p3(&self) -> Result<(), ProofError> {
-        self.verifier.verify_p3()
+    /// Returns [`ProofError::DerivationChainBroken`] if the chain is invalid.
+    pub fn verify_p3(
+        &self,
+        cap_index: u32,
+        cap_generation: u32,
+        max_depth: u8,
+    ) -> Result<(), ProofError> {
+        self.verifier
+            .verify_p3(&self.table, &self.derivation, cap_index, cap_generation, max_depth)
     }
 
     /// Returns a reference to the underlying table.
@@ -396,8 +406,23 @@ mod tests {
     }
 
     #[test]
-    fn test_p3_not_implemented() {
+    fn test_p3_root_capability_passes() {
+        let mut mgr = CapabilityManager::<64>::with_defaults();
+        let owner = PartitionId::new(1);
+        let (idx, gen) = mgr
+            .create_root_capability(CapType::Region, all_rights(), 0, owner)
+            .unwrap();
+
+        // Root capability should pass P3 (trivial chain).
+        assert!(mgr.verify_p3(idx, gen, 8).is_ok());
+    }
+
+    #[test]
+    fn test_p3_nonexistent_fails() {
         let mgr = CapabilityManager::<64>::with_defaults();
-        assert_eq!(mgr.verify_p3(), Err(ProofError::P3NotImplemented));
+        assert_eq!(
+            mgr.verify_p3(99, 0, 8),
+            Err(ProofError::DerivationChainBroken),
+        );
     }
 }
