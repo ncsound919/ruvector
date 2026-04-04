@@ -685,8 +685,8 @@ mod tests {
 
         // Phase 3: Tick scheduler (simulate agent running).
         for i in 0..5 {
-            let summary = kernel.tick().unwrap();
-            assert_eq!(summary.epoch, i);
+            let result = kernel.tick().unwrap();
+            assert_eq!(result.summary.epoch, i);
         }
         assert_eq!(kernel.current_epoch(), 5);
 

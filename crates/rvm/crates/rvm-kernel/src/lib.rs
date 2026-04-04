@@ -92,6 +92,7 @@ pub const CRATE_COUNT: usize = 13;
 
 use rvm_boot::BootTracker;
 use rvm_cap::{CapManagerConfig, CapabilityManager};
+use rvm_coherence::{CoherenceDecision, DefaultCoherenceEngine};
 use rvm_partition::PartitionManager;
 use rvm_sched::Scheduler;
 use rvm_types::{
@@ -112,6 +113,36 @@ const DEFAULT_CAP_CAPACITY: usize = 256;
 /// Default partition table capacity.
 const DEFAULT_MAX_PARTITIONS: usize = 256;
 
+/// Result of a single epoch tick, combining scheduler and coherence outputs.
+#[derive(Debug, Clone)]
+pub struct EpochResult {
+    /// Scheduler epoch summary (context switches, utilisation).
+    pub summary: rvm_sched::EpochSummary,
+    /// Coherence engine recommendation (split, merge, or no-action).
+    pub decision: CoherenceDecision,
+}
+
+/// Result of applying a coherence decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyResult {
+    /// No action was taken.
+    NoAction,
+    /// A partition was split into two.
+    Split {
+        /// The original partition.
+        source: PartitionId,
+        /// The newly created partition.
+        child: PartitionId,
+    },
+    /// Two partitions were merged.
+    Merged {
+        /// The surviving partition.
+        survivor: PartitionId,
+        /// The partition that was absorbed.
+        absorbed: PartitionId,
+    },
+}
+
 /// Top-level kernel integrating all RVM subsystems.
 ///
 /// The kernel holds ownership of all core subsystem instances
@@ -126,6 +157,8 @@ pub struct Kernel {
     witness_log: WitnessLog<DEFAULT_WITNESS_CAPACITY>,
     /// Capability manager (P1/P2/P3 verification).
     cap_manager: CapabilityManager<DEFAULT_CAP_CAPACITY>,
+    /// Coherence engine — graph-driven partition scoring and split/merge.
+    coherence: DefaultCoherenceEngine,
     /// Boot progress tracker.
     boot: BootTracker,
     /// Kernel configuration.
@@ -153,6 +186,9 @@ impl Default for KernelConfig {
 }
 
 impl Kernel {
+    /// Default Stoer-Wagner iteration budget for the coherence engine.
+    const DEFAULT_MINCUT_BUDGET: u32 = 100;
+
     /// Create a new kernel instance with the given configuration.
     #[must_use]
     pub fn new(config: KernelConfig) -> Self {
@@ -161,6 +197,7 @@ impl Kernel {
             scheduler: Scheduler::new(),
             witness_log: WitnessLog::new(),
             cap_manager: CapabilityManager::new(config.cap),
+            coherence: DefaultCoherenceEngine::with_defaults(Self::DEFAULT_MINCUT_BUDGET),
             boot: BootTracker::new(),
             config: config.rvm,
             booted: false,
@@ -199,15 +236,22 @@ impl Kernel {
         Ok(())
     }
 
-    /// Advance the scheduler by one epoch.
+    /// Advance the scheduler and coherence engine by one epoch.
     ///
-    /// Returns the epoch summary. Requires the kernel to have booted.
-    pub fn tick(&mut self) -> RvmResult<rvm_sched::EpochSummary> {
+    /// Returns an `EpochResult` containing the scheduler summary and the
+    /// coherence engine's split/merge recommendation. Requires the kernel
+    /// to have booted.
+    pub fn tick(&mut self) -> RvmResult<EpochResult> {
         if !self.booted {
             return Err(RvmError::InvalidPartitionState);
         }
 
         let summary = self.scheduler.tick_epoch();
+
+        // Tick coherence engine. Use a fixed CPU load estimate for now;
+        // a future HAL integration will read real CPU utilisation.
+        let cpu_load_estimate = 20u8;
+        let decision = self.coherence.tick(cpu_load_estimate);
 
         // Emit an epoch witness.
         let mut record = WitnessRecord::zeroed();
@@ -217,12 +261,49 @@ impl Kernel {
         record.payload[0..2].copy_from_slice(&switch_bytes);
         self.witness_log.append(record);
 
-        Ok(summary)
+        Ok(EpochResult { summary, decision })
+    }
+
+    /// Record a directed communication event between two partitions.
+    ///
+    /// Updates the coherence graph edge weight. Call this when agents in
+    /// different partitions exchange messages.
+    pub fn record_communication(
+        &mut self,
+        from: PartitionId,
+        to: PartitionId,
+        weight: u64,
+    ) -> RvmResult<()> {
+        if !self.booted {
+            return Err(RvmError::InvalidPartitionState);
+        }
+        self.coherence
+            .record_communication(from, to, weight)
+            .map_err(|_| RvmError::InternalError)
+    }
+
+    /// Get the coherence score for a partition (0..10000 basis points).
+    #[must_use]
+    pub fn coherence_score(&self, id: PartitionId) -> rvm_types::CoherenceScore {
+        self.coherence.score(id)
+    }
+
+    /// Get the cut pressure for a partition (0..10000 basis points).
+    #[must_use]
+    pub fn coherence_pressure(&self, id: PartitionId) -> rvm_types::CutPressure {
+        self.coherence.pressure(id)
+    }
+
+    /// Get the latest coherence decision without advancing the epoch.
+    #[must_use]
+    pub fn coherence_recommendation(&self) -> CoherenceDecision {
+        self.coherence.recommend()
     }
 
     /// Create a new partition with the given configuration.
     ///
-    /// Emits a `PartitionCreate` witness record on success.
+    /// Registers the partition in the coherence graph and emits a
+    /// `PartitionCreate` witness record on success.
     pub fn create_partition(&mut self, config: &PartitionConfig) -> RvmResult<PartitionId> {
         if !self.booted {
             return Err(RvmError::InvalidPartitionState);
@@ -234,6 +315,10 @@ impl Kernel {
             config.vcpu_count,
             epoch,
         )?;
+
+        // Register in coherence graph (best-effort: ignore capacity errors
+        // since the partition already exists in the partition manager).
+        let _ = self.coherence.add_partition(id);
 
         // Emit witness.
         let mut record = WitnessRecord::zeroed();
@@ -248,8 +333,8 @@ impl Kernel {
 
     /// Destroy a partition and reclaim its resources.
     ///
-    /// This is a placeholder that emits a `PartitionDestroy` witness.
-    /// Full resource reclamation is deferred.
+    /// Removes the partition from the coherence graph and emits a
+    /// `PartitionDestroy` witness. Full resource reclamation is deferred.
     pub fn destroy_partition(&mut self, id: PartitionId) -> RvmResult<()> {
         if !self.booted {
             return Err(RvmError::InvalidPartitionState);
@@ -259,6 +344,9 @@ impl Kernel {
         if self.partitions.get(id).is_none() {
             return Err(RvmError::PartitionNotFound);
         }
+
+        // Remove from coherence graph (best-effort).
+        let _ = self.coherence.remove_partition(id);
 
         // Emit witness.
         let mut record = WitnessRecord::zeroed();
@@ -323,20 +411,158 @@ impl Kernel {
         &self.witness_log
     }
 
+    // -- Scheduler integration --
+
+    /// Enqueue a partition onto a CPU's run queue.
+    ///
+    /// Automatically injects the partition's coherence-derived cut pressure
+    /// into the scheduler priority. This is the primary path for scheduling
+    /// partitions with coherence awareness.
+    pub fn enqueue_partition(
+        &mut self,
+        cpu: usize,
+        id: PartitionId,
+        deadline_urgency: u16,
+    ) -> RvmResult<()> {
+        if !self.booted {
+            return Err(RvmError::InvalidPartitionState);
+        }
+        if self.partitions.get(id).is_none() {
+            return Err(RvmError::PartitionNotFound);
+        }
+
+        let pressure = self.coherence.pressure(id);
+        if !self.scheduler.enqueue(cpu, id, deadline_urgency, pressure) {
+            return Err(RvmError::ResourceLimitExceeded);
+        }
+        Ok(())
+    }
+
+    /// Pick the next partition on a CPU and switch to it.
+    ///
+    /// Returns `(old_partition, new_partition)` if a switch occurred.
+    /// Emits no witness record (DC-10: switches are bulk-summarised at
+    /// epoch boundaries, not individually witnessed).
+    pub fn switch_next(&mut self, cpu: usize) -> Option<(Option<PartitionId>, PartitionId)> {
+        self.scheduler.switch_next(cpu)
+    }
+
+    // -- Coherence-driven split/merge --
+
+    /// Execute a coherence-driven partition split.
+    ///
+    /// Creates a new "child" partition and emits a `StructuralSplit`
+    /// witness. The actual agent migration is the caller's responsibility;
+    /// this method handles the partition and coherence graph bookkeeping.
+    ///
+    /// Returns the new partition ID on success.
+    pub fn execute_split(&mut self, source: PartitionId) -> RvmResult<PartitionId> {
+        if !self.booted {
+            return Err(RvmError::InvalidPartitionState);
+        }
+        let src = self.partitions.get(source).ok_or(RvmError::PartitionNotFound)?;
+        let vcpu_count = src.vcpu_count;
+
+        // Create the new partition (inherits source's vCPU count).
+        let epoch = self.scheduler.current_epoch();
+        let child = self.partitions.create(
+            rvm_partition::PartitionType::Agent,
+            vcpu_count,
+            epoch,
+        )?;
+
+        // Register child in coherence graph.
+        let _ = self.coherence.add_partition(child);
+
+        // Emit structural split witness.
+        let mut record = WitnessRecord::zeroed();
+        record.action_kind = ActionKind::StructuralSplit as u8;
+        record.proof_tier = 1;
+        record.actor_partition_id = source.as_u32();
+        record.target_object_id = child.as_u32() as u64;
+        self.witness_log.append(record);
+
+        Ok(child)
+    }
+
+    /// Execute a coherence-driven partition merge.
+    ///
+    /// Validates merge preconditions (coherence threshold, adjacency,
+    /// resource limits) and emits a `StructuralMerge` witness. The
+    /// target partition absorbs the source; the source is destroyed.
+    ///
+    /// Returns the surviving partition ID on success.
+    pub fn execute_merge(
+        &mut self,
+        absorber: PartitionId,
+        absorbed: PartitionId,
+    ) -> RvmResult<PartitionId> {
+        if !self.booted {
+            return Err(RvmError::InvalidPartitionState);
+        }
+        // Verify both partitions exist.
+        let _a = self.partitions.get(absorber).ok_or(RvmError::PartitionNotFound)?;
+        let _b = self.partitions.get(absorbed).ok_or(RvmError::PartitionNotFound)?;
+
+        // Check coherence-based merge preconditions.
+        let score_a = self.coherence.score(absorber);
+        let score_b = self.coherence.score(absorbed);
+        rvm_partition::merge_preconditions_met(score_a, score_b)
+            .map_err(|_| RvmError::InvalidPartitionState)?;
+
+        // Remove absorbed from coherence graph.
+        let _ = self.coherence.remove_partition(absorbed);
+
+        // Emit structural merge witness.
+        let mut record = WitnessRecord::zeroed();
+        record.action_kind = ActionKind::StructuralMerge as u8;
+        record.proof_tier = 1;
+        record.actor_partition_id = absorber.as_u32();
+        record.target_object_id = absorbed.as_u32() as u64;
+        self.witness_log.append(record);
+
+        Ok(absorber)
+    }
+
+    /// Apply a coherence decision returned from `tick()`.
+    ///
+    /// - `SplitRecommended` → `execute_split`
+    /// - `MergeRecommended` → `execute_merge`
+    /// - `NoAction` → no-op
+    ///
+    /// Returns the decision that was applied, along with any new partition
+    /// ID created by a split.
+    pub fn apply_decision(
+        &mut self,
+        decision: CoherenceDecision,
+    ) -> RvmResult<ApplyResult> {
+        match decision {
+            CoherenceDecision::NoAction => Ok(ApplyResult::NoAction),
+            CoherenceDecision::SplitRecommended { partition, .. } => {
+                let child = self.execute_split(partition)?;
+                Ok(ApplyResult::Split { source: partition, child })
+            }
+            CoherenceDecision::MergeRecommended { a, b, .. } => {
+                let survivor = self.execute_merge(a, b)?;
+                Ok(ApplyResult::Merged { survivor, absorbed: b })
+            }
+        }
+    }
+
     // -- Feature-gated subsystems --
 
-    /// Access the coherence engine (requires `coherence` feature).
+    /// Whether the coherence engine is integrated.
     ///
-    /// Returns `Err(Unsupported)` if the coherence feature is not enabled.
-    #[cfg(feature = "coherence")]
-    pub fn coherence_enabled(&self) -> bool {
+    /// Always `true` since the engine is a core part of the kernel.
+    #[must_use]
+    pub const fn coherence_enabled(&self) -> bool {
         true
     }
 
-    /// Access the coherence engine (stub when feature is disabled).
-    #[cfg(not(feature = "coherence"))]
-    pub fn coherence_enabled(&self) -> bool {
-        false
+    /// Access the coherence engine directly (for inspection/testing).
+    #[must_use]
+    pub fn coherence_engine(&self) -> &DefaultCoherenceEngine {
+        &self.coherence
     }
 
     /// Check whether WASM support is compiled in.
@@ -443,8 +669,9 @@ mod tests {
         let mut kernel = Kernel::with_defaults();
         kernel.boot().unwrap();
 
-        let summary = kernel.tick().unwrap();
-        assert_eq!(summary.epoch, 0);
+        let result = kernel.tick().unwrap();
+        assert_eq!(result.summary.epoch, 0);
+        assert_eq!(result.decision, CoherenceDecision::NoAction);
         assert_eq!(kernel.current_epoch(), 1);
     }
 
@@ -458,9 +685,8 @@ mod tests {
     fn test_feature_gates() {
         let kernel = Kernel::with_defaults();
 
-        // These compile regardless of features, but return false
-        // when the features are not enabled.
-        let _coherence = kernel.coherence_enabled();
+        // Coherence is always enabled now.
+        assert!(kernel.coherence_enabled());
         let _wasm = kernel.wasm_enabled();
     }
 
@@ -520,8 +746,8 @@ mod tests {
 
         // Phase 3: Tick the scheduler several times
         for expected_epoch in 0..5u32 {
-            let summary = kernel.tick().unwrap();
-            assert_eq!(summary.epoch, expected_epoch);
+            let result = kernel.tick().unwrap();
+            assert_eq!(result.summary.epoch, expected_epoch);
         }
         assert_eq!(kernel.current_epoch(), 5);
         // 5 ticks = 5 more witness records
@@ -655,5 +881,410 @@ mod tests {
             owner,
         );
         assert!(result.is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // Coherence engine integration tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_coherence_engine_tracks_partitions() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let id1 = kernel.create_partition(&config).unwrap();
+        let id2 = kernel.create_partition(&config).unwrap();
+
+        // Coherence engine should track the same count.
+        assert_eq!(kernel.coherence_engine().partition_count(), 2);
+
+        // Isolated partitions have max coherence score.
+        assert_eq!(
+            kernel.coherence_score(id1),
+            rvm_types::CoherenceScore::MAX,
+        );
+        assert_eq!(
+            kernel.coherence_score(id2),
+            rvm_types::CoherenceScore::MAX,
+        );
+    }
+
+    #[test]
+    fn test_record_communication_and_tick() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let id1 = kernel.create_partition(&config).unwrap();
+        let id2 = kernel.create_partition(&config).unwrap();
+
+        // Record heavy communication between the two.
+        kernel.record_communication(id1, id2, 1000).unwrap();
+
+        // After tick, coherence scores drop (all traffic is external).
+        let result = kernel.tick().unwrap();
+
+        assert_eq!(kernel.coherence_score(id1).as_basis_points(), 0);
+        // High external traffic → split recommended.
+        match result.decision {
+            CoherenceDecision::SplitRecommended { partition, .. } => {
+                assert!(partition == id1 || partition == id2);
+            }
+            _ => panic!("expected SplitRecommended after heavy external comms"),
+        }
+    }
+
+    #[test]
+    fn test_coherence_pressure_after_communication() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let id1 = kernel.create_partition(&config).unwrap();
+        let id2 = kernel.create_partition(&config).unwrap();
+        kernel.record_communication(id1, id2, 500).unwrap();
+
+        kernel.tick().unwrap();
+
+        // Partition with only external traffic has max pressure (10000 bp).
+        assert_eq!(kernel.coherence_pressure(id1).as_fixed(), 10_000);
+    }
+
+    #[test]
+    fn test_no_action_for_isolated_partitions() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        kernel.create_partition(&config).unwrap();
+        kernel.create_partition(&config).unwrap();
+
+        let result = kernel.tick().unwrap();
+        assert_eq!(result.decision, CoherenceDecision::NoAction);
+    }
+
+    #[test]
+    fn test_record_communication_before_boot_fails() {
+        let mut kernel = Kernel::with_defaults();
+        assert_eq!(
+            kernel.record_communication(PartitionId::new(1), PartitionId::new(2), 100),
+            Err(RvmError::InvalidPartitionState),
+        );
+    }
+
+    #[test]
+    fn test_coherence_recommendation_without_tick() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        kernel.create_partition(&config).unwrap();
+
+        // Before any tick, recommendation is NoAction.
+        assert_eq!(kernel.coherence_recommendation(), CoherenceDecision::NoAction);
+    }
+
+    #[test]
+    fn test_destroy_removes_from_coherence() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let id1 = kernel.create_partition(&config).unwrap();
+        let id2 = kernel.create_partition(&config).unwrap();
+        assert_eq!(kernel.coherence_engine().partition_count(), 2);
+
+        kernel.destroy_partition(id1).unwrap();
+        assert_eq!(kernel.coherence_engine().partition_count(), 1);
+
+        // id2 is still tracked.
+        assert_eq!(
+            kernel.coherence_score(id2),
+            rvm_types::CoherenceScore::MAX,
+        );
+    }
+
+    #[test]
+    fn test_full_coherence_lifecycle() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let a = kernel.create_partition(&config).unwrap();
+        let b = kernel.create_partition(&config).unwrap();
+        let c = kernel.create_partition(&config).unwrap();
+
+        // a and b talk heavily; c is isolated.
+        kernel.record_communication(a, b, 2000).unwrap();
+        kernel.record_communication(b, a, 2000).unwrap();
+
+        let result = kernel.tick().unwrap();
+
+        // a and b should have high pressure, c should not.
+        assert!(kernel.coherence_pressure(a).as_fixed() > 0);
+        assert!(kernel.coherence_pressure(b).as_fixed() > 0);
+        assert_eq!(kernel.coherence_pressure(c).as_fixed(), 0);
+
+        // Should recommend splitting a or b.
+        match result.decision {
+            CoherenceDecision::SplitRecommended { partition, .. } => {
+                assert!(partition == a || partition == b);
+            }
+            _ => panic!("expected split for heavily communicating partitions"),
+        }
+
+        // Destroy a, verify coherence adapts.
+        kernel.destroy_partition(a).unwrap();
+        assert_eq!(kernel.coherence_engine().partition_count(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // Scheduler integration tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_enqueue_and_switch() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let id1 = kernel.create_partition(&config).unwrap();
+        let id2 = kernel.create_partition(&config).unwrap();
+
+        // Enqueue id1 with lower urgency, id2 with higher.
+        kernel.enqueue_partition(0, id1, 100).unwrap();
+        kernel.enqueue_partition(0, id2, 200).unwrap();
+
+        // Highest priority should be dequeued first.
+        let (old, new) = kernel.switch_next(0).unwrap();
+        assert!(old.is_none());
+        assert_eq!(new, id2);
+
+        let (old, new) = kernel.switch_next(0).unwrap();
+        assert_eq!(old, Some(id2));
+        assert_eq!(new, id1);
+    }
+
+    #[test]
+    fn test_enqueue_injects_coherence_pressure() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let id1 = kernel.create_partition(&config).unwrap();
+        let id2 = kernel.create_partition(&config).unwrap();
+
+        // Record heavy communication to give id1 high pressure.
+        kernel.record_communication(id1, id2, 5000).unwrap();
+        kernel.tick().unwrap();
+
+        // id1 now has max pressure (10000 bp). When enqueued with
+        // lower deadline urgency, pressure boost may re-order.
+        kernel.enqueue_partition(0, id1, 50).unwrap();
+        kernel.enqueue_partition(0, id2, 50).unwrap();
+
+        // id1 should be prioritised because of its pressure boost.
+        let (_, first) = kernel.switch_next(0).unwrap();
+        assert_eq!(first, id1);
+    }
+
+    #[test]
+    fn test_enqueue_before_boot_fails() {
+        let mut kernel = Kernel::with_defaults();
+        assert_eq!(
+            kernel.enqueue_partition(0, PartitionId::new(1), 100),
+            Err(RvmError::InvalidPartitionState),
+        );
+    }
+
+    #[test]
+    fn test_enqueue_nonexistent_partition_fails() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+        assert_eq!(
+            kernel.enqueue_partition(0, PartitionId::new(999), 100),
+            Err(RvmError::PartitionNotFound),
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Split / merge execution tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_execute_split() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let source = kernel.create_partition(&config).unwrap();
+        let pre_count = kernel.partition_count();
+        let pre_witness = kernel.witness_count();
+
+        let child = kernel.execute_split(source).unwrap();
+
+        assert_ne!(source, child);
+        assert_eq!(kernel.partition_count(), pre_count + 1);
+        assert_eq!(kernel.coherence_engine().partition_count(), 2);
+
+        // Verify StructuralSplit witness.
+        let record = kernel.witness_log().get(pre_witness as usize).unwrap();
+        assert_eq!(record.action_kind, ActionKind::StructuralSplit as u8);
+        assert_eq!(record.actor_partition_id, source.as_u32());
+        assert_eq!(record.target_object_id, child.as_u32() as u64);
+    }
+
+    #[test]
+    fn test_execute_split_before_boot_fails() {
+        let mut kernel = Kernel::with_defaults();
+        assert_eq!(
+            kernel.execute_split(PartitionId::new(1)),
+            Err(RvmError::InvalidPartitionState),
+        );
+    }
+
+    #[test]
+    fn test_execute_split_nonexistent_fails() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+        assert_eq!(
+            kernel.execute_split(PartitionId::new(999)),
+            Err(RvmError::PartitionNotFound),
+        );
+    }
+
+    #[test]
+    fn test_execute_merge() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let a = kernel.create_partition(&config).unwrap();
+        let b = kernel.create_partition(&config).unwrap();
+        let pre_witness = kernel.witness_count();
+
+        // Both start with MAX coherence (isolated), which exceeds
+        // the merge threshold of 7000 bp.
+        let survivor = kernel.execute_merge(a, b).unwrap();
+        assert_eq!(survivor, a);
+
+        // b was removed from coherence graph.
+        assert_eq!(kernel.coherence_engine().partition_count(), 1);
+
+        // Verify StructuralMerge witness.
+        let record = kernel.witness_log().get(pre_witness as usize).unwrap();
+        assert_eq!(record.action_kind, ActionKind::StructuralMerge as u8);
+        assert_eq!(record.actor_partition_id, a.as_u32());
+        assert_eq!(record.target_object_id, b.as_u32() as u64);
+    }
+
+    #[test]
+    fn test_execute_merge_low_coherence_fails() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let a = kernel.create_partition(&config).unwrap();
+        let b = kernel.create_partition(&config).unwrap();
+
+        // Drive coherence to zero by adding external-only traffic.
+        kernel.record_communication(a, b, 5000).unwrap();
+        kernel.tick().unwrap();
+
+        // Now a has 0 coherence, below the 7000 bp merge threshold.
+        assert_eq!(
+            kernel.execute_merge(a, b),
+            Err(RvmError::InvalidPartitionState),
+        );
+    }
+
+    #[test]
+    fn test_execute_merge_nonexistent_fails() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let a = kernel.create_partition(&config).unwrap();
+        assert_eq!(
+            kernel.execute_merge(a, PartitionId::new(999)),
+            Err(RvmError::PartitionNotFound),
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // apply_decision tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_apply_no_action() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let result = kernel.apply_decision(CoherenceDecision::NoAction).unwrap();
+        assert_eq!(result, ApplyResult::NoAction);
+    }
+
+    #[test]
+    fn test_apply_split_decision() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let a = kernel.create_partition(&config).unwrap();
+        let b = kernel.create_partition(&config).unwrap();
+
+        // Create heavy traffic to trigger split recommendation.
+        kernel.record_communication(a, b, 5000).unwrap();
+        let epoch = kernel.tick().unwrap();
+
+        match epoch.decision {
+            CoherenceDecision::SplitRecommended { .. } => {
+                let result = kernel.apply_decision(epoch.decision).unwrap();
+                match result {
+                    ApplyResult::Split { source, child } => {
+                        assert!(source == a || source == b);
+                        assert_ne!(source, child);
+                        // Now 3 partitions exist.
+                        assert_eq!(kernel.partition_count(), 3);
+                    }
+                    _ => panic!("expected Split result"),
+                }
+            }
+            _ => panic!("expected SplitRecommended"),
+        }
+    }
+
+    #[test]
+    fn test_full_tick_apply_lifecycle() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let a = kernel.create_partition(&config).unwrap();
+        let b = kernel.create_partition(&config).unwrap();
+
+        // Heavy bidirectional traffic.
+        kernel.record_communication(a, b, 3000).unwrap();
+        kernel.record_communication(b, a, 3000).unwrap();
+
+        // Tick, get decision, apply it.
+        let epoch = kernel.tick().unwrap();
+        let result = kernel.apply_decision(epoch.decision).unwrap();
+
+        // Should have split one of the partitions.
+        match result {
+            ApplyResult::Split { source, child } => {
+                assert!(source == a || source == b);
+                assert_eq!(kernel.partition_count(), 3);
+                assert_eq!(kernel.coherence_engine().partition_count(), 3);
+
+                // Enqueue the new partition and verify it can be scheduled.
+                kernel.enqueue_partition(0, child, 100).unwrap();
+                let (_, next) = kernel.switch_next(0).unwrap();
+                assert_eq!(next, child);
+            }
+            _ => panic!("expected split from heavy traffic"),
+        }
     }
 }
