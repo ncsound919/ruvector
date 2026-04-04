@@ -93,10 +93,11 @@ pub const CRATE_COUNT: usize = 13;
 use rvm_boot::BootTracker;
 use rvm_cap::{CapManagerConfig, CapabilityManager};
 use rvm_coherence::{CoherenceDecision, DefaultCoherenceEngine};
-use rvm_partition::PartitionManager;
+use rvm_memory::tier::{Tier, TierManager};
+use rvm_partition::{CommEdgeId, IpcManager, IpcMessage, PartitionManager};
 use rvm_sched::Scheduler;
 use rvm_types::{
-    ActionKind, PartitionConfig, PartitionId, RvmConfig, RvmError, RvmResult,
+    ActionKind, OwnedRegionId, PartitionConfig, PartitionId, RvmConfig, RvmError, RvmResult,
     WitnessRecord,
 };
 use rvm_witness::WitnessLog;
@@ -112,6 +113,18 @@ const DEFAULT_CAP_CAPACITY: usize = 256;
 
 /// Default partition table capacity.
 const DEFAULT_MAX_PARTITIONS: usize = 256;
+
+/// Default maximum IPC channels (inter-partition edges).
+const DEFAULT_MAX_IPC_CHANNELS: usize = 128;
+
+/// Default per-channel message queue depth.
+const DEFAULT_IPC_QUEUE_SIZE: usize = 16;
+
+/// Default maximum tracked memory regions for tier management.
+const DEFAULT_MAX_TIER_REGIONS: usize = 256;
+
+/// Recency decay per epoch (basis points subtracted each tick).
+const RECENCY_DECAY_PER_EPOCH: u16 = 200;
 
 /// Result of a single epoch tick, combining scheduler and coherence outputs.
 #[derive(Debug, Clone)]
@@ -159,6 +172,10 @@ pub struct Kernel {
     cap_manager: CapabilityManager<DEFAULT_CAP_CAPACITY>,
     /// Coherence engine — graph-driven partition scoring and split/merge.
     coherence: DefaultCoherenceEngine,
+    /// Inter-partition communication channels.
+    ipc: IpcManager<DEFAULT_MAX_IPC_CHANNELS, DEFAULT_IPC_QUEUE_SIZE>,
+    /// Coherence-driven memory tier manager.
+    tier_manager: TierManager<DEFAULT_MAX_TIER_REGIONS>,
     /// Boot progress tracker.
     boot: BootTracker,
     /// Kernel configuration.
@@ -198,6 +215,8 @@ impl Kernel {
             witness_log: WitnessLog::new(),
             cap_manager: CapabilityManager::new(config.cap),
             coherence: DefaultCoherenceEngine::with_defaults(Self::DEFAULT_MINCUT_BUDGET),
+            ipc: IpcManager::new(),
+            tier_manager: TierManager::new(),
             boot: BootTracker::new(),
             config: config.rvm,
             booted: false,
@@ -252,6 +271,10 @@ impl Kernel {
         // a future HAL integration will read real CPU utilisation.
         let cpu_load_estimate = 20u8;
         let decision = self.coherence.tick(cpu_load_estimate);
+
+        // Advance tier manager epoch and decay recency scores.
+        self.tier_manager.advance_epoch();
+        self.tier_manager.decay_recency(RECENCY_DECAY_PER_EPOCH);
 
         // Emit an epoch witness.
         let mut record = WitnessRecord::zeroed();
@@ -547,6 +570,180 @@ impl Kernel {
                 Ok(ApplyResult::Merged { survivor, absorbed: b })
             }
         }
+    }
+
+    // -- IPC (inter-partition communication) --
+
+    /// Create an IPC channel between two partitions.
+    ///
+    /// Also registers the communication edge in the coherence graph.
+    /// Emits a `CommEdgeCreate` witness record.
+    pub fn create_channel(
+        &mut self,
+        from: PartitionId,
+        to: PartitionId,
+    ) -> RvmResult<CommEdgeId> {
+        if !self.booted {
+            return Err(RvmError::InvalidPartitionState);
+        }
+        if self.partitions.get(from).is_none() || self.partitions.get(to).is_none() {
+            return Err(RvmError::PartitionNotFound);
+        }
+
+        let edge_id = self.ipc.create_channel(from, to)?;
+
+        // Emit witness.
+        let mut record = WitnessRecord::zeroed();
+        record.action_kind = ActionKind::CommEdgeCreate as u8;
+        record.proof_tier = 1;
+        record.actor_partition_id = from.as_u32();
+        record.target_object_id = to.as_u32() as u64;
+        self.witness_log.append(record);
+
+        Ok(edge_id)
+    }
+
+    /// Send an IPC message on an existing channel.
+    ///
+    /// Automatically increments the coherence graph edge weight for the
+    /// sender→receiver pair, feeding the mincut/split/merge decisions.
+    /// Emits an `IpcSend` witness record.
+    pub fn ipc_send(&mut self, edge_id: CommEdgeId, msg: IpcMessage) -> RvmResult<()> {
+        if !self.booted {
+            return Err(RvmError::InvalidPartitionState);
+        }
+        let sender = msg.sender;
+        let receiver = msg.receiver;
+
+        self.ipc.send(edge_id, msg)?;
+
+        // Feed the coherence graph: each message increments edge weight
+        // by 1 (the IPC manager also tracks its own cumulative weight).
+        let _ = self.coherence.record_communication(sender, receiver, 1);
+
+        // Emit witness.
+        let mut record = WitnessRecord::zeroed();
+        record.action_kind = ActionKind::IpcSend as u8;
+        record.proof_tier = 1;
+        record.actor_partition_id = sender.as_u32();
+        record.target_object_id = receiver.as_u32() as u64;
+        self.witness_log.append(record);
+
+        Ok(())
+    }
+
+    /// Receive an IPC message from a channel.
+    pub fn ipc_receive(&mut self, edge_id: CommEdgeId) -> RvmResult<Option<IpcMessage>> {
+        if !self.booted {
+            return Err(RvmError::InvalidPartitionState);
+        }
+        self.ipc.receive(edge_id)
+    }
+
+    /// Destroy an IPC channel.
+    ///
+    /// Emits a `CommEdgeDestroy` witness record.
+    pub fn destroy_channel(&mut self, edge_id: CommEdgeId) -> RvmResult<()> {
+        if !self.booted {
+            return Err(RvmError::InvalidPartitionState);
+        }
+        self.ipc.destroy_channel(edge_id)?;
+
+        // Emit witness.
+        let mut record = WitnessRecord::zeroed();
+        record.action_kind = ActionKind::CommEdgeDestroy as u8;
+        record.proof_tier = 1;
+        record.payload[0..8].copy_from_slice(&edge_id.as_u64().to_le_bytes());
+        self.witness_log.append(record);
+
+        Ok(())
+    }
+
+    /// Return the number of active IPC channels.
+    #[must_use]
+    pub fn ipc_channel_count(&self) -> usize {
+        self.ipc.channel_count()
+    }
+
+    // -- Memory tier management --
+
+    /// Register a memory region in the tier manager.
+    ///
+    /// Regions start at the given tier and are subject to coherence-driven
+    /// promotion/demotion as the system evolves.
+    pub fn register_region(
+        &mut self,
+        region_id: OwnedRegionId,
+        initial_tier: Tier,
+    ) -> RvmResult<()> {
+        self.tier_manager.register(region_id, initial_tier)
+    }
+
+    /// Record a memory access, boosting the region's recency score.
+    pub fn record_memory_access(&mut self, region_id: OwnedRegionId) -> RvmResult<()> {
+        self.tier_manager.record_access(region_id)
+    }
+
+    /// Update a region's cut value from the coherence engine.
+    ///
+    /// Call this after `tick()` to propagate coherence scores into the
+    /// tier placement decisions. The `cut_value` is the coherence score
+    /// (basis points) of the partition that owns this region.
+    pub fn update_region_cut_value(
+        &mut self,
+        region_id: OwnedRegionId,
+        cut_value: u16,
+    ) -> RvmResult<()> {
+        self.tier_manager.update_cut_value(region_id, cut_value)
+    }
+
+    /// Promote a region to a warmer tier.
+    ///
+    /// Validates residency score against promotion thresholds.
+    /// Emits a `RegionPromote` witness record on success.
+    pub fn promote_region(
+        &mut self,
+        region_id: OwnedRegionId,
+        target: Tier,
+    ) -> RvmResult<Tier> {
+        let old_tier = self.tier_manager.promote(region_id, target)?;
+
+        let mut record = WitnessRecord::zeroed();
+        record.action_kind = ActionKind::RegionPromote as u8;
+        record.proof_tier = 1;
+        record.target_object_id = region_id.as_u64();
+        record.payload[0] = old_tier.index();
+        record.payload[1] = target.index();
+        self.witness_log.append(record);
+
+        Ok(old_tier)
+    }
+
+    /// Demote a region to a colder tier.
+    ///
+    /// Emits a `RegionDemote` witness record on success.
+    pub fn demote_region(
+        &mut self,
+        region_id: OwnedRegionId,
+        target: Tier,
+    ) -> RvmResult<Tier> {
+        let old_tier = self.tier_manager.demote(region_id, target)?;
+
+        let mut record = WitnessRecord::zeroed();
+        record.action_kind = ActionKind::RegionDemote as u8;
+        record.proof_tier = 1;
+        record.target_object_id = region_id.as_u64();
+        record.payload[0] = old_tier.index();
+        record.payload[1] = target.index();
+        self.witness_log.append(record);
+
+        Ok(old_tier)
+    }
+
+    /// Query a region's current tier state.
+    #[must_use]
+    pub fn region_tier(&self, region_id: OwnedRegionId) -> Option<Tier> {
+        self.tier_manager.get(region_id).map(|s| s.tier)
     }
 
     // -- Feature-gated subsystems --
@@ -1285,6 +1482,259 @@ mod tests {
                 assert_eq!(next, child);
             }
             _ => panic!("expected split from heavy traffic"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // IPC integration tests
+    // ---------------------------------------------------------------
+
+    fn make_msg(sender: u32, receiver: u32, edge: CommEdgeId, seq: u64) -> IpcMessage {
+        IpcMessage {
+            sender: PartitionId::new(sender),
+            receiver: PartitionId::new(receiver),
+            edge_id: edge,
+            payload_len: 0,
+            msg_type: 1,
+            sequence: seq,
+            capability_hash: 0,
+        }
+    }
+
+    #[test]
+    fn test_create_channel_and_send() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let a = kernel.create_partition(&config).unwrap();
+        let b = kernel.create_partition(&config).unwrap();
+
+        let edge = kernel.create_channel(a, b).unwrap();
+        assert_eq!(kernel.ipc_channel_count(), 1);
+
+        let msg = make_msg(a.as_u32(), b.as_u32(), edge, 1);
+        kernel.ipc_send(edge, msg).unwrap();
+
+        let received = kernel.ipc_receive(edge).unwrap().unwrap();
+        assert_eq!(received.sequence, 1);
+    }
+
+    #[test]
+    fn test_ipc_feeds_coherence_graph() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let a = kernel.create_partition(&config).unwrap();
+        let b = kernel.create_partition(&config).unwrap();
+
+        let edge = kernel.create_channel(a, b).unwrap();
+
+        // Send multiple messages to build up edge weight.
+        for seq in 1..=10 {
+            let msg = make_msg(a.as_u32(), b.as_u32(), edge, seq);
+            kernel.ipc_send(edge, msg).unwrap();
+        }
+
+        // After tick, coherence should reflect the traffic.
+        kernel.tick().unwrap();
+
+        // a has only external traffic → 0 coherence.
+        assert_eq!(kernel.coherence_score(a).as_basis_points(), 0);
+        // a should have non-zero pressure.
+        assert!(kernel.coherence_pressure(a).as_fixed() > 0);
+    }
+
+    #[test]
+    fn test_ipc_witnesses() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let a = kernel.create_partition(&config).unwrap();
+        let b = kernel.create_partition(&config).unwrap();
+        let pre_create = kernel.witness_count();
+
+        let edge = kernel.create_channel(a, b).unwrap();
+        let record = kernel.witness_log().get(pre_create as usize).unwrap();
+        assert_eq!(record.action_kind, ActionKind::CommEdgeCreate as u8);
+
+        let pre_send = kernel.witness_count();
+        let msg = make_msg(a.as_u32(), b.as_u32(), edge, 1);
+        kernel.ipc_send(edge, msg).unwrap();
+        let record = kernel.witness_log().get(pre_send as usize).unwrap();
+        assert_eq!(record.action_kind, ActionKind::IpcSend as u8);
+
+        let pre_destroy = kernel.witness_count();
+        kernel.destroy_channel(edge).unwrap();
+        let record = kernel.witness_log().get(pre_destroy as usize).unwrap();
+        assert_eq!(record.action_kind, ActionKind::CommEdgeDestroy as u8);
+    }
+
+    #[test]
+    fn test_create_channel_nonexistent_partition() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let a = kernel.create_partition(&config).unwrap();
+        assert_eq!(
+            kernel.create_channel(a, PartitionId::new(999)),
+            Err(RvmError::PartitionNotFound),
+        );
+    }
+
+    #[test]
+    fn test_ipc_before_boot_fails() {
+        let mut kernel = Kernel::with_defaults();
+        assert_eq!(
+            kernel.create_channel(PartitionId::new(1), PartitionId::new(2)),
+            Err(RvmError::InvalidPartitionState),
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Memory tier integration tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_register_and_query_region() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let r = OwnedRegionId::new(1);
+        kernel.register_region(r, Tier::Warm).unwrap();
+        assert_eq!(kernel.region_tier(r), Some(Tier::Warm));
+    }
+
+    #[test]
+    fn test_promote_region() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let r = OwnedRegionId::new(1);
+        kernel.register_region(r, Tier::Warm).unwrap();
+
+        // Boost recency and cut_value to meet Hot promotion threshold (8000).
+        kernel.record_memory_access(r).unwrap(); // +1000 to 6000
+        kernel.record_memory_access(r).unwrap(); // +1000 to 7000
+        kernel.record_memory_access(r).unwrap(); // +1000 to 8000
+        kernel.update_region_cut_value(r, 1000).unwrap();
+        // residency = 8000 + 1000 = 9000 >= 8000 threshold
+
+        let pre = kernel.witness_count();
+        let old = kernel.promote_region(r, Tier::Hot).unwrap();
+        assert_eq!(old, Tier::Warm);
+        assert_eq!(kernel.region_tier(r), Some(Tier::Hot));
+
+        let record = kernel.witness_log().get(pre as usize).unwrap();
+        assert_eq!(record.action_kind, ActionKind::RegionPromote as u8);
+    }
+
+    #[test]
+    fn test_demote_region() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let r = OwnedRegionId::new(1);
+        kernel.register_region(r, Tier::Warm).unwrap();
+
+        let pre = kernel.witness_count();
+        let old = kernel.demote_region(r, Tier::Dormant).unwrap();
+        assert_eq!(old, Tier::Warm);
+        assert_eq!(kernel.region_tier(r), Some(Tier::Dormant));
+
+        let record = kernel.witness_log().get(pre as usize).unwrap();
+        assert_eq!(record.action_kind, ActionKind::RegionDemote as u8);
+    }
+
+    #[test]
+    fn test_tier_recency_decay_on_tick() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let r = OwnedRegionId::new(1);
+        kernel.register_region(r, Tier::Warm).unwrap();
+
+        // Initial recency is 5000. Each tick decays by 200.
+        kernel.tick().unwrap();
+        kernel.tick().unwrap();
+        kernel.tick().unwrap();
+        // After 3 ticks: 5000 - 3*200 = 4400
+
+        // Trying to promote to Hot should fail because
+        // residency = 4400 + 0 = 4400 < 8000 threshold.
+        assert_eq!(
+            kernel.promote_region(r, Tier::Hot),
+            Err(RvmError::CoherenceBelowThreshold),
+        );
+    }
+
+    #[test]
+    fn test_cut_value_drives_promotion() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let r = OwnedRegionId::new(1);
+        kernel.register_region(r, Tier::Warm).unwrap();
+
+        // With a high cut_value, promotion becomes possible.
+        kernel.update_region_cut_value(r, 5000).unwrap();
+        // residency = 5000 (recency) + 5000 (cut) = 10000 >= 8000
+
+        let old = kernel.promote_region(r, Tier::Hot).unwrap();
+        assert_eq!(old, Tier::Warm);
+        assert_eq!(kernel.region_tier(r), Some(Tier::Hot));
+    }
+
+    // ---------------------------------------------------------------
+    // End-to-end: IPC → coherence → tier lifecycle
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_ipc_to_coherence_to_split_lifecycle() {
+        let mut kernel = Kernel::with_defaults();
+        kernel.boot().unwrap();
+
+        let config = PartitionConfig::default();
+        let a = kernel.create_partition(&config).unwrap();
+        let b = kernel.create_partition(&config).unwrap();
+
+        // Create IPC channel and send enough messages to trigger split.
+        let edge = kernel.create_channel(a, b).unwrap();
+        for seq in 1..=16 {
+            let msg = make_msg(a.as_u32(), b.as_u32(), edge, seq);
+            kernel.ipc_send(edge, msg).unwrap();
+        }
+
+        // Tick → coherence recompute → split recommendation.
+        let epoch = kernel.tick().unwrap();
+
+        match epoch.decision {
+            CoherenceDecision::SplitRecommended { .. } => {
+                // Apply the split.
+                let result = kernel.apply_decision(epoch.decision).unwrap();
+                match result {
+                    ApplyResult::Split { child, .. } => {
+                        // Register memory for the child.
+                        let r = OwnedRegionId::new(100);
+                        kernel.register_region(r, Tier::Warm).unwrap();
+
+                        // Feed coherence score into tier cut_value.
+                        let score = kernel.coherence_score(child);
+                        kernel
+                            .update_region_cut_value(r, score.as_basis_points())
+                            .unwrap();
+
+                        // Verify the partition count grew.
+                        assert_eq!(kernel.partition_count(), 3);
+                        assert_eq!(kernel.coherence_engine().partition_count(), 3);
+                    }
+                    _ => panic!("expected split"),
+                }
+            }
+            _ => panic!("expected SplitRecommended after heavy IPC traffic"),
         }
     }
 }
