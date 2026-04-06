@@ -1,0 +1,28 @@
+[package]
+name = "ruvector-diskann"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DiskANN/Vamana — SSD-friendly approximate nearest neighbor search with product quantization"
+
+[features]
+default = []
+gpu = []  # Feature flag for GPU acceleration (CUDA/Metal stubs)
+simd = ["simsimd"]
+
+[dependencies]
+memmap2 = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+parking_lot = "0.12"
+bytemuck = { version = "1.14", features = ["derive"] }
+simsimd = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3.9"
