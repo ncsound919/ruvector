@@ -55,4 +55,4 @@ pub use bundle::{Generation, RuLakeBundle};
 pub use cache::{CacheStats, VectorCache};
 pub use error::{Result, RuLakeError};
 pub use fs_backend::FsBackend;
-pub use lake::{RuLake, SearchResult};
+pub use lake::{RefreshResult, RuLake, SearchResult};

@@ -21,6 +21,19 @@ pub struct SearchResult {
     pub score: f32,
 }
 
+/// Outcome of [`RuLake::refresh_from_bundle_dir`]. A cache sidecar
+/// daemon decides what to log / alert on based on which variant it
+/// sees — `Invalidated` is the normal "bundle just rotated" signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshResult {
+    /// The cache pointer's witness matches the on-disk bundle.
+    UpToDate,
+    /// Witnesses differed; the cache entry for this key was dropped.
+    Invalidated,
+    /// No sidecar was found at the target directory.
+    BundleMissing,
+}
+
 /// ruLake entry point. Cheap to clone (everything is behind `Arc`).
 #[derive(Clone)]
 pub struct RuLake {
@@ -133,6 +146,45 @@ impl RuLake {
             self.cache.rerank_factor(),
         )?;
         bundle.write_to_dir(dir)
+    }
+
+    /// Refresh the cache for `key` against a published bundle sidecar in
+    /// `dir`. This is the reader side of the sidecar protocol: a cache
+    /// daemon watches a publish directory (e.g. a GCS prefix mounted
+    /// locally), and when a fresh `table.rulake.json` lands, calls this
+    /// to invalidate stale entries so the next search primes against
+    /// the new generation.
+    ///
+    /// Returns:
+    /// - `RefreshResult::UpToDate` when the on-disk bundle's witness
+    ///   matches what the cache currently points at — nothing to do.
+    /// - `RefreshResult::Invalidated` when the witnesses differ; the
+    ///   cache pointer for `key` has been dropped and the next search
+    ///   will re-prime.
+    /// - `RefreshResult::BundleMissing` when the sidecar isn't there —
+    ///   caller decides whether that's expected (not yet published) or
+    ///   an error.
+    ///
+    /// Rejects a tampered sidecar with `InvalidParameter` so a corrupt
+    /// publish doesn't silently poison the cache.
+    pub fn refresh_from_bundle_dir(
+        &self,
+        key: &CacheKey,
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<RefreshResult> {
+        let dir = dir.as_ref();
+        let path = dir.join(crate::RuLakeBundle::SIDECAR_FILENAME);
+        if !path.exists() {
+            return Ok(RefreshResult::BundleMissing);
+        }
+        let bundle = crate::RuLakeBundle::read_from_dir(dir)?;
+        let current = self.cache.witness_of(key);
+        if current.as_deref() == Some(bundle.rvf_witness.as_str()) {
+            Ok(RefreshResult::UpToDate)
+        } else {
+            self.cache.invalidate(key);
+            Ok(RefreshResult::Invalidated)
+        }
     }
 
     /// Search a single (backend, collection) pair. Handles cache

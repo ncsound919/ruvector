@@ -701,3 +701,63 @@ fn publish_bundle_roundtrips_through_disk() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn refresh_from_bundle_dir_reports_all_three_states() {
+    use ruvector_rulake::RefreshResult;
+
+    let mut tmp = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    tmp.push(format!("rulake-refresh-{}-{}", std::process::id(), nanos));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let backend = Arc::new(LocalBackend::new("svc"));
+    backend
+        .put_collection("c", 2, vec![1, 2], vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+        .unwrap();
+    let lake = RuLake::new(20, 42);
+    lake.register_backend(backend.clone()).unwrap();
+    let key = ("svc".to_string(), "c".to_string());
+
+    // Case 1 — no sidecar yet.
+    assert_eq!(
+        lake.refresh_from_bundle_dir(&key, &tmp).unwrap(),
+        RefreshResult::BundleMissing
+    );
+
+    // Prime the cache; publish matching bundle; refresh should be UpToDate.
+    lake.search_one("svc", "c", &[1.0, 0.0], 1).unwrap();
+    lake.publish_bundle(&key, &tmp).unwrap();
+    assert_eq!(
+        lake.refresh_from_bundle_dir(&key, &tmp).unwrap(),
+        RefreshResult::UpToDate
+    );
+
+    // Bump the backend so its current witness diverges from what's on
+    // disk, then write a *new* bundle reflecting the bump. The cache
+    // still points at the old witness until we refresh.
+    backend.append("c", 99, vec![2.0, 0.0]).unwrap();
+    lake.publish_bundle(&key, &tmp).unwrap();
+    let cache_witness_before = lake.cache_witness_of(&key);
+    assert!(cache_witness_before.is_some(), "expected a cache pointer");
+    assert_eq!(
+        lake.refresh_from_bundle_dir(&key, &tmp).unwrap(),
+        RefreshResult::Invalidated
+    );
+    // After invalidation, the cache pointer for this key should be gone.
+    assert_eq!(lake.cache_witness_of(&key), None);
+
+    // A post-refresh search re-primes from the (now-updated) backend.
+    lake.search_one("svc", "c", &[2.0, 0.0], 1).unwrap();
+    let after = lake.cache_witness_of(&key).unwrap();
+    assert_ne!(
+        Some(after.clone()),
+        cache_witness_before,
+        "post-refresh witness should differ from pre-refresh"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
