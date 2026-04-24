@@ -763,6 +763,50 @@ fn refresh_from_bundle_dir_reports_all_three_states() {
 }
 
 #[test]
+fn cache_stats_by_backend_attributes_hits_to_the_right_backend() {
+    // Two backends; query A a lot, query B once. Per-backend stats
+    // must report A with far more hits than B.
+    let d = 8;
+    let a = Arc::new(LocalBackend::new("hot"));
+    a.put_collection("c", d, vec![1], vec![vec![0.0; d]])
+        .unwrap();
+    let b = Arc::new(LocalBackend::new("cold"));
+    b.put_collection("c", d, vec![1], vec![vec![0.0; d]])
+        .unwrap();
+
+    let lake = RuLake::new(20, 42).with_consistency(Consistency::Eventual { ttl_ms: 60_000 });
+    lake.register_backend(a).unwrap();
+    lake.register_backend(b).unwrap();
+
+    // Prime both.
+    lake.search_one("hot", "c", &vec![0.0f32; d], 1).unwrap();
+    lake.search_one("cold", "c", &vec![0.0f32; d], 1).unwrap();
+
+    // Hammer the hot backend.
+    for _ in 0..50 {
+        lake.search_one("hot", "c", &vec![0.0f32; d], 1).unwrap();
+    }
+
+    let per = lake.cache_stats_by_backend();
+    let hot = per.get("hot").expect("hot backend stats missing");
+    let cold = per.get("cold").expect("cold backend stats missing");
+    assert!(
+        hot.hits >= 50 && cold.hits == 0,
+        "attribution wrong: hot={} cold={}",
+        hot.hits,
+        cold.hits
+    );
+    // Hit rate makes sense: hot is all hits (after prime).
+    assert!(
+        hot.hit_rate().unwrap() >= 0.95,
+        "hot hit_rate should be ≥ 0.95, got {:?}",
+        hot.hit_rate()
+    );
+    assert_eq!(hot.primes, 1);
+    assert_eq!(cold.primes, 1);
+}
+
+#[test]
 fn search_batch_matches_per_query_results() {
     // search_batch must return the same top-k as calling search_one
     // for each query individually. Byte-exact required: same seed,

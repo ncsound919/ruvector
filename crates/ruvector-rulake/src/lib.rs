@@ -52,7 +52,7 @@ pub mod lake;
 
 pub use backend::{BackendAdapter, BackendId, CollectionId, LocalBackend, PulledBatch};
 pub use bundle::{Generation, RuLakeBundle};
-pub use cache::{CacheStats, VectorCache};
+pub use cache::{CacheStats, PerBackendStats, VectorCache};
 pub use error::{Result, RuLakeError};
 pub use fs_backend::FsBackend;
 pub use lake::{RefreshResult, RuLake, SearchResult};

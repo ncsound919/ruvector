@@ -110,6 +110,33 @@ impl CacheStats {
     }
 }
 
+/// Per-backend counters. Lets operators see which backend is hot
+/// (high hit_rate) vs cold (high miss+prime cost) without having to
+/// attribute global stats back to individual backends.
+///
+/// Used by [`VectorCache::stats_by_backend`] / [`RuLake::cache_stats_by_backend`].
+#[derive(Debug, Clone, Default)]
+pub struct PerBackendStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub primes: u64,
+    pub invalidations: u64,
+    pub shared_hits: u64,
+}
+
+impl PerBackendStats {
+    /// Cache hit rate over `hits + misses` for this backend. `None`
+    /// when no coherence-checked searches have run against it yet.
+    pub fn hit_rate(&self) -> Option<f64> {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            None
+        } else {
+            Some(self.hits as f64 / total as f64)
+        }
+    }
+}
+
 /// External lookup key: `(backend_id, collection_id)`.
 pub type CacheKey = (BackendId, CollectionId);
 
@@ -155,6 +182,15 @@ struct CacheState {
     /// cache-key → last time the witness check ran (for Eventual mode)
     last_checked: HashMap<CacheKey, Instant>,
     stats: CacheStats,
+    /// Per-backend counters. Populated lazily on the first event per
+    /// backend id.
+    per_backend: HashMap<BackendId, PerBackendStats>,
+}
+
+impl CacheState {
+    fn per_backend_mut(&mut self, backend: &str) -> &mut PerBackendStats {
+        self.per_backend.entry(backend.to_string()).or_default()
+    }
 }
 
 impl VectorCache {
@@ -165,6 +201,7 @@ impl VectorCache {
                 pointers: HashMap::new(),
                 last_checked: HashMap::new(),
                 stats: CacheStats::default(),
+                per_backend: HashMap::new(),
             })),
             rerank_factor,
             rotation_seed,
@@ -192,6 +229,14 @@ impl VectorCache {
 
     pub fn stats(&self) -> CacheStats {
         self.inner.lock().unwrap().stats.clone()
+    }
+
+    /// Per-backend counters. Populated lazily on first activity
+    /// against a given backend id — empty backends are not in the
+    /// map. Use to see which backend is hot vs cold without having
+    /// to attribute global counters manually.
+    pub fn stats_by_backend(&self) -> HashMap<BackendId, PerBackendStats> {
+        self.inner.lock().unwrap().per_backend.clone()
     }
 
     /// Compress a pulled batch into a RaBitQ index and associate it with
@@ -240,6 +285,7 @@ impl VectorCache {
         }
         inner.entries.insert(witness.clone(), entry);
         inner.stats.primes += 1;
+        inner.per_backend_mut(&key.0).primes += 1;
         let prime_ms = prime_start.elapsed().as_secs_f64() * 1000.0;
         inner.stats.total_prime_ms += prime_ms;
         inner.stats.last_prime_ms = prime_ms;
@@ -285,6 +331,7 @@ impl VectorCache {
         witness: WitnessKey,
         shared: bool,
     ) -> crate::Result<()> {
+        let backend_id = key.0.clone();
         // If this key already points somewhere, decrement the old entry.
         if let Some(old_w) = inner.pointers.remove(&key) {
             if let Some(e) = inner.entries.get_mut(&old_w) {
@@ -292,6 +339,7 @@ impl VectorCache {
                 if e.refcount == 0 {
                     inner.entries.remove(&old_w);
                     inner.stats.invalidations += 1;
+                    inner.per_backend_mut(&backend_id).invalidations += 1;
                 }
             }
         }
@@ -303,6 +351,7 @@ impl VectorCache {
         inner.last_checked.insert(key, Instant::now());
         if shared {
             inner.stats.shared_hits += 1;
+            inner.per_backend_mut(&backend_id).shared_hits += 1;
         }
         Ok(())
     }
@@ -320,6 +369,7 @@ impl VectorCache {
                 }
             }
             inner.stats.invalidations += 1;
+            inner.per_backend_mut(&key.0).invalidations += 1;
         }
         inner.last_checked.remove(key);
     }
@@ -356,11 +406,15 @@ impl VectorCache {
         inner.entries.get(w).map(|e| e.dim)
     }
 
-    pub(crate) fn mark_hit(&self) {
-        self.inner.lock().unwrap().stats.hits += 1;
+    pub(crate) fn mark_hit(&self, key: &CacheKey) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.stats.hits += 1;
+        inner.per_backend_mut(&key.0).hits += 1;
     }
-    pub(crate) fn mark_miss(&self) {
-        self.inner.lock().unwrap().stats.misses += 1;
+    pub(crate) fn mark_miss(&self, key: &CacheKey) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.stats.misses += 1;
+        inner.per_backend_mut(&key.0).misses += 1;
     }
 
     /// Run the search against the cached entry for `key`. Caller must

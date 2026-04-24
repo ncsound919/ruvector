@@ -99,6 +99,17 @@ impl RuLake {
         self.cache.stats()
     }
 
+    /// Per-backend cache stats. Empty backends are not in the map.
+    /// Lets operators see which backend is hot (high hit_rate) vs
+    /// cold (high miss+prime) without having to attribute global
+    /// counters manually. Useful for capacity planning and kernel
+    /// dispatch decisions (ADR-157).
+    pub fn cache_stats_by_backend(
+        &self,
+    ) -> std::collections::HashMap<crate::backend::BackendId, crate::cache::PerBackendStats> {
+        self.cache.stats_by_backend()
+    }
+
     /// What witness resolves from a `(backend, collection)` pair?
     /// Useful for diagnostics and cross-backend cache-sharing tests.
     pub fn cache_witness_of(&self, key: &CacheKey) -> Option<String> {
@@ -347,7 +358,7 @@ impl RuLake {
     /// 4. Witness not in the pool → pull + prime.
     fn ensure_fresh(&self, key: &CacheKey) -> Result<()> {
         if self.cache.can_skip_check(key, self.consistency) {
-            self.cache.mark_hit();
+            self.cache.mark_hit(key);
             return Ok(());
         }
 
@@ -361,14 +372,14 @@ impl RuLake {
 
         if self.cache.witness_of(key).as_deref() == Some(target_witness.as_str()) {
             // Case 2: pointer up-to-date.
-            self.cache.mark_hit();
+            self.cache.mark_hit(key);
             self.cache.touch(key);
             return Ok(());
         }
 
         // Cases 3 + 4 are handled in `prime`: it reuses an existing
         // entry for the target witness if present, or builds a new one.
-        self.cache.mark_miss();
+        self.cache.mark_miss(key);
         let batch = backend.pull_vectors(&key.1)?;
         self.cache.prime(key.clone(), target_witness, batch)?;
         Ok(())
