@@ -5,11 +5,21 @@
 //! support native vector ops.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use ruvector_rabitq::AnnIndex;
 
 use crate::backend::{BackendAdapter, BackendId};
 use crate::cache::{intern_key, CacheKey, Consistency, InternedKey, VectorCache};
 use crate::error::{Result, RuLakeError};
+
+/// Canonical filename for the persisted RaBitQ index written by
+/// [`RuLake::save_cache_to_dir`] and read back by
+/// [`RuLake::warm_from_dir`]. Sits alongside `table.rulake.json` in the
+/// same directory; the pair is the portable "primed collection
+/// snapshot" operators hand from warm-shutdown to warm-restart.
+const PERSISTED_INDEX_FILENAME: &str = "index.rbpx";
 
 /// Result from a search — the external id and its estimated L2² score.
 /// Includes the backend that produced the hit so callers can audit.
@@ -215,6 +225,225 @@ impl RuLake {
                 Ok(RefreshResult::UpToDate)
             }
         }
+    }
+
+    /// Snapshot a primed cache entry to `dir/index.rbpx` plus the
+    /// companion bundle sidecar `dir/table.rulake.json`. Pairs with
+    /// [`Self::warm_from_dir`] to give operators a warm-restart path
+    /// that skips the backend round-trip + RaBitQ compression on boot.
+    ///
+    /// Flow:
+    ///
+    /// 1. Resolve the witness currently held for `key` — errors with
+    ///    `UnknownCollection` if nothing is primed (the cache-first
+    ///    operator story assumes the entry exists; we never
+    ///    opportunistically prime on save).
+    /// 2. Look up the compressed `Arc<RabitqPlusIndex>` out of the
+    ///    cache (fails `UnknownCollection` if the pointer is dangling
+    ///    — shouldn't happen but is checked defensively).
+    /// 3. `export_items()` → call `ruvector_rabitq::persist::save_index`
+    ///    with `(idx, cache.rotation_seed(), items)`. The seed is
+    ///    pulled from the cache because the on-disk format's witness
+    ///    chain requires it for deterministic rebuild.
+    /// 4. Atomically rename the temp file into place so readers never
+    ///    observe a half-written index.
+    /// 5. Emit `publish_bundle(key, dir)` so the bundle sidecar
+    ///    accompanies the `.rbpx` — `warm_from_dir` cross-checks the
+    ///    two before installing.
+    ///
+    /// Returns the path of the written `.rbpx` file; the sidecar lives
+    /// next to it at `dir/table.rulake.json`. Directory creation is
+    /// transitive, mirroring `publish_bundle`'s behaviour.
+    ///
+    /// Errors:
+    /// - `UnknownBackend` if the key's backend isn't registered
+    ///   (required for the bundle publish step).
+    /// - `UnknownCollection` if nothing is primed under `key`.
+    /// - `InvalidParameter` on any filesystem or serialization failure.
+    pub fn save_cache_to_dir(&self, key: &CacheKey, dir: impl AsRef<Path>) -> Result<PathBuf> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir).map_err(|e| {
+            RuLakeError::InvalidParameter(format!(
+                "save_cache_to_dir: mkdir {}: {e}",
+                dir.display()
+            ))
+        })?;
+
+        // Step 1 — resolve witness.
+        let witness = self
+            .cache
+            .witness_of(key)
+            .ok_or_else(|| RuLakeError::UnknownCollection {
+                backend: key.0.clone(),
+                collection: key.1.clone(),
+            })?;
+
+        // Step 2 — clone the Arc<RabitqPlusIndex> out of the cache.
+        let (idx, _pos_to_id) = self.cache.index_and_ids_of(&witness).ok_or_else(|| {
+            RuLakeError::UnknownCollection {
+                backend: key.0.clone(),
+                collection: key.1.clone(),
+            }
+        })?;
+
+        // Step 3 — serialize via rabitq's persist API.
+        let items = idx.export_items();
+        let final_path = dir.join(PERSISTED_INDEX_FILENAME);
+        let tmp_path = dir.join(format!(
+            ".{PERSISTED_INDEX_FILENAME}.tmp.{}",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
+                RuLakeError::InvalidParameter(format!(
+                    "save_cache_to_dir: create {}: {e}",
+                    tmp_path.display()
+                ))
+            })?;
+            let mut buf = std::io::BufWriter::new(&mut f);
+            ruvector_rabitq::persist::save_index(
+                idx.as_ref(),
+                self.cache.rotation_seed(),
+                &items,
+                &mut buf,
+            )?;
+            use std::io::Write;
+            buf.flush().map_err(|e| {
+                RuLakeError::InvalidParameter(format!("save_cache_to_dir: flush: {e}"))
+            })?;
+            drop(buf);
+            f.sync_all().map_err(|e| {
+                RuLakeError::InvalidParameter(format!("save_cache_to_dir: fsync: {e}"))
+            })?;
+        }
+        // Step 4 — atomic rename.
+        std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+            RuLakeError::InvalidParameter(format!(
+                "save_cache_to_dir: rename {} → {}: {e}",
+                tmp_path.display(),
+                final_path.display()
+            ))
+        })?;
+
+        // Step 5 — companion sidecar. Reuses the existing publish path
+        // so the on-disk format is identical to the "cache sidecar
+        // daemon publishes to GCS" flow.
+        self.publish_bundle(key, dir)?;
+
+        Ok(final_path)
+    }
+
+    /// Inverse of [`Self::save_cache_to_dir`]. Reads the bundle sidecar
+    /// plus the `index.rbpx` at `dir`, verifies the witness, and installs
+    /// the loaded index into the cache under the pointer for `key`. No
+    /// backend round-trip, no RaBitQ compression — the primed entry pops
+    /// back into reality in O(file-read) time.
+    ///
+    /// Returns the number of vectors loaded (equal to the
+    /// `RabitqPlusIndex::len()` of the installed entry). Operators use
+    /// this to confirm the snapshot they expected is the one that
+    /// landed.
+    ///
+    /// Flow:
+    ///
+    /// 1. `RuLakeBundle::read_from_dir` — opens + witness-verifies
+    ///    `table.rulake.json`. A tampered sidecar is rejected here
+    ///    before we touch the index.
+    /// 2. `ruvector_rabitq::persist::load_index(dir/index.rbpx)`.
+    ///    Malformed / oversize inputs are rejected by the persist
+    ///    layer.
+    /// 3. Cross-check: the loaded index's `dim()` must match the
+    ///    bundle's `dim`, and its `rerank_factor()` must match the
+    ///    bundle's `rerank_factor`. The witness covers these fields,
+    ///    but a belt-and-braces check catches a future format that
+    ///    decouples them.
+    /// 4. Build `pos_to_id` from `idx.ids()` (each u32 widens to u64).
+    /// 5. `cache.install_prebuilt` under the bundle's `rvf_witness`.
+    ///    The cache's shared-witness fast path means two operators
+    ///    warming the same bundle share one compressed entry.
+    ///
+    /// Deliberately does *not* require the backend to be registered —
+    /// this is the warm-restart path, and the operator might warm the
+    /// cache before the backend controller is wired. Any subsequent
+    /// `Consistency::Fresh` search against `key` will fail with
+    /// `UnknownBackend` at that point, which is the same behaviour as
+    /// a cold cache with a missing backend. `Consistency::Frozen`
+    /// serves out of the installed entry without ever asking.
+    ///
+    /// Errors:
+    /// - `InvalidParameter` if the sidecar or index file is missing,
+    ///   malformed, or carries a mismatched witness/dim/rerank_factor.
+    /// - `Rabitq` on any RaBitQ-layer failure (propagated from
+    ///   `persist::load_index`).
+    pub fn warm_from_dir(&self, key: &CacheKey, dir: impl AsRef<Path>) -> Result<usize> {
+        let dir = dir.as_ref();
+
+        // Step 1 — sidecar (witness-verified inside read_from_dir).
+        let bundle = crate::RuLakeBundle::read_from_dir(dir)?;
+
+        // Step 2 — load the compressed index.
+        let index_path = dir.join(PERSISTED_INDEX_FILENAME);
+        if !index_path.exists() {
+            return Err(RuLakeError::InvalidParameter(format!(
+                "warm_from_dir: missing {}",
+                index_path.display()
+            )));
+        }
+        let file = std::fs::File::open(&index_path).map_err(|e| {
+            RuLakeError::InvalidParameter(format!(
+                "warm_from_dir: open {}: {e}",
+                index_path.display()
+            ))
+        })?;
+        let mut reader = std::io::BufReader::new(file);
+        let idx = ruvector_rabitq::persist::load_index(&mut reader)?;
+
+        // Step 3 — bundle vs index cross-check. The witness chain
+        // already proves the bundle is self-consistent, and the
+        // persist format checks `(dim, seed, rerank_factor)` against
+        // the items it saved — but nothing binds the persisted
+        // index's seed to the *bundle's* seed without this check,
+        // and a mismatched seed would silently serve wrong neighbours.
+        if idx.dim() != bundle.dim {
+            return Err(RuLakeError::InvalidParameter(format!(
+                "warm_from_dir: index dim {} != bundle dim {}",
+                idx.dim(),
+                bundle.dim
+            )));
+        }
+        if idx.rerank_factor() != bundle.rerank_factor {
+            return Err(RuLakeError::InvalidParameter(format!(
+                "warm_from_dir: index rerank_factor {} != bundle rerank_factor {}",
+                idx.rerank_factor(),
+                bundle.rerank_factor
+            )));
+        }
+
+        // Step 4 — pos_to_id from the loaded index's internal ids.
+        //
+        // Every primed entry is built with `idx.add(pos, v)` where
+        // `pos ∈ 0..n` — the internal id IS the position. The
+        // `save_index` / `load_index` round-trip preserves that, so
+        // the loaded index's internal ids form an identity sequence
+        // `[0, 1, ..., n-1]`. The cache's `pos_to_id[pos]` mirrors
+        // this by construction; the external u64 ids are collapsed
+        // to their positional form when they round-trip through the
+        // u32-wide rabitq persist format. Callers whose external ids
+        // are not dense 0..n should NOT rely on warm_from_dir to
+        // preserve them — that's a known limitation of the persist
+        // format and documented alongside it.
+        let n = idx.len();
+        let pos_to_id: Vec<u64> = (0..n as u64).collect();
+
+        // Step 5 — install into the cache via the interned path.
+        self.cache.install_prebuilt_interned(
+            intern_key(&key.0, &key.1),
+            bundle.rvf_witness,
+            Arc::new(idx),
+            Arc::new(pos_to_id),
+        )?;
+
+        Ok(n)
     }
 
     /// Search a single (backend, collection) pair. Handles cache

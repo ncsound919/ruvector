@@ -92,6 +92,12 @@ pub struct CacheStats {
     /// Most-recent prime duration in milliseconds (useful to detect
     /// drift between warm primes and the very first miss).
     pub last_prime_ms: f64,
+    /// Incremented each time a pre-built index is installed via
+    /// [`VectorCache::install_prebuilt`] — i.e. a warm-from-disk
+    /// rehydrate that did NOT round-trip to the backend. Deliberately
+    /// separate from `primes` so operators can tell cold-prime cost
+    /// (pull+compress) apart from warm-restart cost (mmap+install).
+    pub warm_installs: u64,
 }
 
 impl CacheStats {
@@ -452,6 +458,90 @@ impl VectorCache {
         self.prime_interned(interned, witness, batch)
     }
 
+    /// Install a pre-built `RabitqPlusIndex` under `witness` and install
+    /// the pointer `key → witness` — the warm-from-disk counterpart to
+    /// [`prime`]. No backend round-trip, no RaBitQ compression: the
+    /// caller supplies an already-compressed index (typically loaded via
+    /// `ruvector_rabitq::persist::load_index`) together with the
+    /// `pos_to_id` mapping the cache would otherwise derive from
+    /// `PulledBatch::ids`.
+    ///
+    /// Semantics:
+    ///
+    /// - If `witness` is already cached (another pointer brought it in),
+    ///   the supplied `idx` is dropped and the existing entry is shared
+    ///   — this is the same "witness already present" fast path `prime`
+    ///   uses, so two operators warming the same bundle from different
+    ///   sidecars see one compressed entry with refcount 2.
+    /// - If `witness` is new, the entry is inserted, `warm_installs` is
+    ///   bumped, and `primes` / prime-duration counters are left alone
+    ///   (this is not a prime — no compression ran).
+    /// - Either way the pointer `key → witness` is installed and its
+    ///   refcount bumped.
+    ///
+    /// The LRU cap honours warm installs identically to prime installs:
+    /// an oversize cache still evicts unpinned entries.
+    pub fn install_prebuilt(
+        &self,
+        key: CacheKey,
+        witness: WitnessKey,
+        idx: Arc<RabitqPlusIndex>,
+        pos_to_id: Arc<Vec<u64>>,
+    ) -> crate::Result<()> {
+        let interned = intern_cache_key(&key);
+        self.install_prebuilt_interned(interned, witness, idx, pos_to_id)
+    }
+
+    pub(crate) fn install_prebuilt_interned(
+        &self,
+        key: InternedKey,
+        witness: WitnessKey,
+        idx: Arc<RabitqPlusIndex>,
+        pos_to_id: Arc<Vec<u64>>,
+    ) -> crate::Result<()> {
+        // Defensive consistency check before we touch state: the caller
+        // must hand us a `pos_to_id` whose length matches the index.
+        // A mismatch means the sidecar and the .rbpx drifted, and
+        // serving through that would map positions to the wrong ids
+        // without any visible error until a query returns garbage.
+        if pos_to_id.len() != idx.len() {
+            return Err(crate::RuLakeError::InvalidParameter(format!(
+                "install_prebuilt: pos_to_id.len()={} but index.len()={}",
+                pos_to_id.len(),
+                idx.len()
+            )));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        // Fast path: target witness already cached — just point and
+        // bookkeep as a shared install. `shared=true` bumps
+        // `shared_hits` — but this is a warm install, not a coherence
+        // event, so we route through `inner_install_pointer_unlocked`
+        // with `shared=false` to avoid polluting coherence stats.
+        if inner.entries.contains_key(&witness) {
+            return self.inner_install_pointer_unlocked(&mut inner, key, witness, false);
+        }
+        let dim = idx.dim();
+        let entry = CacheEntry {
+            index: idx,
+            dim,
+            generation_hint: None,
+            last_checked: Instant::now(),
+            last_used: Instant::now(),
+            pos_to_id,
+            refcount: 0, // install_pointer bumps it
+        };
+        inner.entries.insert(witness.clone(), entry);
+        inner.stats.warm_installs += 1;
+        // NOTE: we intentionally do NOT bump `primes` / prime timers —
+        // a warm install did no compression work, so conflating the
+        // two would hide cold-start cost from operators.
+        let rc = self.inner_install_pointer_unlocked(&mut inner, key, witness, false);
+        if let Some(cap) = self.max_entries {
+            self.evict_lru_if_over(&mut inner, cap);
+        }
+        rc
+    }
+
     /// Evict the least-recently-used unpinned entry until we're at or
     /// below `cap`. Pinned entries are skipped; in the worst case every
     /// entry is pinned and we can't evict anyone — that's by design.
@@ -564,6 +654,22 @@ impl VectorCache {
     /// Differs from `pointers.len()` when witnesses are shared.
     pub fn entry_count(&self) -> usize {
         self.inner.lock().unwrap().entries.len()
+    }
+
+    /// Clone out the `Arc<RabitqPlusIndex>` backing `witness` and its
+    /// `Arc<Vec<u64>>` pos→id map — used by the `save_cache_to_dir`
+    /// path in `RuLake` to serialize a primed entry without exposing
+    /// `CacheEntry` publicly. Returns `None` when the witness is not
+    /// currently cached.
+    pub(crate) fn index_and_ids_of(
+        &self,
+        witness: &str,
+    ) -> Option<(Arc<RabitqPlusIndex>, Arc<Vec<u64>>)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .entries
+            .get(witness)
+            .map(|e| (Arc::clone(&e.index), Arc::clone(&e.pos_to_id)))
     }
 
     pub fn dim_of(&self, key: &CacheKey) -> Option<usize> {

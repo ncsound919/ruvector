@@ -1144,6 +1144,111 @@ fn adaptive_per_shard_rerank_preserves_recall() {
 }
 
 #[test]
+fn warm_from_dir_skips_backend_and_returns_bit_exact_results() {
+    // End-to-end cache-persistence round-trip:
+    //
+    //   1. Prime a RuLake with 50 vectors (D=8).
+    //   2. Run a query, capture the results (ids + score bits).
+    //   3. `save_cache_to_dir` — write `index.rbpx` + `table.rulake.json`.
+    //   4. Build a FRESH RuLake (no backend registered).
+    //   5. `warm_from_dir` — install the snapshot without touching any
+    //      backend, so `primes == 0` on the fresh lake.
+    //   6. Re-run the query; bit-identical ids and f32 bits required.
+    //
+    // The fresh lake uses `Consistency::Frozen` because it has no
+    // backend to coherence-check against — Frozen serves the installed
+    // entry without ever dialing out. `warm_installs == 1` confirms
+    // the new counter fires once per warm install. `primes == 0`
+    // confirms no backend round-trip happened on the serving side.
+    let d = 8;
+    let n = 50;
+    let rerank = 20;
+    let seed = 1234;
+
+    // Seed-clustered data so scores have structure — a flat dataset
+    // would let ties dominate and mask a rerank-ordering regression.
+    let data = clustered(n, d, 5, seed);
+    let backend = Arc::new(LocalBackend::new("warm-src"));
+    backend
+        .put_collection("snap", d, (0..n as u64).collect(), data.clone())
+        .unwrap();
+
+    let src = RuLake::new(rerank, seed);
+    src.register_backend(backend).unwrap();
+    let key = ("warm-src".to_string(), "snap".to_string());
+
+    // Step 1+2: prime + capture the reference result.
+    let query = clustered(1, d, 5, seed ^ 0xdeadbeef)[0].clone();
+    let ref_hits = src.search_one("warm-src", "snap", &query, 5).unwrap();
+    assert_eq!(ref_hits.len(), 5);
+    // Capture both ids and raw f32 bits for the bit-exact compare.
+    let ref_ids: Vec<u64> = ref_hits.iter().map(|r| r.id).collect();
+    let ref_score_bits: Vec<u32> = ref_hits.iter().map(|r| r.score.to_bits()).collect();
+
+    // Step 3: snapshot to disk.
+    let tmp = std::env::temp_dir().join(format!(
+        "rulake-warm-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let written = src.save_cache_to_dir(&key, &tmp).unwrap();
+    assert_eq!(written.file_name().unwrap(), "index.rbpx");
+    // Sidecar must exist alongside.
+    assert!(tmp
+        .join(ruvector_rulake::RuLakeBundle::SIDECAR_FILENAME)
+        .exists());
+
+    // Step 4: fresh RuLake, no backend. Same seed + rerank_factor so
+    // the reconstructed RaBitQ codes are bit-identical to the source.
+    // Frozen consistency so the post-warm search never asks for a
+    // backend.
+    let fresh = RuLake::new(rerank, seed).with_consistency(Consistency::Frozen);
+
+    // Sanity precondition: no primes, no warm installs before we load.
+    let s_pre = fresh.cache_stats();
+    assert_eq!(s_pre.primes, 0);
+    assert_eq!(s_pre.warm_installs, 0);
+
+    // Step 5: warm from disk.
+    let loaded_n = fresh.warm_from_dir(&key, &tmp).unwrap();
+    assert_eq!(loaded_n, n, "warm_from_dir must load every vector");
+
+    let s_after_warm = fresh.cache_stats();
+    assert_eq!(
+        s_after_warm.warm_installs, 1,
+        "warm_installs must tick exactly once on warm_from_dir"
+    );
+    assert_eq!(
+        s_after_warm.primes, 0,
+        "warm_from_dir must not prime (no backend pull)"
+    );
+
+    // Step 6: re-run the query against the fresh lake.
+    let warm_hits = fresh.search_one("warm-src", "snap", &query, 5).unwrap();
+    assert_eq!(warm_hits.len(), ref_hits.len());
+    let warm_ids: Vec<u64> = warm_hits.iter().map(|r| r.id).collect();
+    let warm_score_bits: Vec<u32> = warm_hits.iter().map(|r| r.score.to_bits()).collect();
+
+    assert_eq!(warm_ids, ref_ids, "ids must be byte-identical after warm");
+    assert_eq!(
+        warm_score_bits, ref_score_bits,
+        "f32 score bits must be byte-identical after warm"
+    );
+
+    // Final stats: still zero primes, still one warm_install. Search
+    // didn't round-trip to any backend (there isn't one).
+    let s_final = fresh.cache_stats();
+    assert_eq!(s_final.primes, 0);
+    assert_eq!(s_final.warm_installs, 1);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn stats_expose_hit_rate_and_prime_duration() {
     // The cache-first reframe (ADR-155) makes hit_rate the primary KPI.
     // Verify the counters and the derived accessors actually track.

@@ -553,6 +553,31 @@ impl RabitqPlusIndex {
         let dim = self.inner.dim;
         &self.originals_flat[pos * dim..(pos + 1) * dim]
     }
+
+    /// Export every stored vector as `(pos, row_vec)` pairs, suitable for
+    /// feeding directly into [`Self::from_vectors_parallel_with_rotation`]
+    /// or `persist::save_index(.., &items, ..)`.
+    ///
+    /// `pos` is the row index in `0..self.len()` (matching the internal SoA
+    /// layout — not the external `ids[pos]`). Each row is cloned exactly
+    /// once out of `originals_flat`, so the returned `Vec` owns the data
+    /// and holds no borrow on `self`.
+    ///
+    /// Added for `ruvector-rulake` so a primed `VectorCache` entry can be
+    /// serialized via the existing `persist::save_index` API without
+    /// round-tripping through the backend.
+    pub fn export_items(&self) -> Vec<(usize, Vec<f32>)> {
+        let dim = self.inner.dim;
+        let n = self.inner.ids.len();
+        (0..n)
+            .map(|pos| {
+                (
+                    pos,
+                    self.originals_flat[pos * dim..(pos + 1) * dim].to_vec(),
+                )
+            })
+            .collect()
+    }
 }
 
 impl RabitqPlusIndex {
@@ -1271,5 +1296,60 @@ mod tests {
             had_bytes * 30 <= haar_bytes,
             "Hadamard memory={had_bytes} vs Haar={haar_bytes} — expected ≥ 30× reduction",
         );
+    }
+
+    /// `export_items()` must round-trip: rebuilding a `RabitqPlusIndex` from
+    /// the exported `(pos, row_vec)` pairs — with the same seed, rotation
+    /// kind, and rerank factor — must produce byte-identical search results
+    /// to the source index. This is the contract `ruvector-rulake` relies
+    /// on to serialize a primed cache entry without re-pulling vectors
+    /// from the backend.
+    #[test]
+    fn export_items_roundtrip_via_from_vectors_parallel() {
+        let d = 16;
+        let n = 100;
+        let seed = 20_260_423_u64;
+        let rerank = 4;
+        let kind = RandomRotationKind::HaarDense;
+
+        let data = make_dataset(n, d, seed);
+
+        // Source: add vectors one at a time so the export path is the only
+        // place we round-trip through `originals_flat`.
+        let mut src = RabitqPlusIndex::new_with_rotation(d, seed, rerank, kind);
+        for (id, v) in &data {
+            src.add(*id, v.clone()).unwrap();
+        }
+        assert_eq!(src.len(), n);
+
+        let items = src.export_items();
+        assert_eq!(items.len(), n);
+        for (pos, row) in &items {
+            assert_eq!(row.len(), d, "row {pos} wrong dim");
+        }
+
+        let rebuilt =
+            RabitqPlusIndex::from_vectors_parallel_with_rotation(d, seed, rerank, kind, items)
+                .expect("rebuild from export_items");
+        assert_eq!(rebuilt.len(), n);
+        assert_eq!(rebuilt.dim(), d);
+
+        // Byte-identical search results on 5 deterministic queries.
+        let queries = make_dataset(5, d, seed ^ 0xDEAD_BEEF);
+        let k = 10;
+        for (_, q) in &queries {
+            let a = src.search(q, k).unwrap();
+            let b = rebuilt.search(q, k).unwrap();
+            assert_eq!(a.len(), b.len(), "result count differs");
+            for (ra, rb) in a.iter().zip(b.iter()) {
+                assert_eq!(ra.id, rb.id, "id mismatch on query");
+                assert_eq!(
+                    ra.score.to_bits(),
+                    rb.score.to_bits(),
+                    "score bits differ for id={}",
+                    ra.id,
+                );
+            }
+        }
     }
 }
