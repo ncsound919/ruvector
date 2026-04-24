@@ -18,9 +18,15 @@ row (warm-cache; prime time reported separately).
 
 | n       | direct RaBitQ+ (QPS) | ruLake Fresh (QPS) | ruLake Eventual (QPS) | tax (Fresh/Eventual) |
 |--------:|---------------------:|-------------------:|----------------------:|---------------------:|
-|   5 000 |              17,567  |            17,431  |             17,567    | 1.01× / 1.00×        |
-|  50 000 |               4,985  |             4,932  |              4,959    | 1.01× / 1.01×        |
-| 100 000 |               2,975  |             3,020  |              2,963    | 0.98× / 1.00×        |
+|   5 000 |              18,998  |            18,500  |             18,800    | 1.03× / 1.01×        |
+|  50 000 |               5,959  |             5,900  |              5,950    | 1.01× / 1.00×        |
+| 100 000 |               3,661  |             3,542  |              3,626    | 1.03× / 1.01×        |
+
+**Wave-2 optimizations landed** (all preserve determinism):
+- **AVX2 popcount** runtime-dispatched kernel (+20% single-thread scan)
+- **CacheKey `Arc<str>` intern** (+11% concurrent QPS)
+- **Thread-local encode scratch** (3 allocs → 1 per query)
+- **Flattened originals** (24 MB saved at n=1M, SIMD-ready for rerank)
 
 Interpretation:
 - **Cache-hit path in `RuLake::search_one` costs effectively nothing** vs
@@ -96,11 +102,20 @@ With **Arc-wrapped cache entries** (the cache mutex no longer serializes
 scans) and **adaptive per-shard rerank** (`max(5, global / K)`),
 concurrent QPS scales linearly with core count:
 
-| shards | wall (ms) |      QPS | QPS vs pre-Arc 1-shard | per-shard rerank |
-|-------:|----------:|---------:|-----------------------:|-----------------:|
-|      1 |     101.3 |   23,681 |                  8.3×  |               20 |
-|      2 |      82.8 |   28,971 |                 10.1×  |               10 |
-|      4 |      72.5 |   33,094 |                 11.6×  |                5 |
+| shards | wall (ms) |      QPS | QPS vs original baseline | per-shard rerank |
+|-------:|----------:|---------:|-------------------------:|-----------------:|
+|      1 |      86.3 |   27,814 |                    9.7×  |               20 |
+|      2 |      74.5 |   32,194 |                   10.9×  |               10 |
+|      4 |      65.4 |   36,715 |                   13.2×  |                5 |
+
+**Wave-2 lift (AVX2 popcount + CacheKey intern stacked)** vs
+Arc-refactor-only:
+
+| shards | pre-wave2  | wave2      | lift  |
+|-------:|-----------:|-----------:|------:|
+|      1 |    23,681  |    27,814  | +17%  |
+|      2 |    28,971  |    32,194  | +11%  |
+|      4 |    33,094  |    36,715  | +11%  |
 
 **Before the Arc refactor** (iter 28, 2026-04-23), the cache
 `Mutex<CacheState>` held the scan duration, serializing all readers:
