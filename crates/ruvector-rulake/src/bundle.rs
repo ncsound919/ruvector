@@ -181,8 +181,22 @@ impl RuLakeBundle {
     }
 
     /// Deserialize from JSON. Fails if the format version is newer than
-    /// this binary supports.
+    /// this binary supports, the JSON exceeds the max size, or any
+    /// metadata field violates its length cap.
+    ///
+    /// Length caps are a hardening measure against malicious bundles
+    /// (e.g. a compromised GCS object) that would otherwise force the
+    /// reader to allocate unbounded memory during deserialization.
     pub fn from_json(s: &str) -> crate::Result<Self> {
+        // Hard cap on the input size. A legitimate bundle is a few
+        // hundred bytes; 64 KiB is 100× headroom for custom metadata.
+        const MAX_JSON_BYTES: usize = 64 * 1024;
+        const MAX_FIELD_BYTES: usize = 4 * 1024;
+        if s.len() > MAX_JSON_BYTES {
+            return Err(crate::RuLakeError::InvalidParameter(format!(
+                "bundle parse: exceeds {MAX_JSON_BYTES} bytes"
+            )));
+        }
         let b: Self = serde_json::from_str(s)
             .map_err(|e| crate::RuLakeError::InvalidParameter(format!("bundle parse: {e}")))?;
         if b.format_version > Self::FORMAT_VERSION {
@@ -191,6 +205,34 @@ impl RuLakeBundle {
                 b.format_version,
                 Self::FORMAT_VERSION
             )));
+        }
+        // Per-field length caps. A single field over 4 KiB is almost
+        // certainly wrong; legitimate values (URIs, UUIDs, policy IDs)
+        // are orders of magnitude smaller.
+        for (name, opt) in [
+            ("pii_policy", b.pii_policy.as_deref()),
+            ("lineage_id", b.lineage_id.as_deref()),
+            ("memory_class", b.memory_class.as_deref()),
+        ] {
+            if let Some(v) = opt {
+                if v.len() > MAX_FIELD_BYTES {
+                    return Err(crate::RuLakeError::InvalidParameter(format!(
+                        "bundle parse: {name} exceeds {MAX_FIELD_BYTES} bytes"
+                    )));
+                }
+            }
+        }
+        if b.data_ref.len() > MAX_FIELD_BYTES {
+            return Err(crate::RuLakeError::InvalidParameter(format!(
+                "bundle parse: data_ref exceeds {MAX_FIELD_BYTES} bytes"
+            )));
+        }
+        if b.rvf_witness.len() > 128 {
+            // SHAKE-256(32) hex is exactly 64; reject anything wildly
+            // off before we try to compare witnesses.
+            return Err(crate::RuLakeError::InvalidParameter(
+                "bundle parse: rvf_witness not a hex-encoded SHAKE-256(32)".to_string(),
+            ));
         }
         Ok(b)
     }
@@ -450,6 +492,36 @@ mod tests {
             other => panic!("expected InvalidParameter, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_json_rejects_oversize_input() {
+        // 128 KiB of whitespace inside a bundle → must be rejected
+        // before it reaches serde allocations.
+        let payload = format!(
+            "{{\"format_version\":1,\"data_ref\":\"{}\",\"dim\":1,\"rotation_seed\":0,\"rerank_factor\":1,\"generation\":1,\"rvf_witness\":\"\"}}",
+            "x".repeat(128 * 1024)
+        );
+        let err = RuLakeBundle::from_json(&payload).unwrap_err();
+        match err {
+            crate::RuLakeError::InvalidParameter(m) => {
+                assert!(m.contains("exceeds") && m.contains("bytes"))
+            }
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_json_rejects_oversize_metadata_field() {
+        let good = RuLakeBundle::new("x", 1, 0, 1, Generation::Num(1));
+        let mut v = serde_json::to_value(&good).unwrap();
+        v["memory_class"] = serde_json::Value::String("m".repeat(5000));
+        let s = serde_json::to_string(&v).unwrap();
+        let err = RuLakeBundle::from_json(&s).unwrap_err();
+        match err {
+            crate::RuLakeError::InvalidParameter(m) => assert!(m.contains("memory_class")),
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
     }
 
     #[test]

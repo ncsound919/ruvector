@@ -146,15 +146,21 @@ pub type CacheKey = (BackendId, CollectionId);
 pub type WitnessKey = String;
 
 struct CacheEntry {
-    index: RabitqPlusIndex,
+    /// `Arc`-wrapped so reader threads can `clone` it under the lock
+    /// and run the RaBitQ scan *without* the cache mutex held.
+    /// Eliminates the scan-serializes-on-mutex behavior the original
+    /// implementation showed under concurrent clients — see
+    /// `BENCHMARK.md` "concurrent clients" block.
+    index: Arc<RabitqPlusIndex>,
     dim: usize,
     #[allow(dead_code)] // kept for diagnostics
     generation_hint: Option<u64>,
     last_checked: Instant,
     /// Last time any search hit this entry — used by LRU eviction.
     last_used: Instant,
-    /// internal-position → external id.
-    pos_to_id: Vec<u64>,
+    /// internal-position → external id. Arc so we can share-clone
+    /// without copying the vector on every search.
+    pos_to_id: Arc<Vec<u64>>,
     /// How many external pointers currently resolve to this witness.
     /// An entry with `refcount > 0` is ineligible for LRU eviction.
     refcount: u32,
@@ -281,12 +287,12 @@ impl VectorCache {
             pos_to_id.push(batch.ids[pos]);
         }
         let entry = CacheEntry {
-            index: idx,
+            index: Arc::new(idx),
             dim,
             generation_hint: Some(generation),
             last_checked: Instant::now(),
             last_used: Instant::now(),
-            pos_to_id,
+            pos_to_id: Arc::new(pos_to_id),
             refcount: 0, // install_pointer bumps it
         };
 
@@ -461,34 +467,46 @@ impl VectorCache {
         k: usize,
         rerank_factor_override: Option<usize>,
     ) -> crate::Result<Vec<(u64, f32)>> {
-        let mut inner = self.inner.lock().unwrap();
-        let witness = inner
-            .pointers
-            .get(key)
-            .ok_or_else(|| crate::RuLakeError::UnknownCollection {
-                backend: key.0.clone(),
-                collection: key.1.clone(),
-            })?
-            .clone();
-        let entry = inner.entries.get_mut(&witness).ok_or_else(|| {
-            crate::RuLakeError::UnknownCollection {
-                backend: key.0.clone(),
-                collection: key.1.clone(),
+        // Look up the entry under the lock, clone the Arcs, drop the
+        // lock, then run the scan unlocked. Concurrent readers on
+        // different or same keys all proceed in parallel — the scan
+        // is CPU-bound and needs no shared state beyond the index
+        // (which is Arc-owned; no `&mut` required).
+        let (index, pos_to_id, dim) = {
+            let mut inner = self.inner.lock().unwrap();
+            let witness = inner
+                .pointers
+                .get(key)
+                .ok_or_else(|| crate::RuLakeError::UnknownCollection {
+                    backend: key.0.clone(),
+                    collection: key.1.clone(),
+                })?
+                .clone();
+            let entry = inner.entries.get_mut(&witness).ok_or_else(|| {
+                crate::RuLakeError::UnknownCollection {
+                    backend: key.0.clone(),
+                    collection: key.1.clone(),
+                }
+            })?;
+            if query.len() != entry.dim {
+                return Err(crate::RuLakeError::DimensionMismatch {
+                    expected: entry.dim,
+                    actual: query.len(),
+                });
             }
-        })?;
-        if query.len() != entry.dim {
-            return Err(crate::RuLakeError::DimensionMismatch {
-                expected: entry.dim,
-                actual: query.len(),
-            });
-        }
-        entry.last_used = Instant::now();
-        let hits = match rerank_factor_override {
-            None => entry.index.search(query, k)?,
-            Some(rf) => entry.index.search_with_rerank(query, k, rf)?,
+            entry.last_used = Instant::now();
+            (
+                Arc::clone(&entry.index),
+                Arc::clone(&entry.pos_to_id),
+                entry.dim,
+            )
         };
-        let pos_to_id = entry.pos_to_id.clone();
-        drop(inner);
+        // `dim` check was above under the lock so the clone is safe.
+        let _ = dim;
+        let hits = match rerank_factor_override {
+            None => index.search(query, k)?,
+            Some(rf) => index.search_with_rerank(query, k, rf)?,
+        };
         Ok(hits
             .into_iter()
             .map(|r| (pos_to_id[r.id], r.score))
@@ -511,41 +529,45 @@ impl VectorCache {
         k: usize,
         rerank_factor_override: Option<usize>,
     ) -> crate::Result<Vec<Vec<(u64, f32)>>> {
-        let mut inner = self.inner.lock().unwrap();
-        let witness = inner
-            .pointers
-            .get(key)
-            .ok_or_else(|| crate::RuLakeError::UnknownCollection {
-                backend: key.0.clone(),
-                collection: key.1.clone(),
-            })?
-            .clone();
-        let entry = inner.entries.get_mut(&witness).ok_or_else(|| {
-            crate::RuLakeError::UnknownCollection {
-                backend: key.0.clone(),
-                collection: key.1.clone(),
+        // Lock-once pattern: validate + clone Arcs, drop the mutex,
+        // run the N scans unlocked. Concurrent batches against the
+        // same or different keys parallelize — the scan is pure CPU.
+        let (index, pos_to_id) = {
+            let mut inner = self.inner.lock().unwrap();
+            let witness = inner
+                .pointers
+                .get(key)
+                .ok_or_else(|| crate::RuLakeError::UnknownCollection {
+                    backend: key.0.clone(),
+                    collection: key.1.clone(),
+                })?
+                .clone();
+            let entry = inner.entries.get_mut(&witness).ok_or_else(|| {
+                crate::RuLakeError::UnknownCollection {
+                    backend: key.0.clone(),
+                    collection: key.1.clone(),
+                }
+            })?;
+            let dim = entry.dim;
+            for q in queries {
+                if q.len() != dim {
+                    return Err(crate::RuLakeError::DimensionMismatch {
+                        expected: dim,
+                        actual: q.len(),
+                    });
+                }
             }
-        })?;
-        let dim = entry.dim;
-        for q in queries {
-            if q.len() != dim {
-                return Err(crate::RuLakeError::DimensionMismatch {
-                    expected: dim,
-                    actual: q.len(),
-                });
-            }
-        }
-        entry.last_used = Instant::now();
+            entry.last_used = Instant::now();
+            (Arc::clone(&entry.index), Arc::clone(&entry.pos_to_id))
+        };
         let mut raw: Vec<Vec<ruvector_rabitq::SearchResult>> = Vec::with_capacity(queries.len());
         for q in queries {
             let r = match rerank_factor_override {
-                None => entry.index.search(q, k)?,
-                Some(rf) => entry.index.search_with_rerank(q, k, rf)?,
+                None => index.search(q, k)?,
+                Some(rf) => index.search_with_rerank(q, k, rf)?,
             };
             raw.push(r);
         }
-        let pos_to_id = entry.pos_to_id.clone();
-        drop(inner);
         Ok(raw
             .into_iter()
             .map(|v| v.into_iter().map(|r| (pos_to_id[r.id], r.score)).collect())

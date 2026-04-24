@@ -76,9 +76,63 @@ impl FsBackend {
     /// Register `collection` as the name for `filename` (relative to
     /// root). The file doesn't have to exist yet — writes (`write`) and
     /// pulls (`pull_vectors`) will fail at call time if it's missing.
-    pub fn register(&self, collection: impl Into<String>, filename: impl Into<String>) {
+    ///
+    /// Errors when `filename` contains path components that would
+    /// escape the root directory (absolute path, `..`, leading `/`).
+    /// This is the primary defense against path-traversal — an
+    /// operator who lets user input flow into this API gets a hard
+    /// failure, not a filesystem escape.
+    pub fn register(
+        &self,
+        collection: impl Into<String>,
+        filename: impl Into<String>,
+    ) -> Result<()> {
+        let filename = filename.into();
+        Self::validate_filename(&filename)?;
         let mut idx = self.index.write().unwrap();
-        idx.insert(collection.into(), filename.into());
+        idx.insert(collection.into(), filename);
+        Ok(())
+    }
+
+    /// Reject any filename that could escape the root directory.
+    ///
+    /// Rules (matched by every major OS + strict-whitelist-safe):
+    ///   - non-empty, ASCII printable, no control bytes;
+    ///   - no `/` or `\` separators (this is a filename, not a path);
+    ///   - no `.` or `..` components;
+    ///   - no drive letter or Windows UNC prefix;
+    ///   - length ≤ 255 bytes (POSIX NAME_MAX).
+    fn validate_filename(f: &str) -> Result<()> {
+        let invalid = |msg: &str| {
+            Err(RuLakeError::InvalidParameter(format!(
+                "FsBackend: illegal filename {:?}: {}",
+                f, msg
+            )))
+        };
+        if f.is_empty() {
+            return invalid("empty");
+        }
+        if f.len() > 255 {
+            return invalid("exceeds 255 bytes (POSIX NAME_MAX)");
+        }
+        if f == "." || f == ".." {
+            return invalid("reserved component");
+        }
+        for b in f.bytes() {
+            if b < 0x20 || b == 0x7f {
+                return invalid("control byte");
+            }
+            if b == b'/' || b == b'\\' {
+                return invalid("path separator");
+            }
+        }
+        // Reject Windows drive prefix + UNC paths. (A bare `:` in the
+        // middle of the name is fine on POSIX but we reject to keep
+        // cross-platform semantics.)
+        if f.contains(':') {
+            return invalid("colon");
+        }
+        Ok(())
     }
 
     /// Write a collection to disk in `ruvec1` format. Registers the
@@ -93,6 +147,7 @@ impl FsBackend {
     ) -> Result<PathBuf> {
         let collection = collection.into();
         let filename = filename.into();
+        Self::validate_filename(&filename)?;
         if ids.len() != vectors.len() {
             return Err(RuLakeError::InvalidParameter(format!(
                 "FsBackend::write: ids.len={} != vectors.len={}",
@@ -142,7 +197,7 @@ impl FsBackend {
                 path.display()
             ))
         })?;
-        self.register(collection, filename);
+        self.register(collection, filename)?;
         Ok(path)
     }
 
@@ -328,13 +383,51 @@ mod tests {
     }
 
     #[test]
+    fn fs_register_rejects_path_traversal() {
+        // Security gate: user-controlled filenames cannot escape the
+        // backend's root directory. Every mode of escape must fail
+        // fast with InvalidParameter.
+        let dir = tempdir("pt");
+        let back = FsBackend::new("disk", &dir).unwrap();
+        let cases: &[&str] = &[
+            "../escape",        // parent reference
+            "../../etc/passwd", // nested parent
+            "./secret",         // current-dir (reserved component)
+            "",                 // empty
+            "/absolute",        // leading slash
+            "sub/foo",          // separator
+            "back\\slash",      // Windows separator
+            ".",                // reserved
+            "..",               // reserved
+            "foo\0bar",         // null byte
+            "foo\nbar",         // control char
+            "C:name",           // drive letter
+        ];
+        for bad in cases {
+            assert!(
+                back.register("c", *bad).is_err(),
+                "register accepted illegal filename {:?}",
+                bad
+            );
+            assert!(
+                back.write("c", *bad, 1, &[0], &[vec![0.0]]).is_err(),
+                "write accepted illegal filename {:?}",
+                bad
+            );
+        }
+        // The legitimate filename still works.
+        back.register("c", "ok.bin").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn fs_pull_rejects_bad_magic() {
         let dir = tempdir("bad");
         let back = FsBackend::new("disk", &dir).unwrap();
         // Write a bogus file directly.
         let p = dir.join("bad.bin");
         std::fs::write(&p, b"NOTVECS\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
-        back.register("c", "bad.bin");
+        back.register("c", "bad.bin").unwrap();
         let err = back.pull_vectors("c").unwrap_err();
         match err {
             RuLakeError::InvalidParameter(m) => assert!(m.contains("magic"), "got: {m}"),

@@ -18,9 +18,9 @@ row (warm-cache; prime time reported separately).
 
 | n       | direct RaBitQ+ (QPS) | ruLake Fresh (QPS) | ruLake Eventual (QPS) | tax (Fresh/Eventual) |
 |--------:|---------------------:|-------------------:|----------------------:|---------------------:|
-|   5 000 |              17,635  |            17,166  |             17,682    | 1.03× / 1.00×        |
-|  50 000 |               5,130  |             4,995  |              5,097    | 1.03× / 1.01×        |
-| 100 000 |               3,050  |             2,991  |              2,990    | 1.02× / 1.02×        |
+|   5 000 |              17,567  |            17,431  |             17,567    | 1.01× / 1.00×        |
+|  50 000 |               4,985  |             4,932  |              4,959    | 1.01× / 1.01×        |
+| 100 000 |               2,975  |             3,020  |              2,963    | 0.98× / 1.00×        |
 
 Interpretation:
 - **Cache-hit path in `RuLake::search_one` costs effectively nothing** vs
@@ -92,28 +92,33 @@ mechanically: a batch of 32 registers as 1 coherence check, not 32.
 
 ### Concurrent clients × shard count (n = 100 k, 8 clients × 300 queries)
 
-With the **adaptive per-shard rerank** introduced via
-`RuLake::search_federated_with_rerank` (default policy: `max(5, global /
-K)`), K-shard federation no longer pays K× the rerank cost:
+With **Arc-wrapped cache entries** (the cache mutex no longer serializes
+scans) and **adaptive per-shard rerank** (`max(5, global / K)`),
+concurrent QPS scales linearly with core count:
 
-| shards | wall (ms) |     QPS | QPS vs 1-shard | per-shard rerank |
-|-------:|----------:|--------:|---------------:|-----------------:|
-|      1 |     840.9 |   2,854 |           1.00 |               20 |
-|      2 |     811.0 |   2,959 |           1.04 |               10 |
-|      4 |     859.9 |   2,791 |           0.98 |                5 |
+| shards | wall (ms) |      QPS | QPS vs pre-Arc 1-shard | per-shard rerank |
+|-------:|----------:|---------:|-----------------------:|-----------------:|
+|      1 |     101.3 |   23,681 |                  8.3×  |               20 |
+|      2 |      82.8 |   28,971 |                 10.1×  |               10 |
+|      4 |      72.5 |   33,094 |                 11.6×  |                5 |
 
-**Before the fix** (rerank_factor=20 on every shard, same bench shape):
+**Before the Arc refactor** (iter 28, 2026-04-23), the cache
+`Mutex<CacheState>` held the scan duration, serializing all readers:
 
-| shards | QPS | QPS vs 1-shard |
-|-------:|--------:|---------------:|
-|      1 | 2,963   |           1.00 |
-|      2 | 2,500   |           0.84 |
-|      4 | 1,778   |           0.60 |
+| shards | QPS (old) | QPS (new) | lift |
+|-------:|----------:|----------:|-----:|
+|      1 |    2,854  |   23,681  | 8.3× |
+|      2 |    2,959  |   28,971  | 9.8× |
+|      4 |    2,791  |   33,094  |11.9× |
 
-So the adaptive rerank lifts 4-shard federation from 0.60× → 0.98×.
-Recall@10 stays above 85% at K=2 and K=4 (gate test
-`adaptive_per_shard_rerank_preserves_recall` exercises clustered D=128,
-n=5k).
+The refactor: `CacheEntry::index` is now `Arc<RabitqPlusIndex>`. Readers
+clone the Arc under the mutex (microseconds), drop the lock, then scan
+unlocked. The index is immutable once built, so there's no data race;
+concurrent readers parallelize perfectly. This is the single biggest
+optimization of the M1 branch.
+
+Recall@10 under K=2 / K=4 adaptive rerank stays above 85% on clustered
+D=128 n=5k (gate test `adaptive_per_shard_rerank_preserves_recall`).
 
 **Implementation:** the floor (`MIN_PER_SHARD_RERANK = 5`) stops the
 divide-by-K from going below the point where exact L2² rerank can
