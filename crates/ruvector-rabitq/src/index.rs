@@ -421,54 +421,33 @@ impl RabitqIndex {
         k: usize,
     ) -> Vec<(u32, u32, f32)> {
         // Returns (pos, id, score) so rerank callers can map back to `originals[pos]`.
-        let mut top = TopK::new(k.min(self.ids.len()));
-        let n_words = self.n_words;
-        let mask = self.last_word_mask;
-        let d = self.dim as f32;
+        let n = self.ids.len();
+        let mut top = TopK::new(k.min(n));
         let q_sq = q_norm * q_norm;
         let lut = &self.cos_lut;
 
-        // Unrolled walk with manual prefetch-friendly stride. LLVM can already
-        // do most of this; the important part is the flat `packed` slice — no
-        // per-candidate indirection.
-        let n = self.ids.len();
-        let p = self.packed.as_ptr();
-        let aligned = mask == !0u64; // dim % 64 == 0
+        // 1. SIMD-friendly pass: compute agreement counts for all n candidates
+        //    into a scratch buffer. Runtime dispatch picks AVX2+POPCNT (4×
+        //    unrolled) or a scalar fallback. Bit-identical across paths.
+        let mut agree = vec![0u32; n];
+        crate::scan::scan(
+            &self.packed,
+            self.n_words,
+            n,
+            q_packed,
+            self.last_word_mask,
+            &mut agree,
+        );
+
+        // 2. Scalar reduction pass: cos-LUT lookup + score + TopK heap. Not
+        //    SIMD-amenable (small LUT, scalar FP, branchy heap eviction).
         for i in 0..n {
-            // SAFETY: p is valid for `n * n_words` u64 reads. Using ptr offsets
-            // avoids the bounds-check in the inner loop.
-            let base = unsafe { p.add(i * n_words) };
-            let mut agree: u32 = 0;
-            if aligned && n_words == 2 {
-                // D=128 fast path: 2 popcounts, no last-word mask needed.
-                unsafe {
-                    agree = (!(*base ^ q_packed[0])).count_ones()
-                        + (!(*base.add(1) ^ q_packed[1])).count_ones();
-                }
-            } else if aligned {
-                // Aligned but more words — skip the mask AND on the last word.
-                unsafe {
-                    for w in 0..n_words {
-                        agree += (!(*base.add(w) ^ q_packed[w])).count_ones();
-                    }
-                }
-            } else {
-                // Unaligned: mask the last word's padding bits off.
-                unsafe {
-                    for w in 0..n_words - 1 {
-                        agree += (!(*base.add(w) ^ q_packed[w])).count_ones();
-                    }
-                    agree +=
-                        (!(*base.add(n_words - 1) ^ q_packed[n_words - 1]) & mask).count_ones();
-                }
-            }
-            // cos LUT replaces the `.cos()` call — one indexed load.
-            let est_cos = unsafe { *lut.get_unchecked(agree as usize) };
+            // SAFETY: agree.len() == n and cos_lut has dim+1 entries which
+            // bounds agree[i] ∈ [0, dim].
+            let est_cos = unsafe { *lut.get_unchecked(*agree.get_unchecked(i) as usize) };
             let x_norm = self.norms[i];
             let est_ip = q_norm * x_norm * est_cos;
             let score = q_sq + x_norm * x_norm - 2.0 * est_ip;
-            // ignoring d here — already baked into the LUT indices.
-            let _ = d;
             top.push_raw(self.ids[i] as usize, score, i);
         }
         top.into_sorted_with_pos()

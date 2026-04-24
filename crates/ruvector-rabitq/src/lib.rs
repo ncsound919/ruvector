@@ -47,6 +47,7 @@ pub mod index;
 pub mod kernel;
 pub mod quantize;
 pub mod rotation;
+pub mod scan;
 
 pub use error::RabitqError;
 pub use index::{
