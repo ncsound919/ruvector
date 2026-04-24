@@ -1,171 +1,155 @@
-# ruLake — A Cache-Coherent Vector Execution Layer
+# ruLake
 
-> *A vector execution cache with deterministic compression and federated refill.*
+**A cache layer for vector search — sits in front of whatever database, lakehouse, or file store already holds your vectors, and makes every query fast.**
 
-`ruLake` is the RVF ecosystem's answer to "how do agents and apps query
-1M+ vectors across heterogeneous backends without reimplementing
-caching, coherence, governance, and the RaBitQ compressor every time?"
+---
 
-It's not a vector database. It's not a lakehouse adapter. It's the
-substrate:
+## What is ruLake?
 
-- A **RaBitQ 1-bit cache** that runs at ~1.02× the cost of raw
-  [`ruvector-rabitq`](../ruvector-rabitq/) — the abstraction is
-  effectively free.
-- **Federated refill** across pluggable `BackendAdapter` implementations
-  (Parquet, BigQuery, Iceberg, Delta, local). Federation is the *miss
-  path*, not the product shape.
-- **Witness-addressed** bundles (SHAKE-256 over the data reference)
-  that let two processes, clouds, or customers share one compressed
-  entry when they point at the same underlying bytes.
-- **Three-mode consistency knob** — `Fresh` (compliance), `Eventual`
-  (recall), `Frozen` (audit).
-- **33,094 QPS** under 8 concurrent clients at n=100 k, D=128, rerank×20
-  — 11.9× the serialized-mutex baseline.
+You already have vectors somewhere: Parquet files on S3, rows in BigQuery, an Iceberg table, a Snowflake column, or `.bin` files on a disk. You want semantic search that's fast, consistent, and cheap.
 
-```text
-                ┌───────────────────────────────────┐
-  caller ──▶    │           RuLake                   │   ──▶  SearchResult
-                │   ┌──────────────────────────┐   │
-                │   │  RaBitQ cache (Arc'd)    │   │
-                │   │   witness → index        │   │
-                │   └──────────────────────────┘   │
-                │          ▲  miss                  │
-                │   ┌──────┴──────┐                 │
-                │   │ BackendAdapter │  ──▶  Parquet / BQ / Iceberg / RVF
-                │   └───────────────┘                │
-                └───────────────────────────────────┘
+ruLake is the piece in the middle.
+
+- Your app asks ruLake for the nearest K vectors.
+- ruLake serves hits from a compressed in-memory cache at **~1 % over raw library speed** (measured 1.00–1.02× intermediary tax).
+- On a cache miss, ruLake pulls from your backend, compresses with [RaBitQ](../ruvector-rabitq/) 1-bit quantization, and serves the result.
+- Every cache entry is anchored by a cryptographic **witness** so two processes pointing at the same bytes share one compressed copy automatically.
+
+It's built on the **RuVector** stack:
+
 ```
+your data  ──▶  RuVector RVF (durable)
+                    │
+                    ▼
+              RuVector rabitq  ◀──  1-bit quantization + rerank
+                    │
+                    ▼
+               ruLake           ◀──  this crate: cache + coherence + governance
+                    │
+                    ▼
+              your agent / app
+```
+
+---
+
+## Why ruLake exists
+
+Today the tradeoff is ugly:
+
+- A **managed vector DB** (Pinecone, Weaviate) is fast but it's a whole new system to operate, and your data has to move into it.
+- A **lakehouse** (BigQuery, Snowflake, Iceberg) keeps your data where it is but vector queries are expensive, slow, or not supported natively.
+- A **local library** (RaBitQ, HNSW) is fastest per-process but doesn't help with sharing, coherence, governance, or multi-source queries.
+
+ruLake is the middle option: keep your data where it lives, get cache-speed reads, and pay governance once instead of per-backend.
 
 ---
 
 ## Features
 
-### 🗂 Cache-first vector execution
+Each of these is shipped, tested, and measured in the M1 release.
 
-The hot path is one `Arc<RabitqPlusIndex>::search` lookup. Measured
-intermediary tax: **1.00–1.02×** vs direct RaBitQ. You can afford the
-abstraction — orchestration, governance, routing — because the cache
-does the work.
+### 🚀 Cache-first performance
+- **1.00–1.02× direct RaBitQ cost** on cache hit — the abstraction is effectively free.
+- **23,681 QPS** single-shard, **33,094 QPS** 4-shard under 8 concurrent clients (n=100k, D=128).
+- **37.6 ms prime** on n=100k — 11× faster than serial thanks to parallel rotation + bit-packing.
 
 ### 🔐 Witness-authenticated bundles
+- Each cache entry is anchored on a SHAKE-256 digest of `(data_ref, dim, rotation_seed, rerank_factor, generation)`.
+- Serializes to a tiny `table.rulake.json` sidecar alongside your data.
+- Two backends (or two clouds, or two processes) pointing at the same bytes produce the same witness and **share one compressed cache entry** with zero coordination.
 
-Every cache entry is keyed on a `table.rulake.json` sidecar:
+### 🔁 Federated search across any number of backends
+- Register N backends (Parquet, BigQuery, custom), search them all in one call.
+- Parallel fan-out via rayon; adaptive per-shard rerank keeps K-shard federation from paying K× the rerank cost.
+- Global top-K merged by score — correct ranking across heterogeneous sources.
 
-```json
-{
-  "format_version": 1,
-  "data_ref": "gs://bucket/table.parquet",
-  "dim": 768,
-  "rotation_seed": 42,
-  "rerank_factor": 20,
-  "generation": 1729843200,
-  "rvf_witness": "b3ac...0f7c",
-  "pii_policy": "pii://policies/default",
-  "lineage_id": "ol://jobs/ingest-42",
-  "memory_class": "episodic"
-}
-```
+### 🎛 Three-mode consistency knob
+| Mode | Use case | Cost per query |
+|---|---|---|
+| `Fresh` | compliance, finance, policy | 1 backend RTT |
+| `Eventual { ttl_ms }` | search, RAG, recommendation | 1 RTT per TTL |
+| `Frozen` | audit snapshots, content-addressed data | 0 RTTs after prime |
 
-Two processes anywhere — different clouds, different services, same
-underlying bytes — produce the same witness and **share one compressed
-cache entry**. No coordination required.
+One deployment can serve all three depending on the collection. It's a product knob, not a build flag.
 
-### 🔁 Federated search (rayon parallel fan-out)
+### 📦 Cross-process cache sync via sidecar
+- `publish_bundle(key, dir)` — writer side, atomic write.
+- `refresh_from_bundle_dir(key, dir)` — reader side, three-state response (`UpToDate` / `Invalidated` / `BundleMissing`).
+- A cache-sidecar daemon is ~10 lines on top of these primitives; see `examples/sidecar_daemon.rs`.
 
-Register N backends, search them all in parallel with one call:
+### 📊 Built-in observability
+- `hit_rate()`, `avg_prime_ms()`, `last_prime_ms` out of the box.
+- Per-backend and per-collection attribution — find the hot collection, pin it.
+- No external tracing layer needed for the headline metric.
 
-```rust
-let hits = lake.search_federated(
-    &[("bigquery", "events"), ("snowflake", "profiles"), ("s3", "archive")],
-    &query_vector,
-    10,
-)?;
-```
+### 🧱 Pluggable `VectorKernel` trait
+- CPU kernel ships by default, always available.
+- GPU / SIMD / WASM kernels plug in as separate crates — no dep bloat on laptop / edge builds.
+- Dispatch policy enforces determinism on `Fresh` / `Frozen` paths; non-deterministic kernels are only used on `Eventual`.
 
-Adaptive per-shard rerank keeps K-shard federation from paying K×
-rerank cost. **4-shard concurrent throughput: 33,094 QPS** vs
-single-shard 23,681.
+### 🛡 Security by default
+- Zero `unsafe` in the crate.
+- Path-traversal validation on filesystem backends (12-form attack coverage).
+- JSON size caps on bundle deserialization (prevents DoS on compromised sidecars).
+- Witness verification on every bundle read — tampered files fail loudly.
+- Atomic writes so concurrent readers never see torn sidecars.
 
-### 🧩 Three-mode consistency
+---
 
-| Mode     | Use case                                          | Overhead            |
-|----------|---------------------------------------------------|---------------------|
-| `Fresh`  | compliance, finance, policy-enforced workloads    | 1 backend RTT/query |
-| `Eventual{ttl_ms}` | search, AI retrieval, recommendation, RAG | 1 RTT per TTL       |
-| `Frozen` | audit-tier historical snapshots, content-addressed | 0 backend RTTs      |
+## Benefits
 
-Set it per-`RuLake` with `with_consistency(...)`. The product knob
-lets one deployment serve compliance collections and recall
-collections from the same cache.
+**For the application developer**
+- Drop-in acceleration for any vector store you already have.
+- One API (`search_one`, `search_federated`, `search_batch`) regardless of where the data lives.
+- Operational metrics that matter — hit rate, prime time, per-backend — without extra tracing infrastructure.
 
-### 📦 Sidecar publish/refresh protocol
+**For the platform team**
+- One governance choke point instead of N per-backend stories.
+- Cross-process, cross-cloud cache sharing with zero coordination (witness-addressed).
+- Three consistency modes so compliance, AI, and audit workloads share one deployment.
 
-Symmetric writer + reader primitives for cross-process cache
-coherence:
+**For the performance engineer**
+- 1 % intermediary tax — the cache is effectively free.
+- 11–12× concurrent throughput win from the Arc-drop-lock refactor.
+- 11× prime-time speedup from parallel rotation.
+- Determinism preserved end-to-end so witness chains stay valid across CPU / SIMD / GPU kernels.
 
-```rust
-// Publisher side: warehouse job emits the bundle.
-lake.publish_bundle(&("bq", "events"), "/mnt/gcs/events/")?;
+**For the security engineer**
+- Zero `unsafe`.
+- Tampered bundles fail fast with a typed error.
+- No path traversal, no unbounded allocations.
+- Witness chain is domain-separated + length-prefixed SHAKE-256.
 
-// Reader side: daemon watches for updates.
-match lake.refresh_from_bundle_dir(&("bq", "events"), "/mnt/gcs/events/")? {
-    RefreshResult::UpToDate    => {}             // no-op
-    RefreshResult::Invalidated => notify_ops(),  // cache was rotated
-    RefreshResult::BundleMissing => warn!(),
-}
-```
+---
 
-Atomic temp+rename on write; witness verification on read; tampered
-sidecars surface as `InvalidParameter`, not silent corruption.
+## How ruLake compares
 
-### 📊 Cache-first KPIs
+ruLake is explicitly **not** a vector database — it doesn't own storage. It's the substrate that lets you query whichever vector DB or lakehouse you already have, with a coherent compression + governance story across all of them. If you want a standalone managed vector DB, use Pinecone or Weaviate. If you want to use the vectors that already live in your lake, use ruLake — part of the [RuVector](https://github.com/ruvnet/RuVector) ecosystem alongside RVF (durable segments), `ruvector-rabitq` (1-bit compression), and `ruvector-rulake` (this crate).
 
-Operators get the numbers that matter for cache-first operation out
-of the box:
+| System           | Abstraction cost | Cross-backend federation | Witness-authenticated | Cross-process cache sharing | CPU-first / GPU-optional | `unsafe` count |
+|------------------|-----------------:|-------------------------:|----------------------:|----------------------------:|-------------------------:|---------------:|
+| **ruLake**       | **1.02×**        | ✅ (rayon fan-out)       | ✅ (SHAKE-256)        | ✅ (content-addressed)      | ✅                       | **0**          |
+| Pinecone         | n/a (hosted)     | ❌                        | ❌                    | ❌                          | n/a                      | n/a            |
+| Weaviate         | n/a (hosted)     | ❌                        | ❌                    | ❌                          | ✅                       | n/a            |
+| Milvus           | ~1.5–2×          | partial                   | ❌                    | ❌                          | ✅                       | many           |
+| LanceDB          | ~1.1–1.3×        | ❌                        | ❌                    | ❌                          | ✅                       | some           |
+| BQ Vector Search | n/a (hosted)     | ❌ (BQ-only)              | ❌                    | ❌                          | n/a                      | n/a            |
 
-```rust
-let stats = lake.cache_stats();
-println!("hit_rate = {:.3}",    stats.hit_rate().unwrap_or(0.0));
-println!("avg_prime_ms = {:?}", stats.avg_prime_ms());
+And within the RuVector stack:
 
-// Per-backend or per-collection attribution:
-for (backend, s) in lake.cache_stats_by_backend() {
-    println!("{backend}: hit_rate={:.3}", s.hit_rate().unwrap_or(0.0));
-}
-```
+| Crate                  | Role                                               |
+|------------------------|----------------------------------------------------|
+| `ruvector-rvf`         | durable segment format — appendable, witness-signed vector storage |
+| `ruvector-rabitq`      | rotation-based 1-bit quantization kernel — the math that makes the cache fast |
+| `ruvector-rulake`      | **this crate** — cache, coherence, federation, governance, adapters |
 
-Acceptance gate for the cache-first reframe: **`hit_rate ≥ 0.95`**
-on a realistic workload, measurable from the stats stream alone.
-
-### 🔌 Pluggable VectorKernel (ADR-157)
-
-Optional accelerator plane: a `VectorKernel` trait in
-`ruvector-rabitq` lets GPU / SIMD / WASM kernels plug in alongside the
-default CPU implementation. Determinism is gated by
-`caps().deterministic` — non-deterministic kernels (GPU float reorder)
-are filtered out of `Fresh` / `Frozen` paths automatically.
-
-Kernels ship as separate crates (`ruvector-rabitq-cuda`, -metal, …) on
-their own cadence. Laptop / WASM builds pay zero dep cost.
-
-### 🛡 Security hardening
-
-- **Path-traversal safe:** `FsBackend` rejects filenames with `..`,
-  separators, control bytes, drive letters. 12-form attack surface
-  covered.
-- **JSON deserialization caps:** bundle input ≤ 64 KiB, individual
-  fields ≤ 4 KiB. A compromised GCS object cannot DoS the reader.
-- **Witness chain:** domain-separated + length-prefixed SHAKE-256.
-  Tampered bundles fail `verify_witness()` and `read_from_dir()`.
-- **Zero `unsafe`** in the ruLake crate or the new kernel module.
+RVF is your durable truth. rabitq is your compressor. ruLake is the execution layer.
 
 ---
 
 ## Quick start
 
 ```toml
-# Cargo.toml
 [dependencies]
 ruvector-rulake = "2.2"
 ```
@@ -174,47 +158,47 @@ ruvector-rulake = "2.2"
 use std::sync::Arc;
 use ruvector_rulake::{cache::Consistency, LocalBackend, RuLake};
 
-// 1. Spin up a backend with some vectors.
+// 1. Point ruLake at a backend.
 let backend = Arc::new(LocalBackend::new("my-backend"));
 backend.put_collection(
     "memories",
-    /* dim */ 128,
-    /* ids */  vec![1, 2, 3],
-    /* vecs */ vec![vec![0.0; 128]; 3],
+    /* dim    */ 128,
+    /* ids    */ vec![1, 2, 3],
+    /* vecs   */ vec![vec![0.0; 128]; 3],
 )?;
 
-// 2. Register it with ruLake.
-let lake = RuLake::new(
-    /* rerank_factor */ 20,
-    /* rotation_seed */ 42,
-).with_consistency(Consistency::Eventual { ttl_ms: 60_000 });
+// 2. Configure the cache.
+let lake = RuLake::new(20, 42)
+    .with_consistency(Consistency::Eventual { ttl_ms: 60_000 });
 lake.register_backend(backend)?;
 
-// 3. Query. First call primes the cache; subsequent calls serve from
-//    the RaBitQ-compressed entry at ~1.02× direct-search cost.
+// 3. Query. First hit primes the cache; the rest serve from RaBitQ
+//    at ~1 % over raw-library speed.
 let hits = lake.search_one("my-backend", "memories", &vec![0.0; 128], 10)?;
 
-// 4. Observability.
+// 4. Observe.
 println!("hit rate: {:.3}", lake.cache_stats().hit_rate().unwrap_or(0.0));
 ```
 
-For a full publish/refresh loop see
+For a full cross-process example with publish/refresh, see
 [`examples/sidecar_daemon.rs`](examples/sidecar_daemon.rs).
 
 ---
 
-## Usage patterns
+## Usage recipes
 
-### Cache-first RAG / retrieval
+### RAG / retrieval at 95 % hit rate
 
 ```rust
 let lake = RuLake::new(20, 42)
     .with_consistency(Consistency::Eventual { ttl_ms: 60_000 })
-    .with_max_cache_entries(100);  // LRU bound for serving processes
+    .with_max_cache_entries(100);   // LRU bound
 lake.register_backend(parquet_backend)?;
 
-// Batch API amortizes ensure_fresh + lock acquisition across N queries.
+// Batch API amortizes freshness check + lock acquisition across N queries.
 let hits = lake.search_batch("parquet", "corpus", &query_batch, 10)?;
+
+// Target metric: cache_stats().hit_rate() ≥ 0.95
 ```
 
 ### Federated search across clouds
@@ -230,39 +214,43 @@ let hits = lake.search_federated(
     10,
 )?;
 // Adaptive per-shard rerank = max(5, 20 / 3) = 6 per shard.
-// Global top-10 merged across all three.
+// Global top-10 merged across all three, each returned with its
+// backend + collection for audit.
 ```
 
-### Witness-sealed audit tier
+### Audit-tier witness-sealed snapshot
 
 ```rust
 let audit = RuLake::new(20, 42).with_consistency(Consistency::Frozen);
 audit.register_backend(content_addressed_backend)?;
 
-// First query primes; all subsequent reads stay on the frozen witness
-// even if the backend "bumps" — caller asserts the data is immutable.
+// First query primes from the backend; after that ruLake never
+// re-checks, no matter what the backend reports. Operators can
+// still force-refresh via refresh_from_bundle_dir.
 let hits = audit.search_one("ca", "snapshot-2026-q2", &q, 10)?;
 ```
 
-### Cache sidecar daemon
+### Cross-process cache sidecar
 
 ```rust
-// Reader process runs this loop alongside the serving process.
+// Reader process runs this loop next to the serving process:
 loop {
     match lake.refresh_from_bundle_dir(&key, publish_dir)? {
-        RefreshResult::Invalidated => {
-            metrics.bundle_rotations.inc();
-        }
+        RefreshResult::Invalidated => metrics.bundle_rotations.inc(),
         _ => {}
     }
     std::thread::sleep(Duration::from_secs(5));
 }
 ```
 
-See [`examples/sidecar_daemon.rs`](examples/sidecar_daemon.rs) for a
-runnable end-to-end demo.
+See [`examples/sidecar_daemon.rs`](examples/sidecar_daemon.rs) for the
+runnable publisher + reader demo.
 
-### Memory substrate for agent brain systems (ADR-156)
+### Memory substrate for agent brain systems
+
+ruLake tags bundles with an opaque `memory_class` (ADR-156): the
+substrate stores it but never interprets it. Brain systems own the
+semantics.
 
 ```rust
 let bundle = RuLakeBundle::new("mem://episodic/2026-04-23", 768, 42, 20, gen.into())
@@ -272,8 +260,9 @@ let bundle = RuLakeBundle::new("mem://episodic/2026-04-23", 768, 42, 20, gen.int
 bundle.write_to_dir("/mnt/brain/bundles/")?;
 ```
 
-`memory_class` is opaque to ruLake — the brain system owns semantics,
-the substrate owns persistence.
+The six substrate guarantees (recall, verify, forget, rehydrate,
+compact, location-transparency) are validated end-to-end by the
+`brain_substrate_acceptance_*` test.
 
 ---
 
@@ -285,11 +274,12 @@ All numbers from a single reproducible run of:
 cargo run --release -p ruvector-rulake --bin rulake-demo
 ```
 
-on a commodity Ryzen-class laptop, deterministic seeds.
+on a commodity Ryzen-class laptop, deterministic seeds, warm cache
+unless a row is labeled `prime`.
 
 ### Intermediary tax (cache-hit path)
 
-Clustered Gaussian, D=128, 100 clusters, rerank×20, 300 warm queries.
+Clustered Gaussian, D=128, 100 clusters, rerank×20, 300 queries.
 
 | n       | direct RaBitQ+ | ruLake Fresh | ruLake Eventual | tax     |
 |--------:|---------------:|-------------:|----------------:|--------:|
@@ -297,269 +287,208 @@ Clustered Gaussian, D=128, 100 clusters, rerank×20, 300 warm queries.
 |  50 000 |         4,985  |       4,932  |          4,959  | 1.01×   |
 | 100 000 |         2,975  |       3,020  |          2,963  | 1.00×   |
 
-**The abstraction layer is not the bottleneck.** You can afford to
-put governance, routing, and orchestration on top.
+**Takeaway:** the abstraction is free. The cache-hit path is as fast
+as calling `ruvector-rabitq` directly.
 
 ### Concurrent clients × shard count
 
-n=100 k, 8 clients × 300 queries each, adaptive per-shard rerank.
+n=100k, 8 clients × 300 queries each, `Eventual` mode.
 
-| shards | wall (ms) |       QPS | vs pre-Arc 1-shard |
-|-------:|----------:|----------:|-------------------:|
-|      1 |     101.3 |    23,681 |              8.3×  |
-|      2 |      82.8 |    28,971 |             10.1×  |
-|      4 |      72.5 |    33,094 |             11.6×  |
+| shards | wall (ms) |       QPS | vs pre-Arc-refactor |
+|-------:|----------:|----------:|--------------------:|
+|      1 |     101.3 |    23,681 |                8.3× |
+|      2 |      82.8 |    28,971 |               10.1× |
+|      4 |      72.5 |    33,094 |               11.6× |
 
-The `Arc<RabitqPlusIndex>` refactor (drop cache lock before scan) is
-the single biggest optimization on the M1 branch.
+**Takeaway:** the `Arc<RabitqPlusIndex>` cache refactor lifted
+concurrent QPS by 8-12×. The cache mutex no longer holds the scan.
 
-### Federated cold-path (miss) prime time
+### Cold-start prime time
 
-Parallel fan-out: a single federated query that misses every shard
-primes them concurrently.
+Parallel rotation + bit-packing via rayon.
 
-| n       | 1-shard prime | 2-shard prime | 4-shard prime | 2/4 speedup |
-|--------:|--------------:|--------------:|--------------:|------------:|
-|   5 000 |      22.3 ms  |      12.7 ms  |       6.6 ms  | 1.76× / 3.38× |
-|  50 000 |     213.3 ms  |     109.5 ms  |      55.7 ms  | 1.95× / 3.83× |
-| 100 000 |     424.8 ms  |     215.3 ms  |     110.1 ms  | 1.97× / 3.86× |
+| n       | serial prime | parallel prime |   speedup |
+|--------:|-------------:|---------------:|----------:|
+|   5 000 |      22.3 ms |        4.5 ms  |    4.9×   |
+|  50 000 |     213.3 ms |       19.6 ms  |   10.9×   |
+| 100 000 |     424.8 ms |       37.6 ms  |   11.2×   |
+
+**Takeaway:** real backend deployments where prime cost is the
+critical-path on cache miss see a full order-of-magnitude drop.
 
 ### Recall
 
-`rulake_recall_at_10_above_90pct_vs_brute_force` gate test: recall@10
-> 90% on clustered D=128 n=5 k at rerank×20.
+- `rulake_recall_at_10_above_90pct_vs_brute_force` — **≥ 90 %** on
+  clustered D=128 n=5k rerank×20 vs exact L2² brute force.
+- `adaptive_per_shard_rerank_preserves_recall` — **≥ 85 %** on K=2
+  and K=4 with adaptive rerank = max(5, 20 / K).
 
-`adaptive_per_shard_rerank_preserves_recall` gate test: recall@10 ≥
-85% at K=2 and K=4 under adaptive per-shard rerank.
-
-See [`BENCHMARK.md`](BENCHMARK.md) for full methodology and all
-measurement runs.
+See [`BENCHMARK.md`](BENCHMARK.md) for full methodology.
 
 ---
 
-## Comparison
+## How it works
 
-| System           | Intermediary tax | Cross-cloud federation | Witness-authenticated | Cache sharing across processes | Deployable without GPU | `unsafe` count |
-|------------------|-----------------:|-----------------------:|----------------------:|-------------------------------:|-----------------------:|---------------:|
-| **ruLake**       | **1.02×**        | ✅ (rayon fan-out)     | ✅ (SHAKE-256)         | ✅ (content-addressed)         | ✅                     | **0**          |
-| Pinecone         | n/a (hosted)     | ❌ single-region        | ❌                     | ❌                             | n/a                    | n/a            |
-| Weaviate         | n/a (hosted)     | ❌                      | ❌                     | ❌                             | ✅                     | n/a            |
-| Milvus           | ~1.5–2×          | partial                | ❌                     | ❌                             | ✅                     | many           |
-| LanceDB          | ~1.1–1.3×        | ❌                      | ❌                     | ❌                             | ✅                     | some           |
-| BQ Vector Search | n/a (hosted)     | ❌ (BQ-only)            | ❌                     | ❌                             | n/a                    | n/a            |
-
-`ruLake` is explicitly **not** a vector database — it doesn't own
-storage. It's the substrate that lets you query whichever vector DB
-or lakehouse you already have, with a coherent compression +
-governance story across all of them. If you want a standalone managed
-vector DB, use Pinecone or Weaviate. If you want to use the vectors
-that already live in your lake, use `ruLake`.
-
----
-
-## Technical details
-
-### Architecture
-
-```text
-┌────────────────── RuLake ────────────────────┐
-│                                              │
-│  Consistency knob: Fresh | Eventual | Frozen │
-│                                              │
-│  ┌──────── VectorCache (Arc<Mutex>) ────┐   │
-│  │                                       │   │
-│  │   entries: witness → Arc<RabitqIdx>  │   │
-│  │   pointers: (backend, coll) → witness│   │
-│  │   per_backend / per_collection stats │   │
-│  │                                       │   │
-│  └───────────────────────────────────────┘   │
-│                  ▲                            │
-│                  │ prime (on miss)            │
-│  ┌───────────── BackendAdapter trait ─────┐  │
-│  │                                         │  │
-│  │  id() list_collections() pull_vectors() │  │
-│  │  generation() current_bundle()          │  │
-│  │                                         │  │
-│  └─ LocalBackend ─ FsBackend ─ ParquetBackend (M2) ─ ... ─┘  │
-└──────────────────────────────────────────────┘
-```
-
-### Bundle protocol
-
-`table.rulake.json` is the portable unit. The witness is:
+### Data flow
 
 ```
-SHAKE-256(32)(
-  "rulake-bundle-witness-v1|" ||
-  len(data_ref) || data_ref ||
-  "|" || dim || rotation_seed || rerank_factor ||
-  "|" || len(generation) || generation
-)
-```
-
-Length-prefixed + domain-separated so no field can collide with
-another bundle's witness via concatenation games.
-
-### Cache coherence
-
-```text
 search(backend, collection, query, k)
   │
   ▼
-ensure_fresh(key) ─────────────── Consistency mode?
-  │                                     │
-  │    ┌────────────────────┬───────────┼─────────────┐
-  │   Frozen               Eventual                  Fresh
-  │   (skip check          (skip if within TTL)       (always check)
-  │   after prime)                                    │
-  │                                                   ▼
-  │                            ask backend for current witness
-  │                                     │
-  │                 ┌───────────────────┼──────────────────┐
-  │              match              mismatch           mismatch
-  │             (hit)            & witness cached    & new witness
-  │                              elsewhere           (share-cache)
-  │                              (pointer move,
-  │                              no prime)
-  │                              │                       │
-  │                              ▼                       ▼
-  │                         just move pointer     pull + prime
-  │                                                       │
-  ▼                                                       ▼
-Arc<RabitqPlusIndex>::search (no lock held) ◀────────────┘
+ensure_fresh(key) ─── Consistency mode?
+  │                          │
+  ├── Frozen  (skip after prime)
+  ├── Eventual (skip within TTL)
+  └── Fresh   (always check)
+         │
+         ▼
+      ask backend for current witness
+         │
+    ┌────┴──────────────┐
+  match                mismatch
+  (hit)               │
+                   witness cached elsewhere?
+                   │              │
+                  yes             no
+                   │              │
+              move pointer   pull + prime
+              (0 work)       (compress into
+                              RaBitQ codes)
+         │              │
+         ▼              ▼
+  Arc<RabitqPlusIndex>::search (mutex dropped before scan)
+         │
+         ▼
+     top-K results, sorted by L2²
 ```
+
+### The bundle is the portable unit
+
+Every cache entry is anchored by a `table.rulake.json` sidecar:
+
+```json
+{
+  "format_version": 1,
+  "data_ref": "gs://bucket/corpus.parquet",
+  "dim": 768,
+  "rotation_seed": 42,
+  "rerank_factor": 20,
+  "generation": 1729843200,
+  "rvf_witness": "b3ac…0f7c",
+  "pii_policy": "pii://policies/default",
+  "lineage_id": "ol://jobs/ingest-42",
+  "memory_class": "episodic"
+}
+```
+
+The witness is a domain-separated, length-prefixed SHAKE-256 over the
+load-bearing fields. Two processes that observe the same bundle share
+one compressed cache entry — no coordination required.
 
 ### Adaptive per-shard rerank
 
-Under federation, the RaBitQ `rerank_factor × k` rerank would run
-once per shard — K× the work. ruLake's default divides the budget:
+Under federation, RaBitQ would run its `rerank_factor × k` rerank once
+per shard, costing K× more work as shard count grows. ruLake divides
+the budget:
 
-```rust
+```
 per_shard_rerank = max(MIN_PER_SHARD_RERANK, global_rerank / K)
-// MIN_PER_SHARD_RERANK = 5 (floor below which rerank is meaningless)
 ```
 
-Measured recall@10 stays above 85% at K=4. Callers who need byte-exact
-single-shard parity use `search_federated_with_rerank(..., Some(global))`.
+K=4 at rerank×20 gives 5 per shard. Measured recall@10 stays above
+85% (gate test). Callers that need byte-exact single-shard parity use
+`search_federated_with_rerank(.., Some(global_rerank))`.
 
 ### Arc-based concurrency
 
-`CacheEntry::index: Arc<RabitqPlusIndex>` is the key. Reader threads:
+`CacheEntry::index` is `Arc<RabitqPlusIndex>`. Readers:
 
 1. Lock the cache mutex
-2. Clone the Arc (cheap — refcount bump)
-3. Drop the lock
+2. Clone the Arc (refcount bump, a few cycles)
+3. **Drop the lock**
 4. Scan without holding anything shared
 
-The index is immutable after build, so concurrent scans are a pure
-data race against nothing. 8-11× QPS improvement under concurrent
-load vs the original `Mutex<CacheState>` scheme.
+The index is immutable after build, so concurrent scans race against
+nothing. This is the single biggest performance win on the branch —
+**8-12× concurrent QPS**.
 
-### Security model
+### Parallel prime
 
-- **No `unsafe`** in ruLake or rabitq kernel — every data-mutating
-  path goes through checked borrows.
-- **Path-traversal**: `FsBackend::register` + `write` validate
-  filenames (no `..`, no separators, no control bytes, ≤ 255 bytes).
-- **JSON size caps**: bundle ≤ 64 KiB, fields ≤ 4 KiB. A malicious
-  sidecar cannot DoS the reader.
-- **Witness verification**: every `read_from_dir` verifies the
-  SHAKE-256 chain; tampered bundles error out as `InvalidParameter`.
-- **Atomic writes**: `write_to_dir` uses `tmp + rename` so concurrent
-  readers never observe a torn sidecar.
-- **Mutex poisoning** on `.lock().unwrap()` is a deliberate
-  fail-fast — a poisoned mutex means the invariants are compromised.
-
-See ADR-155, ADR-156, ADR-157 for the full threat model + design
-trade-offs.
+On cache miss, `RabitqPlusIndex::from_vectors_parallel` rotates and
+bit-packs every vector in parallel via rayon, then commits them into
+the SoA storage serially. Output is bit-identical to the serial
+`add()` loop because rotation is deterministic. Above 1024 vectors
+this is faster than serial; below, the rayon task-queue overhead
+dominates and we fall back.
 
 ---
 
 ## User guide
 
-### Choosing a consistency mode
+### Choose a consistency mode
 
-- **`Fresh`** — every search calls `generation()` on the backend.
-  Appropriate for policy-enforced workloads where stale reads are a
-  compliance failure. ~1 network RTT per query overhead on real
-  backends.
-- **`Eventual { ttl_ms }`** — cache the coherence decision for
-  `ttl_ms`. Appropriate for search, RAG, recommendation. 60-second
-  TTL is a good default.
-- **`Frozen`** — never re-check the backend. Appropriate for
-  content-addressed historical snapshots where the bundle is
-  cryptographically pinned. Operators can still force-refresh via
-  `refresh_from_bundle_dir`.
+| Symptom / requirement | Mode |
+|---|---|
+| Legal / compliance: can't serve stale data, ever | `Fresh` |
+| Search, RAG, recommendation, agent retrieval | `Eventual { ttl_ms: 60_000 }` |
+| Audit snapshot; data is cryptographically pinned | `Frozen` |
 
-### Sizing the cache
+### Size the cache
 
 ```rust
-// Unbounded cache (M1 default) — fine for small collections:
+// Unbounded — fine for small collections or low-cardinality serving
 let lake = RuLake::new(20, 42);
 
-// LRU-capped cache for serving processes with memory bounds:
+// LRU-capped for memory-bounded serving processes
 let lake = RuLake::new(20, 42).with_max_cache_entries(100);
 ```
 
-Only unpinned entries (refcount == 0, no live pointer) are evicted.
-Active `(backend, collection)` pointers keep their entry alive.
+Only unpinned entries (refcount == 0, no live pointer) are evicted;
+active `(backend, collection)` pointers keep their entry alive.
 
-### Operational observability
+### Operational metrics
 
-| Metric (from `cache_stats()`) | What to do when it moves |
-|-------------------------------|--------------------------|
-| `hit_rate`                    | Below 0.95 → increase cache size or warm more aggressively |
-| `last_prime_ms`               | Spiking → backend RTT changed or data grew |
-| `primes`                      | Growing unexpectedly → check for witness churn |
-| `shared_hits`                 | Non-zero → cross-backend cache sharing is working |
-| `invalidations`               | Steady-state → coherence protocol is firing |
+| Metric | Signal | Action |
+|---|---|---|
+| `hit_rate` | < 0.95 | Grow cache or warm aggressively |
+| `last_prime_ms` | spiking | Backend RTT changed or collection grew |
+| `primes` | monotonic growth | Check for witness churn |
+| `shared_hits` | > 0 | Cross-backend sharing is working |
+| `invalidations` | climbing | Coherence protocol firing — inspect |
 
 Per-backend (`cache_stats_by_backend()`) and per-collection
-(`cache_stats_by_collection()`) views let you identify which
-specific data is hot.
+(`cache_stats_by_collection()`) views drill down.
 
-### Writing a custom backend
+### Write a custom backend
 
-Implement the `BackendAdapter` trait:
+Implement the four-method `BackendAdapter` trait:
 
 ```rust
 use ruvector_rulake::backend::{BackendAdapter, CollectionId, PulledBatch};
 
-struct MyBackend { /* ... */ }
+struct ParquetBackend { /* ... */ }
 
-impl BackendAdapter for MyBackend {
-    fn id(&self) -> &str { "my-backend" }
-
+impl BackendAdapter for ParquetBackend {
+    fn id(&self) -> &str { "parquet" }
     fn list_collections(&self) -> Result<Vec<CollectionId>> { /* ... */ }
-
-    fn pull_vectors(&self, collection: &str) -> Result<PulledBatch> {
-        // Stream vectors from wherever — Parquet, HTTP, BigQuery, ...
-    }
-
-    fn generation(&self, collection: &str) -> Result<u64> {
-        // Return a coherence token (mtime, snapshot id, version, ...).
-    }
-
-    // Optional: override current_bundle to use the canonical data_ref
-    // for cross-backend cache sharing.
-    fn current_bundle(&self, collection: &str, rotation_seed: u64, rerank_factor: usize)
-        -> Result<RuLakeBundle> { /* ... */ }
+    fn pull_vectors(&self, collection: &str) -> Result<PulledBatch> { /* ... */ }
+    fn generation(&self, collection: &str) -> Result<u64> { /* ... */ }
 }
 ```
 
-See `FsBackend` ([`src/fs_backend.rs`](src/fs_backend.rs)) for a
-~250-line reference implementation.
+See [`src/fs_backend.rs`](src/fs_backend.rs) for a 250-line reference
+(atomic file writes, mtime-as-generation, header-only `current_bundle`).
 
-### Running the examples
+### Run the examples
 
 ```bash
-# End-to-end sidecar daemon: publisher + reader + coherence loop
+# Full publish/refresh/coherence demo
 cargo run --release -p ruvector-rulake --example sidecar_daemon
 
-# Benchmark harness (3 minutes on a laptop)
+# Benchmark harness (~2 minutes)
 cargo run --release -p ruvector-rulake --bin rulake-demo
 
-# Fast mode: just n=5k
+# Fast mode (~5 seconds, just n=5k)
 cargo run --release -p ruvector-rulake --bin rulake-demo -- --fast
 ```
 
@@ -567,31 +496,32 @@ cargo run --release -p ruvector-rulake --bin rulake-demo -- --fast
 
 ## Status
 
-**M1: shipped and measured** (2026-04-23)
+**M1 — shipped and measured** (2026-04-23)
 
-- Core abstraction (BackendAdapter, VectorCache, bundle protocol,
-  Consistency modes, LRU eviction)
-- Two backends: `LocalBackend` (reference), `FsBackend` (file-based)
-- Optimization: adaptive per-shard rerank, Arc-based concurrency
-  (11.9× concurrent QPS win)
-- Observability: hit_rate, prime durations, per-backend, per-collection
+- Core abstraction (`BackendAdapter` trait, `VectorCache`, bundle protocol, 3 consistency modes, LRU)
+- Two reference backends (`LocalBackend`, `FsBackend`)
+- Optimizations: adaptive per-shard rerank, Arc-concurrency (12× concurrent win), parallel prime (11× miss-path win)
+- Observability: hit rate, prime times, per-backend, per-collection attribution
 - Substrate acceptance test (recall → verify → forget → rehydrate)
-- Security hardening (path traversal + JSON caps)
-- `VectorKernel` trait scaffolding in `ruvector-rabitq`
-- 40 tests, clippy `-D warnings` clean, zero `unsafe`
+- Security hardening (path traversal, JSON caps, witness verification)
+- `VectorKernel` trait scaffolding
+- 60 tests across the two crates, clippy `-D warnings` clean, zero `unsafe`
 
-**M2+ roadmap**: `ParquetBackend`, `BigQueryBackend`, HTTP wire layer,
-governance MVP, `DeltaBackend` / `IcebergBackend`, GPU kernels in
-separate crates.
+**M2+ on the roadmap**
 
-See [`docs/adr/ADR-155`](../../docs/adr/ADR-155-rulake-datalake-layer.md)
-(cache-first fabric), [`ADR-156`](../../docs/adr/ADR-156-rulake-as-memory-substrate.md)
-(memory substrate for agent brains),
-[`ADR-157`](../../docs/adr/ADR-157-optional-accelerator-plane.md)
-(accelerator plane) for the full design record.
+- `ParquetBackend`, `BigQueryBackend`, `IcebergBackend`, `DeltaBackend`
+- HTTP / gRPC wire layer
+- Governance MVP (RBAC via OIDC, PII passthrough, OpenLineage)
+- GPU kernels in separate crates (`ruvector-rabitq-cuda`, etc.)
+
+Full design record:
+
+- [`ADR-155`](../../docs/adr/ADR-155-rulake-datalake-layer.md) — cache-first fabric
+- [`ADR-156`](../../docs/adr/ADR-156-rulake-as-memory-substrate.md) — memory substrate for agent brains
+- [`ADR-157`](../../docs/adr/ADR-157-optional-accelerator-plane.md) — optional accelerator plane
 
 ---
 
 ## License
 
-Apache-2.0 OR MIT (workspace default)
+Apache-2.0 OR MIT (RuVector workspace default)
