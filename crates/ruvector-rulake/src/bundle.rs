@@ -69,10 +69,30 @@ impl Generation {
     }
 
     /// Concatenate into a byte stream for witness digest input.
+    ///
+    /// Prepends a 1-byte variant tag (`0x00` for `Num`, `0x01` for
+    /// `Opaque`) so the two variants can never produce the same
+    /// hash-bytes stream. Without the tag, `Num(7)` and
+    /// `Opaque("\x07\0\0\0\0\0\0\0")` would collide — a correctness
+    /// bug surfaced by the 2026-04-23 security audit. The witness
+    /// format now includes this tag; old witnesses computed without
+    /// it will not match newly-computed ones, which is intended:
+    /// it's a breaking change to the witness, bumped as such in the
+    /// bundle's `format_version = 2`.
     pub fn hash_bytes(&self) -> Vec<u8> {
         match self {
-            Self::Num(n) => n.to_le_bytes().to_vec(),
-            Self::Opaque(s) => s.as_bytes().to_vec(),
+            Self::Num(n) => {
+                let mut out = Vec::with_capacity(1 + 8);
+                out.push(0x00);
+                out.extend_from_slice(&n.to_le_bytes());
+                out
+            }
+            Self::Opaque(s) => {
+                let mut out = Vec::with_capacity(1 + s.len());
+                out.push(0x01);
+                out.extend_from_slice(s.as_bytes());
+                out
+            }
         }
     }
 }
@@ -135,7 +155,12 @@ pub struct RuLakeBundle {
 }
 
 impl RuLakeBundle {
-    pub const FORMAT_VERSION: u32 = 1;
+    /// Witness-format version. Bumped to 2 on 2026-04-23 when the
+    /// `Generation` variant tag byte was added to `hash_bytes()` (see
+    /// security audit §4). Version 1 witnesses are NOT forward-
+    /// compatible with version 2 — operators with persisted v1
+    /// bundles must re-prime the cache.
+    pub const FORMAT_VERSION: u32 = 2;
 
     /// Construct a bundle, computing the witness from the other fields.
     pub fn new(
@@ -396,6 +421,25 @@ mod tests {
     }
 
     #[test]
+    fn generation_num_and_opaque_cannot_collide() {
+        // Regression against the security-audit finding: before the
+        // tag byte, Num(7) and Opaque("\x07\0\0\0\0\0\0\0") shared
+        // hash_bytes() output, so their witnesses collided.
+        let a = RuLakeBundle::new("x", 1, 0, 1, Generation::Num(7));
+        let b = RuLakeBundle::new(
+            "x",
+            1,
+            0,
+            1,
+            Generation::Opaque("\x07\0\0\0\0\0\0\0".to_string()),
+        );
+        assert_ne!(
+            a.rvf_witness, b.rvf_witness,
+            "Num and Opaque witnesses must be distinguishable"
+        );
+    }
+
+    #[test]
     fn witness_is_length_prefixed() {
         // Regression against "a|b" colliding with "ab|" on concat-only
         // witness schemes. Length prefixes should prevent that.
@@ -435,7 +479,7 @@ mod tests {
         let good = RuLakeBundle::new("x", 128, 1, 20, Generation::Num(1));
         let mut s = good.to_json().unwrap();
         // Simulate a future bundle with format_version: 99.
-        s = s.replace("\"format_version\": 1", "\"format_version\": 99");
+        s = s.replace("\"format_version\": 2", "\"format_version\": 99");
         let err = RuLakeBundle::from_json(&s).unwrap_err();
         assert!(matches!(err, crate::RuLakeError::InvalidParameter(_)));
     }

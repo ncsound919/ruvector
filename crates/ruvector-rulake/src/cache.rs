@@ -268,6 +268,10 @@ impl VectorCache {
         witness: WitnessKey,
         batch: PulledBatch,
     ) -> crate::Result<()> {
+        // Defense-in-depth: reject hostile / corrupt batches before any
+        // allocation. A malicious backend claiming n=u64::MAX / dim=2^30
+        // would otherwise OOM the host during prime.
+        crate::backend::validate_pulled_batch(&batch)?;
         // Fast path: target witness already cached — just point and return.
         {
             let mut inner = self.inner.lock().unwrap();

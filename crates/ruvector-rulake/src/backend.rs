@@ -48,6 +48,65 @@ pub struct PulledBatch {
     pub generation: u64,
 }
 
+/// Hard caps enforced on any `PulledBatch` returned from a backend.
+/// Protects `RuLake` from a hostile or corrupt backend returning an
+/// impossibly-large batch that would OOM the host. Operators with
+/// legitimate use cases beyond these bounds can raise them at the
+/// call site after explicit review.
+///
+/// Values chosen to cover every realistic collection size seen in
+/// production vector workloads (100M vectors × 8192 dim is ~8 TB
+/// of f32, more than any single serving process handles).
+pub const MAX_PULLED_VECTORS: usize = 100_000_000;
+pub const MAX_PULLED_DIM: usize = 8192;
+pub const MAX_PULLED_BYTES: usize = 16 * 1024 * 1024 * 1024; // 16 GiB
+
+/// Validate a `PulledBatch` against the hard caps above. Called by
+/// `VectorCache::prime` before allocating. Returns an error rather
+/// than panicking because a hostile backend reaching this check is
+/// expected — fail the one search, keep the process alive.
+pub(crate) fn validate_pulled_batch(batch: &PulledBatch) -> Result<()> {
+    if batch.ids.len() != batch.vectors.len() {
+        return Err(RuLakeError::InvalidParameter(format!(
+            "PulledBatch: ids.len={} != vectors.len={}",
+            batch.ids.len(),
+            batch.vectors.len()
+        )));
+    }
+    if batch.ids.len() > MAX_PULLED_VECTORS {
+        return Err(RuLakeError::InvalidParameter(format!(
+            "PulledBatch: {} vectors exceeds cap {MAX_PULLED_VECTORS}",
+            batch.ids.len()
+        )));
+    }
+    if batch.dim == 0 || batch.dim > MAX_PULLED_DIM {
+        return Err(RuLakeError::InvalidParameter(format!(
+            "PulledBatch: dim={} outside (0, {MAX_PULLED_DIM}]",
+            batch.dim
+        )));
+    }
+    // checked_mul catches the 32-bit-usize overflow case the security
+    // audit flagged: a 64-bit count field that truncates when cast.
+    let bytes = batch
+        .ids
+        .len()
+        .checked_mul(batch.dim)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| {
+            RuLakeError::InvalidParameter(format!(
+                "PulledBatch: size overflow (n={}, dim={})",
+                batch.ids.len(),
+                batch.dim
+            ))
+        })?;
+    if bytes > MAX_PULLED_BYTES {
+        return Err(RuLakeError::InvalidParameter(format!(
+            "PulledBatch: {bytes} bytes exceeds cap {MAX_PULLED_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
 pub trait BackendAdapter: Send + Sync {
     fn id(&self) -> &str;
 
@@ -267,5 +326,62 @@ impl BackendAdapter for LocalBackend {
             rerank_factor,
             crate::Generation::Num(c.generation),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch(n: usize, dim: usize) -> PulledBatch {
+        PulledBatch {
+            collection: "c".to_string(),
+            ids: (0..n as u64).collect(),
+            vectors: vec![vec![0.0; dim]; n],
+            dim,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn pulled_batch_validator_accepts_reasonable_size() {
+        // 10k vectors × 128 dim × 4 bytes = 5 MiB — well within caps.
+        assert!(validate_pulled_batch(&batch(10_000, 128)).is_ok());
+    }
+
+    #[test]
+    fn pulled_batch_validator_rejects_dim_zero() {
+        let b = PulledBatch {
+            collection: "c".to_string(),
+            ids: vec![0],
+            vectors: vec![vec![]],
+            dim: 0,
+            generation: 1,
+        };
+        assert!(validate_pulled_batch(&b).is_err());
+    }
+
+    #[test]
+    fn pulled_batch_validator_rejects_dim_over_cap() {
+        let b = PulledBatch {
+            collection: "c".to_string(),
+            ids: vec![0],
+            vectors: vec![vec![0.0; MAX_PULLED_DIM + 1]],
+            dim: MAX_PULLED_DIM + 1,
+            generation: 1,
+        };
+        assert!(validate_pulled_batch(&b).is_err());
+    }
+
+    #[test]
+    fn pulled_batch_validator_rejects_len_mismatch() {
+        let b = PulledBatch {
+            collection: "c".to_string(),
+            ids: vec![0, 1],
+            vectors: vec![vec![0.0; 4]],
+            dim: 4,
+            generation: 1,
+        };
+        assert!(validate_pulled_batch(&b).is_err());
     }
 }

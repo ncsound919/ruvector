@@ -250,14 +250,39 @@ impl BackendAdapter for FsBackend {
                 path.display()
             )));
         }
-        let count = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
-        let dim = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        // Bounds-check the on-disk header BEFORE any allocation. A
+        // corrupt or hostile file claiming count=u64::MAX or
+        // dim=u32::MAX would otherwise crash the host — use try_from
+        // so 32-bit targets reject oversized counts instead of
+        // silently truncating, and checked_mul so the vec-buffer
+        // size can't overflow.
+        let count_u64 = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let dim_u32 = u32::from_le_bytes(header[16..20].try_into().unwrap());
+        let count = usize::try_from(count_u64).map_err(|_| {
+            RuLakeError::InvalidParameter(format!(
+                "FsBackend::pull: count={count_u64} exceeds usize"
+            ))
+        })?;
+        let dim = dim_u32 as usize;
+        if count > crate::backend::MAX_PULLED_VECTORS {
+            return Err(RuLakeError::InvalidParameter(format!(
+                "FsBackend::pull: count={count} exceeds MAX_PULLED_VECTORS"
+            )));
+        }
+        if dim == 0 || dim > crate::backend::MAX_PULLED_DIM {
+            return Err(RuLakeError::InvalidParameter(format!(
+                "FsBackend::pull: dim={dim} outside (0, MAX_PULLED_DIM]"
+            )));
+        }
         // header[20..24] reserved — ignored.
 
+        let vec_buf_bytes = dim.checked_mul(4).ok_or_else(|| {
+            RuLakeError::InvalidParameter("FsBackend::pull: dim*4 overflow".to_string())
+        })?;
         let mut ids = Vec::with_capacity(count);
         let mut vectors = Vec::with_capacity(count);
         let mut id_buf = [0u8; 8];
-        let mut vec_bytes = vec![0u8; dim * 4];
+        let mut vec_bytes = vec![0u8; vec_buf_bytes];
         for _ in 0..count {
             f.read_exact(&mut id_buf)
                 .map_err(|e| RuLakeError::InvalidParameter(format!("FsBackend::pull: id: {e}")))?;
