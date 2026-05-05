@@ -36,6 +36,10 @@ tls = ["tonic/tls"]
 #   cargo build --features hailo,cpu-fallback --bin ruvector-hailo-worker
 cpu-fallback = ["ruvector-hailo/cpu-fallback"]
 
+# ADR-179 iter 9 — wire the in-tree ruvllm engine into ruvllm-pi-worker.
+# Off by default to keep `cargo build` fast for non-LLM work.
+ruvllm-engine = ["dep:ruvllm", "dep:anyhow"]
+
 # Iter 219 — rejoined the parent workspace. Closes ADR-178 Gap E
 # (folded into Gap B). The iter-218 EmbeddingProvider impl bridged
 # the trait gap; rejoining lets `cargo build --workspace` see the
@@ -74,6 +78,12 @@ ruvector-hailo     = { path = "../ruvector-hailo" }
 # default-features=false keeps reqwest / ort / hnsw out — we only
 # need the trait + error surface.
 ruvector-core      = { path = "../ruvector-core", default-features = false }
+# ADR-179 iter 9: in-tree LLM inference engine. Optional + feature-gated
+# behind `ruvllm-engine` so default builds don't pull candle (heavy).
+# Cross-builds for aarch64 require `--no-default-features --features
+# ruvllm-engine` here AND ruvllm built without `hub-download` (iter 8).
+ruvllm             = { path = "../ruvllm", optional = true, default-features = false, features = ["async-runtime", "candle", "quantize"] }
+anyhow             = { version = "1", optional = true }
 
 [[bin]]
 name = "ruvector-hailo-worker"
@@ -112,6 +122,15 @@ path = "src/bin/ruview-csi-bridge.rs"
 # the cluster without speaking gRPC.
 name = "ruvllm-bridge"
 path = "src/bin/ruvllm-bridge.rs"
+
+[[bin]]
+# ADR-179 (iter 3, scaffold): per-Pi LLM completion worker. Uses
+# `ruvllm` as a library + loads quantized models from local paths
+# (no hf-hub) so it cross-compiles cleanly to aarch64. Sibling to
+# `ruvector-hailo-worker` on each Pi 5 — :50051 for embeddings,
+# :50053 for completions. Engine wiring lands iter 4–6.
+name = "ruvllm-pi-worker"
+path = "src/bin/ruvllm-pi-worker.rs"
 
 [build-dependencies]
 tonic-build         = { version = "0.12", default-features = false, features = ["prost"] }
