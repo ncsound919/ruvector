@@ -51,7 +51,7 @@ use std::net::SocketAddr;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(feature = "ruvllm-engine")]
-const GATE: &str = "ADR-179 iter 9 — engine wired (qwen2.5-0.5b fp16 first)";
+const GATE: &str = "ADR-180 iter 3 — N-backend pool + semaphore parallelism";
 #[cfg(not(feature = "ruvllm-engine"))]
 const GATE: &str = "ADR-179 iter 3 — scaffold (no engine; build with --features ruvllm-engine)";
 
@@ -69,51 +69,99 @@ fn read_optional_env(key: &str) -> String {
 #[cfg(feature = "ruvllm-engine")]
 mod engine {
     use ruvllm::backends::{CandleBackend, GenerateParams, LlmBackend, ModelConfig};
-    use std::sync::Mutex;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
-    /// Thread-safe wrapper around CandleBackend. ServingEngine has its
-    /// own scheduler+batcher, but iter 9 ships a simpler single-shot
-    /// generate path — one request at a time — so we can prove the
-    /// loop closes end-to-end. Iter 10 swaps this for ServingEngine.
+    /// ADR-180 iter 3: pool of `Mutex<CandleBackend>` instances + a
+    /// tokio Semaphore for capacity control. N independent backends =
+    /// N parallel requests *actually running concurrently* on different
+    /// threads, each holding its own model weights + KV cache.
+    ///
+    /// **Why not ServingEngine?** Iter-2 found that ruvllm 2.2.0's
+    /// `ServingEngine::generate_next_token` is a per-token text-mode
+    /// dispatcher that still serializes on `model.generate(text, 1)` —
+    /// no actual batched forward pass against CandleBackend. It's a
+    /// scaffold for true continuous batching, not a working impl.
+    ///
+    /// **Cost of pool**: N × ~640 MB weights = 4 backends ≈ 2.5 GB on
+    /// each Pi. 8 GB Pi 5 has plenty of headroom (the embed worker
+    /// + system already use ~1 GB, leaving ~5 GB for our pool + KV).
     pub struct PiEngine {
-        inner: Mutex<CandleBackend>,
+        backends: Vec<Arc<tokio::sync::Mutex<CandleBackend>>>,
+        sem: Arc<Semaphore>,
     }
 
     impl PiEngine {
-        pub fn load(model_path: &str) -> anyhow::Result<Self> {
-            let mut backend = CandleBackend::new()
-                .map_err(|e| anyhow::anyhow!("CandleBackend::new failed: {e:?}"))?;
-            // ADR-179 iter 10: candle-transformers' Llama path panics
-            // with "compile with '--features flash-attn'" on CPU when
-            // use_flash_attn=true. The flag is intended to gate
-            // CUDA-only kernels — set false so the model uses the
-            // standard candle attention. We also disable quantization
-            // here so iter 10 first-light is fp16; pi_quant lands iter 11.
+        pub fn load(model_path: &str, pool_size: usize) -> anyhow::Result<Self> {
+            // Load ONE backend first to fail fast on bad model paths,
+            // then load the rest. (Loads are independent; we could
+            // parallelize, but Pi 5 disk IO + tokenizer init is the
+            // serial bottleneck either way.)
             let config = ModelConfig {
                 use_flash_attention: false,
                 quantization: None,
                 ..ModelConfig::default()
             };
-            backend
-                .load_model(model_path, config)
-                .map_err(|e| anyhow::anyhow!("load_model({model_path}) failed: {e:?}"))?;
+
+            let mut backends = Vec::with_capacity(pool_size);
+            for i in 0..pool_size {
+                let mut backend = CandleBackend::new()
+                    .map_err(|e| anyhow::anyhow!("CandleBackend::new[{i}] failed: {e:?}"))?;
+                backend
+                    .load_model(model_path, config.clone())
+                    .map_err(|e| anyhow::anyhow!("load_model[{i}]({model_path}) failed: {e:?}"))?;
+                backends.push(Arc::new(tokio::sync::Mutex::new(backend)));
+                tracing::info!(
+                    "loaded backend slot {}/{} for {}",
+                    i + 1,
+                    pool_size,
+                    model_path
+                );
+            }
+
             Ok(Self {
-                inner: Mutex::new(backend),
+                backends,
+                sem: Arc::new(Semaphore::new(pool_size)),
             })
         }
 
-        pub fn generate(&self, prompt: &str, max_tokens: usize) -> anyhow::Result<String> {
-            let backend = self
-                .inner
-                .lock()
-                .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?;
-            let params = GenerateParams {
-                max_tokens,
-                ..Default::default()
+        /// Pick a free backend slot (round-robin under semaphore) and
+        /// drive the request to completion. Multiple concurrent calls
+        /// run on different slots — true request-level parallelism.
+        pub async fn generate(&self, prompt: &str, max_tokens: usize) -> anyhow::Result<String> {
+            let _permit = self
+                .sem
+                .acquire()
+                .await
+                .map_err(|e| anyhow::anyhow!("semaphore closed: {e:?}"))?;
+
+            // Find the first un-locked backend (try-lock walk).
+            let backend = {
+                let mut chosen = None;
+                for b in &self.backends {
+                    if let Ok(_g) = b.try_lock() {
+                        chosen = Some(Arc::clone(b));
+                        break;
+                    }
+                }
+                chosen.unwrap_or_else(|| Arc::clone(&self.backends[0]))
             };
-            backend
-                .generate(prompt, params)
-                .map_err(|e| anyhow::anyhow!("generate failed: {e:?}"))
+
+            let prompt = prompt.to_string();
+            // Move the actual generate() call to a blocking thread —
+            // candle's CPU forward pass is sync + compute-heavy.
+            tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                let backend = backend.blocking_lock();
+                let params = GenerateParams {
+                    max_tokens,
+                    ..Default::default()
+                };
+                backend
+                    .generate(&prompt, params)
+                    .map_err(|e| anyhow::anyhow!("generate failed: {e:?}"))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e:?}"))?
         }
     }
 }
@@ -142,11 +190,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "ruvllm-engine")]
     let engine = if model_path.is_empty() {
-        tracing::warn!("RUVLLM_MODEL_PATH is unset; refusing to start engine, falling back to scaffold mode");
+        tracing::warn!(
+            "RUVLLM_MODEL_PATH is unset; refusing to start engine, falling back to scaffold mode"
+        );
         None
     } else {
-        tracing::info!("loading model from {} ...", model_path);
-        match engine::PiEngine::load(&model_path) {
+        // ADR-180 iter 2: max_inflight controls ServingEngine's
+        // continuous-batching capacity. Default 4; bump via env to sweep.
+        let max_inflight: usize = env::var("RUVLLM_MAX_INFLIGHT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        tracing::info!(
+            "loading model from {} (max_inflight={}) ...",
+            model_path,
+            max_inflight
+        );
+        match engine::PiEngine::load(&model_path, max_inflight) {
             Ok(e) => {
                 tracing::info!("model loaded, ready to serve");
                 Some(std::sync::Arc::new(e))
@@ -198,32 +258,29 @@ async fn handle_conn(
         let req: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => {
-                let banner = format!(
-                    "ruvllm-pi-worker v{} — {}\n",
-                    VERSION, GATE
-                );
+                let banner = format!("ruvllm-pi-worker v{} — {}\n", VERSION, GATE);
                 tx.write_all(banner.as_bytes()).await?;
                 continue;
             }
         };
         let prompt = req.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-        let max_tokens = req
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(64) as usize;
+        let max_tokens = req.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(64) as usize;
 
-        let started = std::time::Instant::now();
         #[cfg(feature = "ruvllm-engine")]
-        let resp = match &engine {
-            Some(e) => match e.generate(prompt, max_tokens) {
-                Ok(text) => {
-                    let ms = started.elapsed().as_millis() as u64;
-                    serde_json::json!({"text": text, "tokens": text.len(), "ms": ms})
+        let resp = {
+            let started = std::time::Instant::now();
+            match &engine {
+                // ADR-180 iter 2: generate() is now async (ServingEngine submit_async).
+                Some(e) => match e.generate(prompt, max_tokens).await {
+                    Ok(text) => {
+                        let ms = started.elapsed().as_millis() as u64;
+                        serde_json::json!({"text": text, "tokens": text.len(), "ms": ms})
+                    }
+                    Err(e) => serde_json::json!({"error": format!("{e:#}")}),
+                },
+                None => {
+                    serde_json::json!({"error": "engine not loaded; check RUVLLM_MODEL_PATH"})
                 }
-                Err(e) => serde_json::json!({"error": format!("{e:#}")}),
-            },
-            None => {
-                serde_json::json!({"error": "engine not loaded; check RUVLLM_MODEL_PATH"})
             }
         };
         #[cfg(not(feature = "ruvllm-engine"))]
