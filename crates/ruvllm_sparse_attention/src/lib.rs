@@ -3,8 +3,8 @@ pub mod model;
 pub mod tensor;
 
 pub use attention::{
-    dense_attention, AttentionBackend, AttentionError, KvCache, SparseAttentionConfig,
-    SubquadraticSparseAttention,
+    dense_attention, AttentionBackend, AttentionError, IncrementalLandmarks, KvCache,
+    SparseAttentionConfig, SubquadraticSparseAttention,
 };
 pub use model::{RuvLlmSparseBlock, RuvLlmSparseBlockConfig};
 pub use tensor::Tensor3;

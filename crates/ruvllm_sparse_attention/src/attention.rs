@@ -932,47 +932,96 @@ impl SubquadraticSparseAttention {
             None
         };
 
-        let mut out = Tensor3::zeros(seq, q_heads, dim);
-        let mut seen_tokens = vec![0usize; seq.max(1)];
-        let mut seen_blocks = vec![0usize; div_ceil(seq.max(1), self.config.block_size)];
-        let mut token_candidates = Vec::<usize>::with_capacity(self.config.window + 64);
-        let mut block_candidates = Vec::<usize>::with_capacity(64);
-        let mut acc = vec![0f32; dim];
-
-        for h in 0..q_heads {
-            let kv_h = h / group_size;
-            for i in 0..seq {
-                let stamp = 1 + h * seq + i;
-                token_candidates.clear();
-                block_candidates.clear();
-
-                build_token_candidates(i, seq, &self.config, &mut seen_tokens, stamp, &mut token_candidates);
-                if landmarks.is_some() {
-                    build_landmark_candidates(i, seq, &self.config, &mut seen_blocks, stamp, &mut block_candidates);
-                }
-
-                let q_row = q.row(i, h);
-                let mut running_max = f32::NEG_INFINITY;
-                let mut denom = 0.0f32;
-                acc.fill(0.0);
-
-                for &j in &token_candidates {
-                    let score = dot(q_row, k.row(j, kv_h)) * scale;
-                    if score > running_max {
-                        let corr = (running_max - score).exp();
-                        for d in 0..dim { acc[d] *= corr; }
-                        denom *= corr;
-                        running_max = score;
+        #[cfg(feature = "parallel")]
+        let out = {
+            use rayon::prelude::*;
+            let lm_ref = landmarks.as_ref();
+            let config = &self.config;
+            let head_vecs: Vec<Vec<f32>> = (0..q_heads).into_par_iter().map(|h| {
+                let kv_h = h / group_size;
+                let mut seen_tokens = vec![0usize; seq.max(1)];
+                let mut seen_blocks = vec![0usize; div_ceil(seq.max(1), config.block_size)];
+                let mut tok_c = Vec::<usize>::with_capacity(config.window + 64);
+                let mut blk_c = Vec::<usize>::with_capacity(64);
+                let mut acc = vec![0f32; dim];
+                let mut hout = vec![0f32; seq * dim];
+                for i in 0..seq {
+                    let stamp = 1 + h * seq + i;
+                    tok_c.clear(); blk_c.clear();
+                    build_token_candidates(i, seq, config, &mut seen_tokens, stamp, &mut tok_c);
+                    if lm_ref.is_some() {
+                        build_landmark_candidates(i, seq, config, &mut seen_blocks, stamp, &mut blk_c);
                     }
-                    let w = (score - running_max).exp();
-                    denom += w;
-                    let v_row = v.row(j, kv_h);
-                    for d in 0..dim { acc[d] += w * v_row[d]; }
+                    let q_row = q.row(i, h);
+                    let mut running_max = f32::NEG_INFINITY;
+                    let mut denom = 0.0f32;
+                    acc.fill(0.0);
+                    for &j in &tok_c {
+                        let score = dot(q_row, k.row(j, kv_h)) * scale;
+                        if score > running_max {
+                            let c = (running_max - score).exp();
+                            for d in 0..dim { acc[d] *= c; }
+                            denom *= c; running_max = score;
+                        }
+                        let w = (score - running_max).exp();
+                        denom += w;
+                        let vr = v.row(j, kv_h);
+                        for d in 0..dim { acc[d] += w * vr[d]; }
+                    }
+                    if let Some(lm) = lm_ref {
+                        for &b in &blk_c {
+                            let score = dot(q_row, lm.keys.row(b, kv_h)) * scale;
+                            if score > running_max {
+                                let c = (running_max - score).exp();
+                                for d in 0..dim { acc[d] *= c; }
+                                denom *= c; running_max = score;
+                            }
+                            let w = (score - running_max).exp();
+                            denom += w;
+                            let vr = lm.values.row(b, kv_h);
+                            for d in 0..dim { acc[d] += w * vr[d]; }
+                        }
+                    }
+                    let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+                    let s = &mut hout[i * dim..(i + 1) * dim];
+                    for d in 0..dim { s[d] = acc[d] * inv; }
                 }
+                hout
+            }).collect();
+            let mut out = Tensor3::zeros(seq, q_heads, dim);
+            for h in 0..q_heads {
+                for i in 0..seq {
+                    out.row_mut(i, h).copy_from_slice(&head_vecs[h][i * dim..(i + 1) * dim]);
+                }
+            }
+            out
+        };
 
-                if let Some(lm) = landmarks.as_ref() {
-                    for &b in &block_candidates {
-                        let score = dot(q_row, lm.keys.row(b, kv_h)) * scale;
+        #[cfg(not(feature = "parallel"))]
+        let out = {
+            let mut out = Tensor3::zeros(seq, q_heads, dim);
+            let mut seen_tokens = vec![0usize; seq.max(1)];
+            let mut seen_blocks = vec![0usize; div_ceil(seq.max(1), self.config.block_size)];
+            let mut token_candidates = Vec::<usize>::with_capacity(self.config.window + 64);
+            let mut block_candidates = Vec::<usize>::with_capacity(64);
+            let mut acc = vec![0f32; dim];
+
+            for h in 0..q_heads {
+                let kv_h = h / group_size;
+                for i in 0..seq {
+                    let stamp = 1 + h * seq + i;
+                    token_candidates.clear();
+                    block_candidates.clear();
+                    build_token_candidates(i, seq, &self.config, &mut seen_tokens, stamp, &mut token_candidates);
+                    if landmarks.is_some() {
+                        build_landmark_candidates(i, seq, &self.config, &mut seen_blocks, stamp, &mut block_candidates);
+                    }
+                    let q_row = q.row(i, h);
+                    let mut running_max = f32::NEG_INFINITY;
+                    let mut denom = 0.0f32;
+                    acc.fill(0.0);
+                    for &j in &token_candidates {
+                        let score = dot(q_row, k.row(j, kv_h)) * scale;
                         if score > running_max {
                             let corr = (running_max - score).exp();
                             for d in 0..dim { acc[d] *= corr; }
@@ -981,16 +1030,31 @@ impl SubquadraticSparseAttention {
                         }
                         let w = (score - running_max).exp();
                         denom += w;
-                        let v_row = lm.values.row(b, kv_h);
+                        let v_row = v.row(j, kv_h);
                         for d in 0..dim { acc[d] += w * v_row[d]; }
                     }
+                    if let Some(lm) = landmarks.as_ref() {
+                        for &b in &block_candidates {
+                            let score = dot(q_row, lm.keys.row(b, kv_h)) * scale;
+                            if score > running_max {
+                                let corr = (running_max - score).exp();
+                                for d in 0..dim { acc[d] *= corr; }
+                                denom *= corr;
+                                running_max = score;
+                            }
+                            let w = (score - running_max).exp();
+                            denom += w;
+                            let v_row = lm.values.row(b, kv_h);
+                            for d in 0..dim { acc[d] += w * v_row[d]; }
+                        }
+                    }
+                    let out_row = out.row_mut(i, h);
+                    let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+                    for d in 0..dim { out_row[d] = acc[d] * inv; }
                 }
-
-                let out_row = out.row_mut(i, h);
-                let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
-                for d in 0..dim { out_row[d] = acc[d] * inv; }
             }
-        }
+            out
+        };
 
         Ok(out)
     }
