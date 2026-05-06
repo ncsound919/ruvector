@@ -227,6 +227,8 @@ members = [
     "examples/real-eeg-analysis",
     # Multi-seizure cross-patient analysis: all 7 chb01 seizures
     "examples/real-eeg-multi-seizure",
+    # ruvllm sparse attention kernel for Hailo-10H cluster (ADR-183 – ADR-190)
+    "crates/ruvllm_sparse_attention",
 ]
 resolver = "2"
 

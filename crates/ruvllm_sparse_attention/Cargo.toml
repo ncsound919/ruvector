@@ -1,0 +1,17 @@
+[package]
+name = "ruvllm_sparse_attention"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Subquadratic sparse attention kernel for ruvllm style inference"
+
+[dependencies]
+
+[dev-dependencies]
+# rand is only used in tests/benchmarks — keep zero runtime dep footprint (ADR-183)
+rand = "0.8"
+criterion = "0.5"
+
+[[bench]]
+name = "attention_bench"
+harness = false
