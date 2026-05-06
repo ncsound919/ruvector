@@ -9,7 +9,7 @@ Subquadratic sparse attention kernel for the ruvllm inference stack, optimised f
 | Zero runtime dep footprint (`rand` dev-only) | ADR-183 | Accepted |
 | One-pass online softmax (~2× FLOPs reduction) | ADR-184 | Accepted |
 | Non-causal landmark block-exclusion fix | ADR-185 | Accepted |
-| 17-test CI suite, validated on Pi 5 aarch64 | ADR-186 | Accepted |
+| 17-test CI suite, validated on all 4 Pi 5 cluster nodes | ADR-186 | Accepted |
 | Overflow-checked `Tensor3::zeros` | ADR-187 | Accepted |
 | Stamp-scheme comments (cross-head dedup safety) | ADR-188 | Accepted |
 | KV cache incremental decode (`decode_step`) | ADR-189 | Accepted |
@@ -63,15 +63,20 @@ let q_new = Tensor3::zeros(1, 32, 128);
 let out = attn.decode_step(&q_new, &cache).unwrap();
 ```
 
-## Benchmarks (x86-64 ruvultra, 8 heads dim=64, default config)
+## Benchmarks
 
-| seq | sparse forward | edge reduction vs dense |
-|---|---|---|
-| 512 | 13.1 ms | 2.2× |
-| 1024 | 28.4 ms | 4.0× |
-| 2048 | 60.1 ms | 7.7× |
-| 4096 | 126.5 ms | 15.0× |
-| 8192 | 262.6 ms | 29.3× |
+Config: 8 heads, dim=64, window=128, block_size=64, causal=true, log-stride+landmarks enabled.
+
+| seq | x86-64 (AMD Ryzen) | Pi 5 Cortex-A76 | edge reduction vs dense |
+|---|---|---|---|
+| 512 | 13.1 ms | 85.8 ms | 2.2× |
+| 1024 | 28.4 ms | 190.5 ms | 4.0× |
+| 2048 | 60.1 ms | 401.0 ms | 7.7× |
+| 4096 | 126.5 ms | 836.2 ms | 15.0× |
+| 8192 | 262.6 ms | ~1,660 ms (est.) | 29.3× |
+
+Pi 5 measurements collected on `cognitum-v0` (Raspberry Pi 5 Model B Rev 1.1,
+aarch64, compiled with `-C target-cpu=cortex-a76 -C target-feature=+lse,+rcpc,+fp16,+crc`).
 
 ## Hailo-10H KV cache memory (Mistral-7B, seq=8192)
 
@@ -92,6 +97,17 @@ seq       dense_causal   sparse   reduction
 16,384   134,225,920   2,334,274    57.5×
 32,768   536,887,296   4,742,658   113.2×
 ```
+
+## Cluster validation
+
+All 17 tests pass on all 4 Hailo-10H cluster nodes (release build, aarch64):
+
+| Node | Result |
+|---|---|
+| cognitum-v0 | 17/17 ✓ |
+| cognitum-v1 | 17/17 ✓ |
+| cognitum-cluster-2 | 17/17 ✓ |
+| cognitum-cluster-3 | 17/17 ✓ |
 
 ## Build and test
 
