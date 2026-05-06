@@ -9,9 +9,12 @@ description = "Subquadratic sparse attention kernel for ruvllm style inference"
 default = []
 # Enable parallel head loops via rayon (~4× prefill speedup on multi-core).
 parallel = ["dep:rayon"]
+# Enable FP16 KV cache (halves KV memory; requires the `half` crate).
+fp16 = ["dep:half"]
 
 [dependencies]
 rayon = { version = "1", optional = true }
+half = { version = "2", optional = true }
 
 [dev-dependencies]
 # rand is only used in tests/benchmarks — keep zero runtime dep footprint (ADR-183)

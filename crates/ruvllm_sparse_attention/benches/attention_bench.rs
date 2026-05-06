@@ -60,5 +60,37 @@ fn bench_dense_reference(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_sparse, bench_dense_reference);
+fn bench_flash_sparse(c: &mut Criterion) {
+    let mut group = c.benchmark_group("flash_sparse_attention");
+    let heads = 8;
+    let dim = 64;
+
+    for seq in [512usize, 1024, 2048, 4096] {
+        let q = random_tensor(seq, heads, dim, 7);
+        let k = random_tensor(seq, heads, dim, 8);
+        let v = random_tensor(seq, heads, dim, 9);
+        let attention = SubquadraticSparseAttention::new(SparseAttentionConfig {
+            window: 128,
+            block_size: 64,
+            global_tokens: vec![0],
+            causal: true,
+            use_log_stride: true,
+            use_landmarks: true,
+            sort_candidates: false,
+        })
+        .unwrap();
+
+        group.bench_function(format!("seq_{}", seq), |b| {
+            b.iter(|| {
+                attention
+                    .forward_flash(black_box(&q), black_box(&k), black_box(&v), 128)
+                    .unwrap()
+            })
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_sparse, bench_flash_sparse, bench_dense_reference);
 criterion_main!(benches);

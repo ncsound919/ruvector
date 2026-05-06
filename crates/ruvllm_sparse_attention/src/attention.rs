@@ -351,11 +351,14 @@ fn validate_qkv(q: &Tensor3, k: &Tensor3, v: &Tensor3) -> Result<(), AttentionEr
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    let mut sum = 0.0f32;
-    for i in 0..a.len() {
-        sum += a[i] * b[i];
-    }
-    sum
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+#[cfg(feature = "fp16")]
+#[allow(dead_code)]
+#[inline]
+fn dot_f16(a: &[f32], b: &[half::f16]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y.to_f32()).sum()
 }
 
 fn build_token_candidates(
@@ -1174,6 +1177,463 @@ impl SubquadraticSparseAttention {
             self.forward_gqa(q, k, v)
         }
     }
+
+    /// IO-optimal tiled sparse attention (Flash-Sparse) — shared inner kernel.
+    ///
+    /// Iterates KV in tiles of `tile_size` tokens; for each tile processes all
+    /// queries whose window overlaps that tile using online softmax accumulators.
+    /// KV is accessed sequentially across tiles so the hardware prefetcher keeps
+    /// L1/L2 hot, unlike the query-outer loop which scatters KV reads.
+    ///
+    /// `group_size`: 1 for MHA, q_heads/kv_heads for GQA.
+    fn forward_flash_inner(
+        &self,
+        q: &Tensor3,
+        k: &Tensor3,
+        v: &Tensor3,
+        tile_size: usize,
+        group_size: usize,
+    ) -> Result<Tensor3, AttentionError> {
+        let seq = q.seq;
+        let q_heads = q.heads;
+        let _kv_heads = k.heads;
+        let dim = q.dim;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+        let window = self.config.window;
+        let causal = self.config.causal;
+
+        // Choose tile size: auto means use window (fits L1 for typical models).
+        let tile = if tile_size == 0 { window.max(1) } else { tile_size };
+
+        // Per-query running accumulators [q_heads][seq] (running_max, denom, acc*dim).
+        // Layout: flattened per query-head, then per query token.
+        let num_slots = q_heads * seq;
+        let mut running_max = vec![f32::NEG_INFINITY; num_slots];
+        let mut denom = vec![0.0f32; num_slots];
+        let mut out_data = vec![0.0f32; q_heads * seq * dim];
+
+        // --- Phase 1: Tiled window scan ---
+        // Iterate KV tiles in ascending order. For each tile, find which queries
+        // overlap (window intersection is non-empty), then accumulate.
+        let mut kv_start = 0usize;
+        while kv_start < seq {
+            let kv_end = (kv_start + tile).min(seq); // exclusive
+
+            // Query range whose window overlaps [kv_start, kv_end):
+            let q_lo = if causal {
+                kv_start // causal: q must see kv_start, so q >= kv_start
+            } else {
+                kv_start.saturating_sub(window)
+            };
+            let q_hi = if causal {
+                (kv_end - 1 + window + 1).min(seq) // exclusive upper bound on q
+            } else {
+                (kv_end - 1 + window + 1).min(seq)
+            };
+
+            for h in 0..q_heads {
+                let kv_h = h / group_size;
+                for qi in q_lo..q_hi {
+                    // Window intersection of query qi with this tile:
+                    let win_lo = if causal {
+                        qi.saturating_sub(window).max(kv_start)
+                    } else {
+                        qi.saturating_sub(window).max(kv_start)
+                    };
+                    let win_hi = if causal {
+                        qi.min(kv_end.saturating_sub(1))
+                    } else {
+                        (qi + window).min(kv_end.saturating_sub(1))
+                    };
+                    if win_lo > win_hi {
+                        continue;
+                    }
+                    let slot = h * seq + qi;
+                    let q_row = q.row(qi, h);
+                    let out_base = slot * dim;
+
+                    for j in win_lo..=win_hi {
+                        let score = dot(q_row, k.row(j, kv_h)) * scale;
+                        if score > running_max[slot] {
+                            let corr = (running_max[slot] - score).exp();
+                            for d in 0..dim {
+                                out_data[out_base + d] *= corr;
+                            }
+                            denom[slot] *= corr;
+                            running_max[slot] = score;
+                        }
+                        let w = (score - running_max[slot]).exp();
+                        denom[slot] += w;
+                        let v_row = v.row(j, kv_h);
+                        for d in 0..dim {
+                            out_data[out_base + d] += w * v_row[d];
+                        }
+                    }
+                }
+            }
+
+            kv_start = kv_end;
+        }
+
+        // --- Phase 2: Scattered pass (globals + log-stride + landmarks) ---
+        // We need per-query dedup so pre-mark window positions for each query,
+        // then push non-window sparse candidates via the standard helpers,
+        // excluding already-seen positions.
+        let landmarks = if self.config.use_landmarks {
+            Some(Landmarks::from_kv(k, v, self.config.block_size))
+        } else {
+            None
+        };
+
+        // seen_tokens stamp array: shared across heads (fine — stamps include h).
+        let mut seen_tokens = vec![0usize; seq.max(1)];
+        let mut seen_blocks = vec![0usize; div_ceil(seq.max(1), self.config.block_size)];
+        let mut sparse_toks: Vec<usize> = Vec::with_capacity(128);
+        let mut sparse_blks: Vec<usize> = Vec::with_capacity(64);
+
+        for h in 0..q_heads {
+            let kv_h = h / group_size;
+            for qi in 0..seq {
+                let stamp_base = 1 + h * seq + qi;
+
+                // Pre-mark the window positions so push_unique skips them.
+                // Window was already processed in Phase 1.
+                {
+                    let win_lo = qi.saturating_sub(window);
+                    let win_hi = if causal { qi } else { (qi + window).min(seq - 1) };
+                    let mark_stamp = stamp_base; // same stamp
+                    for j in win_lo..=win_hi {
+                        seen_tokens[j] = mark_stamp;
+                    }
+                }
+
+                sparse_toks.clear();
+                sparse_blks.clear();
+
+                // globals
+                for &g in &self.config.global_tokens {
+                    if g < seq && (!causal || g <= qi) {
+                        push_unique(g, &mut seen_tokens, stamp_base, &mut sparse_toks);
+                    }
+                }
+
+                // log-stride
+                if self.config.use_log_stride {
+                    let mut stride = 1usize;
+                    while stride < seq {
+                        if qi >= stride {
+                            push_unique(qi - stride, &mut seen_tokens, stamp_base, &mut sparse_toks);
+                        }
+                        if !causal {
+                            let fwd = qi + stride;
+                            if fwd < seq {
+                                push_unique(fwd, &mut seen_tokens, stamp_base, &mut sparse_toks);
+                            }
+                        }
+                        match stride.checked_mul(2) {
+                            Some(next) => stride = next,
+                            None => break,
+                        }
+                    }
+                }
+
+                // landmarks
+                if let Some(lm) = landmarks.as_ref() {
+                    build_landmark_candidates(
+                        qi, seq, &self.config, &mut seen_blocks, stamp_base, &mut sparse_blks,
+                    );
+                    let slot = h * seq + qi;
+                    let out_base = slot * dim;
+                    for &b in &sparse_blks {
+                        let score = dot(q.row(qi, h), lm.keys.row(b, kv_h)) * scale;
+                        if score > running_max[slot] {
+                            let corr = (running_max[slot] - score).exp();
+                            for d in 0..dim {
+                                out_data[out_base + d] *= corr;
+                            }
+                            denom[slot] *= corr;
+                            running_max[slot] = score;
+                        }
+                        let w = (score - running_max[slot]).exp();
+                        denom[slot] += w;
+                        let v_row = lm.values.row(b, kv_h);
+                        for d in 0..dim {
+                            out_data[out_base + d] += w * v_row[d];
+                        }
+                    }
+                }
+
+                // sparse token candidates (globals + log-stride)
+                {
+                    let slot = h * seq + qi;
+                    let out_base = slot * dim;
+                    for &j in &sparse_toks {
+                        let score = dot(q.row(qi, h), k.row(j, kv_h)) * scale;
+                        if score > running_max[slot] {
+                            let corr = (running_max[slot] - score).exp();
+                            for d in 0..dim {
+                                out_data[out_base + d] *= corr;
+                            }
+                            denom[slot] *= corr;
+                            running_max[slot] = score;
+                        }
+                        let w = (score - running_max[slot]).exp();
+                        denom[slot] += w;
+                        let v_row = v.row(j, kv_h);
+                        for d in 0..dim {
+                            out_data[out_base + d] += w * v_row[d];
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Phase 3: Normalize ---
+        let mut out = Tensor3::zeros(seq, q_heads, dim);
+        for h in 0..q_heads {
+            for qi in 0..seq {
+                let slot = h * seq + qi;
+                let inv = if denom[slot] > 0.0 { 1.0 / denom[slot] } else { 0.0 };
+                let out_row = out.row_mut(qi, h);
+                let src_base = slot * dim;
+                for d in 0..dim {
+                    out_row[d] = out_data[src_base + d] * inv;
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// IO-optimal tiled sparse attention for MHA.
+    ///
+    /// `tile_size = 0` auto-selects `window` as the tile (keeps KV tile in L1).
+    pub fn forward_flash(
+        &self,
+        q: &Tensor3,
+        k: &Tensor3,
+        v: &Tensor3,
+        tile_size: usize,
+    ) -> Result<Tensor3, AttentionError> {
+        validate_qkv(q, k, v)?;
+        if self.config.block_size == 0 {
+            return Err(AttentionError::InvalidConfig(
+                "block_size must be greater than zero".to_string(),
+            ));
+        }
+        if q.seq == 0 {
+            return Ok(Tensor3::zeros(0, q.heads, q.dim));
+        }
+        self.forward_flash_inner(q, k, v, tile_size, 1)
+    }
+
+    /// IO-optimal tiled sparse attention for GQA/MQA.
+    ///
+    /// `q` has `q_heads`, `k`/`v` have `kv_heads` where `q_heads % kv_heads == 0`.
+    /// `tile_size = 0` auto-selects `window` as the tile.
+    pub fn forward_gqa_flash(
+        &self,
+        q: &Tensor3,
+        k: &Tensor3,
+        v: &Tensor3,
+        tile_size: usize,
+    ) -> Result<Tensor3, AttentionError> {
+        validate_gqa(q, k, v)?;
+        if self.config.block_size == 0 {
+            return Err(AttentionError::InvalidConfig(
+                "block_size must be greater than zero".to_string(),
+            ));
+        }
+        if q.seq == 0 {
+            return Ok(Tensor3::zeros(0, q.heads, q.dim));
+        }
+        let group_size = q.heads / k.heads;
+        self.forward_flash_inner(q, k, v, tile_size, group_size)
+    }
+}
+
+/// FP16 KV cache — halves KV memory vs. f32 at the cost of inline conversion during decode.
+///
+/// Gated by the `fp16` feature; requires the `half` crate.
+///
+/// `decode_step_f16` converts f16 → f32 row-by-row during the dot product; LLVM
+/// auto-vectorises this to NEON `vcvt` on AArch64 (no allocation needed — a
+/// stack-allocated `dim`-sized buffer is reused across heads).
+#[cfg(feature = "fp16")]
+pub struct KvCacheF16 {
+    keys: Vec<half::f16>,   // [capacity * kv_heads * dim] flattened
+    values: Vec<half::f16>,
+    pub len: usize,
+    pub capacity: usize,
+    kv_heads: usize,
+    pub dim: usize,
+    /// Incremental f32 landmarks for precision.
+    pub landmarks: IncrementalLandmarks,
+}
+
+#[cfg(feature = "fp16")]
+impl KvCacheF16 {
+    pub fn new(capacity: usize, kv_heads: usize, dim: usize, block_size: usize) -> Self {
+        let n = capacity * kv_heads * dim;
+        Self {
+            keys: vec![half::f16::ZERO; n],
+            values: vec![half::f16::ZERO; n],
+            len: 0,
+            capacity,
+            kv_heads,
+            dim,
+            landmarks: IncrementalLandmarks::new(capacity, block_size, kv_heads, dim),
+        }
+    }
+
+    /// Append a single-token K/V (shape [1, kv_heads, dim]); converts f32 → f16.
+    pub fn try_append(&mut self, k: &Tensor3, v: &Tensor3) -> Result<(), AttentionError> {
+        if k.seq != 1 || v.seq != 1 {
+            return Err(AttentionError::InvalidConfig(
+                "KvCacheF16::try_append expects single-token tensors (seq == 1)".into(),
+            ));
+        }
+        if k.heads != self.kv_heads || v.heads != self.kv_heads {
+            return Err(AttentionError::InvalidConfig(format!(
+                "kv_heads mismatch: cache={}, k={}, v={}",
+                self.kv_heads, k.heads, v.heads
+            )));
+        }
+        if self.len >= self.capacity {
+            return Err(AttentionError::InvalidConfig(format!(
+                "KvCacheF16 capacity exceeded: capacity={}, len={}",
+                self.capacity, self.len
+            )));
+        }
+        let base = self.len * self.kv_heads * self.dim;
+        for (dst, src) in self.keys[base..base + self.kv_heads * self.dim]
+            .iter_mut()
+            .zip(k.data.iter())
+        {
+            *dst = half::f16::from_f32(*src);
+        }
+        for (dst, src) in self.values[base..base + self.kv_heads * self.dim]
+            .iter_mut()
+            .zip(v.data.iter())
+        {
+            *dst = half::f16::from_f32(*src);
+        }
+        self.landmarks.update(self.len, k, v);
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.len >= self.capacity
+    }
+
+    pub fn reset(&mut self) {
+        self.len = 0;
+        self.landmarks.reset();
+    }
+
+    /// Decode step against the f16 KV cache.
+    ///
+    /// `q`: shape `[1, q_heads, dim]`. Returns shape `[1, q_heads, dim]`.
+    /// Inline f16→f32 conversion per row; LLVM auto-vecs to NEON vcvt on AArch64.
+    pub fn decode_step_f16(
+        &self,
+        attn: &SubquadraticSparseAttention,
+        q: &Tensor3,
+    ) -> Result<Tensor3, AttentionError> {
+        if q.seq != 1 {
+            return Err(AttentionError::InvalidConfig(
+                "decode_step_f16 requires q.seq == 1".into(),
+            ));
+        }
+        if q.dim == 0 {
+            return Err(AttentionError::InvalidConfig(
+                "head dimension must be greater than zero".into(),
+            ));
+        }
+        if self.len == 0 {
+            return Ok(Tensor3::zeros(1, q.heads, q.dim));
+        }
+        if self.kv_heads == 0 || q.heads % self.kv_heads != 0 {
+            return Err(AttentionError::InvalidConfig(format!(
+                "q_heads={} must be divisible by kv_heads={}",
+                q.heads, self.kv_heads
+            )));
+        }
+
+        let q_heads = q.heads;
+        let group_size = q_heads / self.kv_heads;
+        let dim = self.dim;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+        let seq = self.len;
+        let i = seq - 1;
+
+        let mut seen_tokens = vec![0usize; seq.max(1)];
+        let mut seen_blocks =
+            vec![0usize; div_ceil(seq.max(1), attn.config.block_size)];
+        let mut token_candidates = Vec::with_capacity(attn.config.window + 64);
+        let mut block_candidates = Vec::with_capacity(64);
+
+        build_token_candidates(i, seq, &attn.config, &mut seen_tokens, 1, &mut token_candidates);
+        if attn.config.use_landmarks {
+            build_landmark_candidates(
+                i, seq, &attn.config, &mut seen_blocks, 1, &mut block_candidates,
+            );
+        }
+
+        let mut out = Tensor3::zeros(1, q_heads, dim);
+        // Reuse a single f32 row buffer for f16→f32 conversion — no extra alloc per candidate.
+        let mut k_buf = vec![0.0f32; dim];
+
+        for h in 0..q_heads {
+            let kv_h = h / group_size;
+            let q_row = q.row(0, h);
+            let mut running_max = f32::NEG_INFINITY;
+            let mut denom_acc = 0.0f32;
+            let mut acc = vec![0.0f32; dim];
+
+            for &j in &token_candidates {
+                let base = (j * self.kv_heads + kv_h) * dim;
+                for d in 0..dim {
+                    k_buf[d] = self.keys[base + d].to_f32();
+                }
+                let score = dot(q_row, &k_buf) * scale;
+                if score > running_max {
+                    let corr = (running_max - score).exp();
+                    for d in 0..dim { acc[d] *= corr; }
+                    denom_acc *= corr;
+                    running_max = score;
+                }
+                let w = (score - running_max).exp();
+                denom_acc += w;
+                let v_base = (j * self.kv_heads + kv_h) * dim;
+                for d in 0..dim {
+                    acc[d] += w * self.values[v_base + d].to_f32();
+                }
+            }
+
+            // f32 landmarks (precision preserved)
+            for &b in &block_candidates {
+                let score = dot(q_row, self.landmarks.keys.row(b, kv_h)) * scale;
+                if score > running_max {
+                    let corr = (running_max - score).exp();
+                    for d in 0..dim { acc[d] *= corr; }
+                    denom_acc *= corr;
+                    running_max = score;
+                }
+                let w = (score - running_max).exp();
+                denom_acc += w;
+                let v_row = self.landmarks.values.row(b, kv_h);
+                for d in 0..dim { acc[d] += w * v_row[d]; }
+            }
+
+            let inv = if denom_acc > 0.0 { 1.0 / denom_acc } else { 0.0 };
+            let out_row = out.row_mut(0, h);
+            for d in 0..dim { out_row[d] = acc[d] * inv; }
+        }
+
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -1691,5 +2151,168 @@ mod tests {
         let k = make_tensor(seq, 2, 4);
         let v = make_tensor(seq, 2, 4);
         assert!(attn.forward_gqa(&q, &k, &v).is_err());
+    }
+
+    // --- Flash-Sparse Attention tests ---
+
+    #[test]
+    fn forward_flash_matches_forward_mha() {
+        let seq = 64;
+        let heads = 4;
+        let dim = 8;
+        let q = make_tensor(seq, heads, dim);
+        let k = make_tensor(seq, heads, dim);
+        let v = make_tensor(seq, heads, dim);
+        let attn = SubquadraticSparseAttention::new(SparseAttentionConfig {
+            window: 16,
+            block_size: 8,
+            global_tokens: vec![0],
+            causal: true,
+            use_log_stride: true,
+            use_landmarks: true,
+            sort_candidates: false,
+        })
+        .unwrap();
+        let reference = attn.forward(&q, &k, &v).unwrap();
+        let flash = attn.forward_flash(&q, &k, &v, 8).unwrap();
+        assert_eq!(flash.seq, seq);
+        assert_eq!(flash.heads, heads);
+        assert_eq!(flash.dim, dim);
+        for (a, b) in reference.data.iter().zip(flash.data.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "forward_flash_mha causal mismatch: ref={} flash={}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn forward_flash_matches_forward_non_causal() {
+        let seq = 64;
+        let heads = 4;
+        let dim = 8;
+        let q = make_tensor(seq, heads, dim);
+        let k = make_tensor(seq, heads, dim);
+        let v = make_tensor(seq, heads, dim);
+        let attn = SubquadraticSparseAttention::new(SparseAttentionConfig {
+            window: 16,
+            block_size: 8,
+            global_tokens: vec![0],
+            causal: false,
+            use_log_stride: true,
+            use_landmarks: true,
+            sort_candidates: false,
+        })
+        .unwrap();
+        let reference = attn.forward(&q, &k, &v).unwrap();
+        let flash = attn.forward_flash(&q, &k, &v, 8).unwrap();
+        assert_eq!(flash.seq, seq);
+        for (a, b) in reference.data.iter().zip(flash.data.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "forward_flash non-causal mismatch: ref={} flash={}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn forward_gqa_flash_matches_forward_gqa() {
+        let seq = 32;
+        let q_heads = 4;
+        let kv_heads = 2;
+        let dim = 8;
+        let q = make_tensor(seq, q_heads, dim);
+        let k = make_tensor(seq, kv_heads, dim);
+        let v = make_tensor(seq, kv_heads, dim);
+        let attn = SubquadraticSparseAttention::new(SparseAttentionConfig {
+            window: 8,
+            block_size: 4,
+            global_tokens: vec![0],
+            causal: true,
+            use_log_stride: true,
+            use_landmarks: true,
+            sort_candidates: false,
+        })
+        .unwrap();
+        let reference = attn.forward_gqa(&q, &k, &v).unwrap();
+        let flash = attn.forward_gqa_flash(&q, &k, &v, 4).unwrap();
+        assert_eq!(flash.seq, seq);
+        assert_eq!(flash.heads, q_heads);
+        assert_eq!(flash.dim, dim);
+        for (a, b) in reference.data.iter().zip(flash.data.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "forward_gqa_flash mismatch: ref={} flash={}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn forward_flash_single_token_no_panic() {
+        let q = make_tensor(1, 2, 4);
+        let k = q.clone();
+        let v = q.clone();
+        let attn = SubquadraticSparseAttention::new(SparseAttentionConfig {
+            window: 4,
+            block_size: 4,
+            global_tokens: vec![],
+            causal: true,
+            use_log_stride: false,
+            use_landmarks: false,
+            sort_candidates: false,
+        })
+        .unwrap();
+        let out = attn.forward_flash(&q, &k, &v, 1);
+        assert!(out.is_ok(), "single-token forward_flash panicked or errored");
+        let out = out.unwrap();
+        assert_eq!(out.seq, 1);
+        for val in &out.data {
+            assert!(val.is_finite());
+        }
+    }
+
+    #[cfg(feature = "fp16")]
+    #[test]
+    fn kv_cache_f16_roundtrip() {
+        let kv_heads = 2;
+        let dim = 8;
+        let block_size = 4;
+        let capacity = 16;
+        let mut cache = KvCacheF16::new(capacity, kv_heads, dim, block_size);
+
+        let k = make_tensor(1, kv_heads, dim);
+        let v = make_tensor(1, kv_heads, dim);
+        cache.try_append(&k, &v).unwrap();
+
+        assert_eq!(cache.len, 1);
+
+        // Verify the stored f16 values round-trip back to f32 within 1e-2
+        let base = 0;
+        for d in 0..kv_heads * dim {
+            let original = k.data[d];
+            let stored = cache.keys[base + d].to_f32();
+            assert!(
+                (original - stored).abs() < 1e-2,
+                "f16 roundtrip error too large: original={} stored={}",
+                original,
+                stored
+            );
+        }
+        for d in 0..kv_heads * dim {
+            let original = v.data[d];
+            let stored = cache.values[base + d].to_f32();
+            assert!(
+                (original - stored).abs() < 1e-2,
+                "f16 roundtrip error too large: original={} stored={}",
+                original,
+                stored
+            );
+        }
     }
 }
