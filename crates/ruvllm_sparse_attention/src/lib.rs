@@ -3,7 +3,7 @@ pub mod model;
 pub mod tensor;
 
 pub use attention::{
-    dense_attention, AttentionBackend, AttentionError, SparseAttentionConfig,
+    dense_attention, AttentionBackend, AttentionError, KvCache, SparseAttentionConfig,
     SubquadraticSparseAttention,
 };
 pub use model::{RuvLlmSparseBlock, RuvLlmSparseBlockConfig};
