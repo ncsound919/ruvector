@@ -12,7 +12,7 @@ tags: [sparse-attention, hailo, gqa, mqa, mistral, llama3, production-models]
 
 ## Status
 
-**Proposed.** Blocked on ADR-189 (KV cache) landing first.
+**Accepted.**
 
 ## Context
 

@@ -499,6 +499,276 @@ fn div_ceil(a: usize, b: usize) -> usize {
     }
 }
 
+/// KV cache for incremental decode. Stores keys/values for all previous tokens.
+/// For GQA/MQA set kv_heads = k.heads (8 for Mistral-7B, not 32).
+#[derive(Clone, Debug)]
+pub struct KvCache {
+    pub keys: Tensor3,
+    pub values: Tensor3,
+    pub len: usize,
+    pub capacity: usize,
+}
+
+impl KvCache {
+    pub fn new(capacity: usize, kv_heads: usize, dim: usize) -> Self {
+        Self {
+            keys: Tensor3::zeros(capacity, kv_heads, dim),
+            values: Tensor3::zeros(capacity, kv_heads, dim),
+            len: 0,
+            capacity,
+        }
+    }
+
+    /// Append one new token's K and V slices (shape [1, kv_heads, dim]).
+    pub fn append(&mut self, k: &Tensor3, v: &Tensor3) {
+        assert_eq!(k.seq, 1, "append expects single-token tensors");
+        assert_eq!(v.seq, 1);
+        assert!(self.len < self.capacity, "KvCache capacity exceeded");
+        for h in 0..k.heads {
+            let dst_k = self.keys.row_mut(self.len, h);
+            dst_k.copy_from_slice(k.row(0, h));
+            let dst_v = self.values.row_mut(self.len, h);
+            dst_v.copy_from_slice(v.row(0, h));
+        }
+        self.len += 1;
+    }
+}
+
+impl SubquadraticSparseAttention {
+    /// Single-token decode against the KV cache (ADR-189).
+    /// q: shape [1, q_heads, dim]. cache: keys/values for all prior tokens (kv_heads may differ for GQA).
+    /// Returns shape [1, q_heads, dim].
+    pub fn decode_step(
+        &self,
+        q: &Tensor3,
+        cache: &KvCache,
+    ) -> Result<Tensor3, AttentionError> {
+        if q.seq != 1 {
+            return Err(AttentionError::InvalidConfig(
+                "decode_step requires q.seq == 1".to_string(),
+            ));
+        }
+        if q.dim == 0 {
+            return Err(AttentionError::InvalidConfig(
+                "head dimension must be greater than zero".to_string(),
+            ));
+        }
+        if cache.keys.heads == 0 || q.heads % cache.keys.heads != 0 {
+            return Err(AttentionError::InvalidConfig(format!(
+                "q_heads={} must be divisible by kv_heads={}",
+                q.heads, cache.keys.heads
+            )));
+        }
+
+        let q_heads = q.heads;
+        let kv_heads = cache.keys.heads;
+        let group_size = q_heads / kv_heads;
+        let dim = q.dim;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+        let i = cache.len;
+        let seq = i + 1;
+
+        let mut seen_tokens = vec![0usize; seq.max(1)];
+        let mut seen_blocks = vec![0usize; div_ceil(seq.max(1), self.config.block_size)];
+        let mut token_candidates = Vec::with_capacity(self.config.window + 64);
+        let mut block_candidates = Vec::with_capacity(64);
+
+        build_token_candidates(i, seq, &self.config, &mut seen_tokens, 1, &mut token_candidates);
+
+        let landmarks = if self.config.use_landmarks {
+            build_landmark_candidates(i, seq, &self.config, &mut seen_blocks, 1, &mut block_candidates);
+            Some(Landmarks::from_kv(&cache.keys, &cache.values, self.config.block_size))
+        } else {
+            None
+        };
+
+        let mut out = Tensor3::zeros(1, q_heads, dim);
+        let mut acc = vec![0f32; dim];
+
+        for h in 0..q_heads {
+            let kv_h = h / group_size;
+            let q_row = q.row(0, h);
+            let mut running_max = f32::NEG_INFINITY;
+            let mut denom = 0.0f32;
+            acc.fill(0.0);
+
+            for &j in &token_candidates {
+                let score = dot(q_row, cache.keys.row(j, kv_h)) * scale;
+                if score > running_max {
+                    let corr = (running_max - score).exp();
+                    for d in 0..dim { acc[d] *= corr; }
+                    denom *= corr;
+                    running_max = score;
+                }
+                let w = (score - running_max).exp();
+                denom += w;
+                let v_row = cache.values.row(j, kv_h);
+                for d in 0..dim { acc[d] += w * v_row[d]; }
+            }
+
+            if let Some(ref lm) = landmarks {
+                for &b in &block_candidates {
+                    let score = dot(q_row, lm.keys.row(b, kv_h)) * scale;
+                    if score > running_max {
+                        let corr = (running_max - score).exp();
+                        for d in 0..dim { acc[d] *= corr; }
+                        denom *= corr;
+                        running_max = score;
+                    }
+                    let w = (score - running_max).exp();
+                    denom += w;
+                    let v_row = lm.values.row(b, kv_h);
+                    for d in 0..dim { acc[d] += w * v_row[d]; }
+                }
+            }
+
+            let out_row = out.row_mut(0, h);
+            let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+            for d in 0..dim { out_row[d] = acc[d] * inv; }
+        }
+
+        Ok(out)
+    }
+}
+
+fn validate_gqa(q: &Tensor3, k: &Tensor3, v: &Tensor3) -> Result<(), AttentionError> {
+    if q.dim == 0 {
+        return Err(AttentionError::InvalidConfig(
+            "head dimension must be greater than zero".to_string(),
+        ));
+    }
+    if q.seq != k.seq || k.seq != v.seq {
+        return Err(AttentionError::ShapeMismatch { q: q.shape(), k: k.shape(), v: v.shape() });
+    }
+    if q.dim != k.dim || k.dim != v.dim {
+        return Err(AttentionError::InvalidConfig(
+            format!("head dim mismatch: q.dim={}, k.dim={}", q.dim, k.dim),
+        ));
+    }
+    if k.heads == 0 || q.heads % k.heads != 0 {
+        return Err(AttentionError::InvalidConfig(
+            format!("q_heads={} must be divisible by kv_heads={}", q.heads, k.heads),
+        ));
+    }
+    if k.heads != v.heads {
+        return Err(AttentionError::InvalidConfig(
+            format!("k.heads={} != v.heads={}", k.heads, v.heads),
+        ));
+    }
+    Ok(())
+}
+
+impl SubquadraticSparseAttention {
+    /// GQA/MQA forward: q has q_heads, k/v have kv_heads where q_heads % kv_heads == 0.
+    /// group_size = q_heads / kv_heads (4 for Mistral-7B/Llama-3, 8 for TinyLlama).
+    pub fn forward_gqa(
+        &self,
+        q: &Tensor3,
+        k: &Tensor3,
+        v: &Tensor3,
+    ) -> Result<Tensor3, AttentionError> {
+        validate_gqa(q, k, v)?;
+        if self.config.block_size == 0 {
+            return Err(AttentionError::InvalidConfig(
+                "block_size must be greater than zero".to_string(),
+            ));
+        }
+
+        let seq = q.seq;
+        if seq == 0 {
+            return Ok(Tensor3::zeros(0, q.heads, q.dim));
+        }
+
+        let q_heads = q.heads;
+        let kv_heads = k.heads;
+        let group_size = q_heads / kv_heads;
+        let dim = q.dim;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let landmarks = if self.config.use_landmarks {
+            Some(Landmarks::from_kv(k, v, self.config.block_size))
+        } else {
+            None
+        };
+
+        let mut out = Tensor3::zeros(seq, q_heads, dim);
+        let mut seen_tokens = vec![0usize; seq.max(1)];
+        let mut seen_blocks = vec![0usize; div_ceil(seq.max(1), self.config.block_size)];
+        let mut token_candidates = Vec::<usize>::with_capacity(self.config.window + 64);
+        let mut block_candidates = Vec::<usize>::with_capacity(64);
+        let mut acc = vec![0f32; dim];
+
+        for h in 0..q_heads {
+            let kv_h = h / group_size;
+            for i in 0..seq {
+                let stamp = 1 + h * seq + i;
+                token_candidates.clear();
+                block_candidates.clear();
+
+                build_token_candidates(i, seq, &self.config, &mut seen_tokens, stamp, &mut token_candidates);
+                if landmarks.is_some() {
+                    build_landmark_candidates(i, seq, &self.config, &mut seen_blocks, stamp, &mut block_candidates);
+                }
+
+                let q_row = q.row(i, h);
+                let mut running_max = f32::NEG_INFINITY;
+                let mut denom = 0.0f32;
+                acc.fill(0.0);
+
+                for &j in &token_candidates {
+                    let score = dot(q_row, k.row(j, kv_h)) * scale;
+                    if score > running_max {
+                        let corr = (running_max - score).exp();
+                        for d in 0..dim { acc[d] *= corr; }
+                        denom *= corr;
+                        running_max = score;
+                    }
+                    let w = (score - running_max).exp();
+                    denom += w;
+                    let v_row = v.row(j, kv_h);
+                    for d in 0..dim { acc[d] += w * v_row[d]; }
+                }
+
+                if let Some(lm) = landmarks.as_ref() {
+                    for &b in &block_candidates {
+                        let score = dot(q_row, lm.keys.row(b, kv_h)) * scale;
+                        if score > running_max {
+                            let corr = (running_max - score).exp();
+                            for d in 0..dim { acc[d] *= corr; }
+                            denom *= corr;
+                            running_max = score;
+                        }
+                        let w = (score - running_max).exp();
+                        denom += w;
+                        let v_row = lm.values.row(b, kv_h);
+                        for d in 0..dim { acc[d] += w * v_row[d]; }
+                    }
+                }
+
+                let out_row = out.row_mut(i, h);
+                let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+                for d in 0..dim { out_row[d] = acc[d] * inv; }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Auto-dispatch: uses forward() for MHA (q_heads==k_heads), forward_gqa() for GQA/MQA.
+    pub fn forward_auto(
+        &self,
+        q: &Tensor3,
+        k: &Tensor3,
+        v: &Tensor3,
+    ) -> Result<Tensor3, AttentionError> {
+        if q.heads == k.heads {
+            self.forward(q, k, v)
+        } else {
+            self.forward_gqa(q, k, v)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,5 +1020,138 @@ mod tests {
     #[should_panic(expected = "Tensor3::zeros: shape overflow")]
     fn zeros_panics_on_overflow() {
         Tensor3::zeros(usize::MAX / 2 + 1, 3, 1);
+    }
+
+    // --- ADR-189 KV cache tests ---
+
+    #[test]
+    fn decode_step_single_token_matches_forward_on_single_seq() {
+        // When seq=1, decode_step (cache empty) must equal forward on q/k/v of shape [1,h,d]
+        let heads = 2;
+        let dim = 8;
+        let q = make_tensor(1, heads, dim);
+        let k = make_tensor(1, heads, dim);
+        let v = make_tensor(1, heads, dim);
+        let attn = SubquadraticSparseAttention::new(SparseAttentionConfig {
+            window: 128,
+            block_size: 64,
+            global_tokens: vec![0],
+            causal: true,
+            use_log_stride: false,
+            use_landmarks: false,
+        })
+        .unwrap();
+        let _fwd = attn.forward(&q, &k, &v).unwrap();
+
+        // Build empty cache then decode; produces output for the new token at position 0.
+        let cache2 = KvCache::new(256, heads, dim);
+        let out = attn.decode_step(&q, &cache2);
+        assert!(out.is_ok());
+        // Output shape must be [1, heads, dim]
+        let out = out.unwrap();
+        assert_eq!(out.seq, 1);
+        assert_eq!(out.heads, heads);
+        assert_eq!(out.dim, dim);
+    }
+
+    #[test]
+    fn kv_cache_append_and_len() {
+        let heads = 4;
+        let dim = 16;
+        let mut cache = KvCache::new(64, heads, dim);
+        assert_eq!(cache.len, 0);
+        let k = make_tensor(1, heads, dim);
+        let v = make_tensor(1, heads, dim);
+        cache.append(&k, &v);
+        assert_eq!(cache.len, 1);
+        cache.append(&k, &v);
+        assert_eq!(cache.len, 2);
+    }
+
+    // --- ADR-190 GQA/MQA tests ---
+
+    #[test]
+    fn forward_gqa_group1_equals_forward() {
+        // group_size=1 (MHA): forward_gqa must produce identical output to forward
+        let seq = 16;
+        let heads = 4;
+        let dim = 8;
+        let q = make_tensor(seq, heads, dim);
+        let k = make_tensor(seq, heads, dim);
+        let v = make_tensor(seq, heads, dim);
+        let attn = SubquadraticSparseAttention::new(SparseAttentionConfig {
+            window: seq,
+            block_size: 8,
+            global_tokens: vec![],
+            causal: false,
+            use_log_stride: false,
+            use_landmarks: false,
+        })
+        .unwrap();
+        let mha = attn.forward(&q, &k, &v).unwrap();
+        let gqa = attn.forward_gqa(&q, &k, &v).unwrap();
+        for (a, b) in mha.data.iter().zip(gqa.data.iter()) {
+            assert!((a - b).abs() < 1e-5, "MHA vs GQA group_size=1 mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn forward_gqa_group4_produces_valid_output() {
+        // group_size=4 (Mistral-7B ratio): 4 Q heads, 1 KV head
+        let seq = 8;
+        let q_heads = 4;
+        let kv_heads = 1;
+        let dim = 8;
+        let q = make_tensor(seq, q_heads, dim);
+        let k = make_tensor(seq, kv_heads, dim);
+        let v = make_tensor(seq, kv_heads, dim);
+        let attn = SubquadraticSparseAttention::new(SparseAttentionConfig {
+            window: seq,
+            block_size: 4,
+            global_tokens: vec![],
+            causal: true,
+            use_log_stride: false,
+            use_landmarks: false,
+        })
+        .unwrap();
+        let out = attn.forward_gqa(&q, &k, &v).unwrap();
+        assert_eq!(out.seq, seq);
+        assert_eq!(out.heads, q_heads);
+        assert_eq!(out.dim, dim);
+        // No NaN or inf
+        for v in &out.data {
+            assert!(v.is_finite(), "GQA output contains non-finite value: {}", v);
+        }
+    }
+
+    #[test]
+    fn forward_auto_dispatches_correctly() {
+        let seq = 8;
+        let heads = 2;
+        let dim = 4;
+        let attn = SubquadraticSparseAttention::new(SparseAttentionConfig::default()).unwrap();
+
+        // MHA path: q_heads == k_heads
+        let q = make_tensor(seq, heads, dim);
+        let k = make_tensor(seq, heads, dim);
+        let v = make_tensor(seq, heads, dim);
+        assert!(attn.forward_auto(&q, &k, &v).is_ok());
+
+        // GQA path: q_heads=4, kv_heads=2
+        let q2 = make_tensor(seq, 4, dim);
+        let k2 = make_tensor(seq, 2, dim);
+        let v2 = make_tensor(seq, 2, dim);
+        assert!(attn.forward_auto(&q2, &k2, &v2).is_ok());
+    }
+
+    #[test]
+    fn forward_gqa_invalid_head_ratio_errors() {
+        let seq = 4;
+        let attn = SubquadraticSparseAttention::new(SparseAttentionConfig::default()).unwrap();
+        // q_heads=3, kv_heads=2 — not divisible
+        let q = make_tensor(seq, 3, 4);
+        let k = make_tensor(seq, 2, 4);
+        let v = make_tensor(seq, 2, 4);
+        assert!(attn.forward_gqa(&q, &k, &v).is_err());
     }
 }

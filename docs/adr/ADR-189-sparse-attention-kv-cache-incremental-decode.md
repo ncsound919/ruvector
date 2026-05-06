@@ -12,9 +12,7 @@ tags: [sparse-attention, hailo, kv-cache, incremental-decode, throughput]
 
 ## Status
 
-**Proposed.** Depends on ADR-184 (online softmax) and ADR-185
-(landmark fix) being merged first. Hardware target: Hailo-10H cluster
-at ADR-182.
+**Accepted.**
 
 ## Context
 
