@@ -5,7 +5,13 @@ edition = "2021"
 license = "MIT"
 description = "Subquadratic sparse attention kernel for ruvllm style inference"
 
+[features]
+default = []
+# Enable parallel head loops via rayon (~4× prefill speedup on multi-core).
+parallel = ["dep:rayon"]
+
 [dependencies]
+rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 # rand is only used in tests/benchmarks — keep zero runtime dep footprint (ADR-183)
