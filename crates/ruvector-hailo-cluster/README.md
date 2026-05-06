@@ -451,6 +451,22 @@ cargo test --test embed_cli                   # binary CLI tests
 - `cross-build.sh` — `aarch64-unknown-linux-gnu` cross-compile via
   `gcc-aarch64-linux-gnu`
 
+## Sparse Attention Validation
+
+The `ruvllm_sparse_attention` kernel (ADR-183 – ADR-190) was validated on this cluster:
+
+| Node | Tests | Attention kernel | Build |
+|---|---|---|---|
+| cognitum-v0 | 17/17 ✓ | sparse O(N log N) + GQA + KV cache | release aarch64 |
+| cognitum-v1 | 17/17 ✓ | sparse O(N log N) + GQA + KV cache | release aarch64 |
+| cognitum-cluster-2 | 17/17 ✓ | sparse O(N log N) + GQA + KV cache | release aarch64 |
+| cognitum-cluster-3 | 17/17 ✓ | sparse O(N log N) + GQA + KV cache | release aarch64 |
+
+Measured on cognitum-v0: seq_4096 sparse forward = **836.2 ms** vs 12,537 ms dense (15× reduction).
+Mistral-7B GQA KV cache fits in **2.1 GB** with 8 KV heads vs 8.6 GB with naive MHA expansion.
+
+See [`crates/ruvllm_sparse_attention`](../ruvllm_sparse_attention/README.md) for the full kernel documentation.
+
 ## ADRs
 
 | ADR | Topic |
@@ -459,3 +475,6 @@ cargo test --test embed_cli                   # binary CLI tests
 | [ADR-168][adr168] | Cluster CLI surface (3-binary split + flag conventions) |
 | [ADR-169][adr169] | Cache architecture (LRU + TTL + fingerprint isolation + auto-invalidate) |
 | [ADR-170][adr170] | Tracing correlation (gRPC metadata + sortable IDs + caller propagation) |
+| [ADR-183..190][ruvllm-sparse] | Sparse attention kernel (subquadratic, GQA, KV cache) |
+
+[ruvllm-sparse]: ../ruvllm_sparse_attention/README.md
