@@ -30,6 +30,7 @@ fn bench_sparse(c: &mut Criterion) {
             causal: true,
             use_log_stride: true,
             use_landmarks: true,
+            sort_candidates: false,
         })
         .unwrap();
 

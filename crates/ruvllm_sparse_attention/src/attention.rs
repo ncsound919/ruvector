@@ -39,6 +39,12 @@ pub struct SparseAttentionConfig {
     pub causal: bool,
     pub use_log_stride: bool,
     pub use_landmarks: bool,
+    /// Sort candidate indices before the attention dot-product loop.
+    ///
+    /// Ascending order makes KV cache access sequential, which benefits the
+    /// hardware prefetcher when the KV cache exceeds L3 (e.g. Pi 5 at seq ≥ 2K).
+    /// Leave `false` on x86 with large L3 where the sort cost exceeds the gain.
+    pub sort_candidates: bool,
 }
 
 impl Default for SparseAttentionConfig {
@@ -50,6 +56,7 @@ impl Default for SparseAttentionConfig {
             causal: true,
             use_log_stride: true,
             use_landmarks: true,
+            sort_candidates: false,
         }
     }
 }
@@ -159,6 +166,7 @@ impl AttentionBackend for SubquadraticSparseAttention {
                     if lm_ref.is_some() {
                         build_landmark_candidates(i, seq, config, &mut seen_blocks, stamp, &mut blk_c);
                     }
+                    if config.sort_candidates { tok_c.sort_unstable(); blk_c.sort_unstable(); }
                     let q_row = q.row(i, h);
                     let mut running_max = f32::NEG_INFINITY;
                     let mut denom = 0.0f32;
@@ -223,6 +231,7 @@ impl AttentionBackend for SubquadraticSparseAttention {
                     if landmarks.is_some() {
                         build_landmark_candidates(i, seq, &self.config, &mut seen_blocks, stamp, &mut block_candidates);
                     }
+                    if self.config.sort_candidates { token_candidates.sort_unstable(); block_candidates.sort_unstable(); }
                     let q_row = q.row(i, h);
                     let mut running_max = f32::NEG_INFINITY;
                     let mut denom = 0.0f32;
@@ -398,6 +407,7 @@ fn build_token_candidates(
             }
         }
     }
+
 }
 
 fn build_landmark_candidates(
@@ -469,6 +479,7 @@ fn build_landmark_candidates(
             }
         }
     }
+
 }
 
 #[inline]
@@ -703,6 +714,94 @@ impl KvCache {
         self.len = 0;
         self.landmarks.reset();
     }
+
+    /// H2O-style heavy-hitter eviction: compact the cache by removing the token
+    /// with the lowest cumulative attention score, then append the new token.
+    ///
+    /// `attention_scores` must be a slice of length `self.len` where
+    /// `attention_scores[j]` is the total attention weight token `j` has received
+    /// across all decode steps.  Global-token positions and the most recent
+    /// `window` tokens are protected from eviction.
+    ///
+    /// Returns `Err` on capacity zero, k/v shape mismatch, or score-len mismatch.
+    pub fn evict_and_append(
+        &mut self,
+        k: &Tensor3,
+        v: &Tensor3,
+        attention_scores: &[f32],
+        global_tokens: &[usize],
+        window: usize,
+    ) -> Result<(), AttentionError> {
+        if !self.is_full() {
+            return self.try_append(k, v);
+        }
+        if attention_scores.len() != self.len {
+            return Err(AttentionError::InvalidConfig(format!(
+                "evict_and_append: attention_scores.len={} != cache.len={}",
+                attention_scores.len(), self.len
+            )));
+        }
+        if self.capacity == 0 {
+            return Err(AttentionError::InvalidConfig(
+                "evict_and_append: capacity is zero".into(),
+            ));
+        }
+
+        // Find the eviction victim: lowest attention score, not in recent window,
+        // not a global token.
+        let recent_start = self.len.saturating_sub(window);
+        let is_protected = |idx: usize| -> bool {
+            idx >= recent_start || global_tokens.contains(&idx)
+        };
+        let victim = (0..self.len)
+            .filter(|&idx| !is_protected(idx))
+            .min_by(|&a, &b| {
+                attention_scores[a]
+                    .partial_cmp(&attention_scores[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+        let victim = match victim {
+            Some(v) => v,
+            None => {
+                // All tokens protected — fall back to evicting the oldest non-global.
+                (0..recent_start)
+                    .find(|idx| !global_tokens.contains(idx))
+                    .unwrap_or(0)
+            }
+        };
+
+        // Compact: shift tokens [victim+1..len] left by one slot.
+        let kv_heads = self.keys.heads;
+        let dim = self.keys.dim;
+        for t in victim..self.len - 1 {
+            for h in 0..kv_heads {
+                // SAFETY: t < t+1 < self.len <= self.capacity, all in bounds.
+                let src_off = ((t + 1) * kv_heads + h) * dim;
+                let dst_off = (t * kv_heads + h) * dim;
+                self.keys.data.copy_within(src_off..src_off + dim, dst_off);
+                self.values.data.copy_within(src_off..src_off + dim, dst_off);
+            }
+        }
+        self.len -= 1;
+        // Rebuild landmarks after compaction (eviction is infrequent, O(T) rebuild ok).
+        self.landmarks.reset();
+        let lm_block = self.landmarks.block_size;
+        if lm_block > 0 {
+            for t in 0..self.len {
+                let k_t = Tensor3::from_vec(
+                    self.keys.data[t * kv_heads * dim..(t + 1) * kv_heads * dim].to_vec(),
+                    1, kv_heads, dim,
+                ).unwrap();
+                let v_t = Tensor3::from_vec(
+                    self.values.data[t * kv_heads * dim..(t + 1) * kv_heads * dim].to_vec(),
+                    1, kv_heads, dim,
+                ).unwrap();
+                self.landmarks.update(t, &k_t, &v_t);
+            }
+        }
+        self.try_append(k, v)
+    }
 }
 
 impl SubquadraticSparseAttention {
@@ -756,6 +855,7 @@ impl SubquadraticSparseAttention {
         if self.config.use_landmarks {
             build_landmark_candidates(i, seq, &self.config, &mut seen_blocks, 1, &mut block_candidates);
         }
+        if self.config.sort_candidates { token_candidates.sort_unstable(); block_candidates.sort_unstable(); }
 
         let mut out = Tensor3::zeros(1, q_heads, dim);
         let mut acc = vec![0f32; dim];
@@ -952,6 +1052,7 @@ impl SubquadraticSparseAttention {
                     if lm_ref.is_some() {
                         build_landmark_candidates(i, seq, config, &mut seen_blocks, stamp, &mut blk_c);
                     }
+                    if config.sort_candidates { tok_c.sort_unstable(); blk_c.sort_unstable(); }
                     let q_row = q.row(i, h);
                     let mut running_max = f32::NEG_INFINITY;
                     let mut denom = 0.0f32;
@@ -1016,6 +1117,7 @@ impl SubquadraticSparseAttention {
                     if landmarks.is_some() {
                         build_landmark_candidates(i, seq, &self.config, &mut seen_blocks, stamp, &mut block_candidates);
                     }
+                    if self.config.sort_candidates { token_candidates.sort_unstable(); block_candidates.sort_unstable(); }
                     let q_row = q.row(i, h);
                     let mut running_max = f32::NEG_INFINITY;
                     let mut denom = 0.0f32;
@@ -1103,6 +1205,7 @@ mod tests {
             causal: false,
             use_log_stride: false,
             use_landmarks: false,
+            sort_candidates: false,
         })
         .unwrap()
         .forward(&q, &k, &v)
@@ -1130,6 +1233,7 @@ mod tests {
             causal: true,
             use_log_stride: false,
             use_landmarks: false,
+            sort_candidates: false,
         })
         .unwrap()
         .forward(&q, &k, &v)
@@ -1149,6 +1253,7 @@ mod tests {
             causal: true,
             use_log_stride: true,
             use_landmarks: true,
+            sort_candidates: false,
         })
         .unwrap();
 
@@ -1187,6 +1292,7 @@ mod tests {
             causal: true,
             use_log_stride: true,
             use_landmarks: true,
+            sort_candidates: false,
         })
         .unwrap()
         .forward(&q, &k, &v)
@@ -1209,6 +1315,7 @@ mod tests {
             causal: true,
             use_log_stride: false,
             use_landmarks: false,
+            sort_candidates: false,
         })
         .unwrap()
         .forward(&q, &k, &v);
@@ -1228,6 +1335,7 @@ mod tests {
             causal: false,
             use_log_stride: false,
             use_landmarks: true,
+            sort_candidates: false,
         })
         .unwrap()
         .forward(&q, &k, &v);
@@ -1253,6 +1361,7 @@ mod tests {
             causal: true,
             use_log_stride: false,
             use_landmarks: false,
+            sort_candidates: false,
         })
         .unwrap()
         .forward(&q, &k, &v)
@@ -1279,6 +1388,7 @@ mod tests {
             causal: false,
             use_log_stride: false,
             use_landmarks: false,
+            sort_candidates: false,
         })
         .unwrap()
         .forward(&q, &k, &v)
@@ -1343,6 +1453,7 @@ mod tests {
             causal: true,
             use_log_stride: false,
             use_landmarks: false,
+            sort_candidates: false,
         })
         .unwrap();
         let fwd = attn.forward(&q, &k, &v).unwrap();
@@ -1452,6 +1563,7 @@ mod tests {
             causal: true,
             use_log_stride: false,
             use_landmarks: false,
+            sort_candidates: false,
         }).unwrap();
 
         let q = make_tensor(draft_len, q_heads, dim);
@@ -1510,6 +1622,7 @@ mod tests {
             causal: false,
             use_log_stride: false,
             use_landmarks: false,
+            sort_candidates: false,
         })
         .unwrap();
         let mha = attn.forward(&q, &k, &v).unwrap();
@@ -1536,6 +1649,7 @@ mod tests {
             causal: true,
             use_log_stride: false,
             use_landmarks: false,
+            sort_candidates: false,
         })
         .unwrap();
         let out = attn.forward_gqa(&q, &k, &v).unwrap();
